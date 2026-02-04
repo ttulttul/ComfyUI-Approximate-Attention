@@ -225,6 +225,14 @@ def taylor_attention(
 
     feature_dim = taylor_sym_features.feature_dim(dim_head, cfg.P)
     if feature_dim > cfg.max_feature_dim_R:
+        if cfg.log_fallbacks:
+            logger.warning(
+                "Taylor attention fallback: feature_dim_too_large (R=%s > max_feature_dim_R=%s) head_dim=%s P=%s",
+                feature_dim,
+                cfg.max_feature_dim_R,
+                dim_head,
+                cfg.P,
+            )
         raise TaylorAttentionFallback("feature_dim_too_large")
 
     scale = dim_head ** -0.5

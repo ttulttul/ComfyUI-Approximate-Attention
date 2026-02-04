@@ -1,5 +1,6 @@
 import math
 import os
+import logging
 
 import pytest
 import torch
@@ -147,3 +148,41 @@ def test_taylor_attention_skip_reshape_false():
 
     error = (taylor_out - baseline).abs().mean().item()
     assert error < 5e-2
+
+
+def test_feature_dim_too_large_logs(caplog):
+    device = torch.device("cpu")
+    batch = 1
+    heads = 1
+    tokens = 1
+    dim_head = 8
+
+    q, k, v = _make_qkv(batch, heads, tokens, dim_head, device)
+
+    config = {
+        "enabled": True,
+        "P": 4,
+        "min_tokens": 0,
+        "max_feature_dim_R": 10,
+        "block_size_q": 1,
+        "block_size_k": 1,
+        "eps": 1e-6,
+        "fallback_on_negative": False,
+        "allow_cross_attention": True,
+        "max_head_dim": 128,
+        "log_fallbacks": True,
+    }
+
+    caplog.set_level(logging.WARNING, logger="taylor_attention")
+    with pytest.raises(taylor_attention.TaylorAttentionFallback):
+        taylor_attention.taylor_attention(
+            q,
+            k,
+            v,
+            heads,
+            skip_reshape=True,
+            config=config,
+        )
+
+    assert "feature_dim_too_large" in caplog.text
+    assert "max_feature_dim_R" in caplog.text
