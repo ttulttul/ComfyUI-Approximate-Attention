@@ -298,9 +298,12 @@ def taylor_attention(
     scale = dim_head ** -0.5
     _log_shapes_once(cfg, transformer_options, q, k, v, mask, scale, skip_reshape)
 
+    dtype_accum = torch.float32 if cfg.force_fp32 else q.dtype
+    v_dtype = v.dtype
+
     if mask is not None:
         key_mask_bool = _normalize_key_mask(mask, batch, heads, n_q, n_k).to(device=q.device)
-        key_mask = key_mask_bool.to(dtype=torch.float32)
+        key_mask = key_mask_bool.to(dtype=dtype_accum)
         key_mask = key_mask[:, None, :]
     else:
         key_mask_bool = None
@@ -308,20 +311,19 @@ def taylor_attention(
 
     specs = taylor_sym_features.get_feature_specs(dim_head, cfg.P, q.device)
 
-    dtype_accum = torch.float32 if cfg.force_fp32 else q.dtype
-    v_dtype = v.dtype
-
     s = torch.zeros((batch, heads, feature_dim, v.shape[-1]), dtype=dtype_accum, device=q.device)
     z = torch.zeros((batch, heads, feature_dim), dtype=dtype_accum, device=q.device)
 
     sqrt_betas = []
+    sqrt_ws = []
     for spec in specs:
         beta = (scale ** spec.degree) / math.factorial(spec.degree)
-        sqrt_betas.append(math.sqrt(beta))
+        sqrt_betas.append(torch.tensor(math.sqrt(beta), dtype=dtype_accum, device=q.device))
+        sqrt_ws.append(spec.sqrt_w.to(dtype=dtype_accum))
 
     block_k = max(1, cfg.block_size_k)
     offset = 0
-    for spec, sqrt_beta in zip(specs, sqrt_betas):
+    for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
         m_p = spec.indices.shape[0]
         for start in range(0, n_k, block_k):
             end = min(start + block_k, n_k)
@@ -330,7 +332,7 @@ def taylor_attention(
             k_blk_f = k_blk.to(dtype=dtype_accum)
             v_blk_f = v_blk.to(dtype=dtype_accum)
             phi_k = taylor_sym_features.eval_phi(k_blk_f, spec.indices)
-            psi_k = phi_k * spec.sqrt_w * sqrt_beta
+            psi_k = phi_k * sqrt_w * sqrt_beta
             if key_mask is not None:
                 mask_blk = key_mask[:, :, start:end]
                 psi_k = psi_k * mask_blk[..., None]
@@ -348,10 +350,10 @@ def taylor_attention(
         num = torch.zeros((batch, heads, end - start, v.shape[-1]), dtype=dtype_accum, device=q.device)
         den = torch.zeros((batch, heads, end - start), dtype=dtype_accum, device=q.device)
         offset = 0
-        for spec, sqrt_beta in zip(specs, sqrt_betas):
+        for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
             m_p = spec.indices.shape[0]
             phi_q = taylor_sym_features.eval_phi(q_blk_f, spec.indices)
-            psi_q = phi_q * spec.sqrt_w * sqrt_beta
+            psi_q = phi_q * sqrt_w * sqrt_beta
             num += torch.einsum("b h n r, b h r d -> b h n d", psi_q, s[:, :, offset:offset + m_p, :])
             den += torch.einsum("b h n r, b h r -> b h n", psi_q, z[:, :, offset:offset + m_p])
             offset += m_p
