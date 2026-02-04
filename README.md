@@ -1,6 +1,9 @@
-# SATA-Speedup: Taylor Attention Backend for ComfyUI
+# Taylor Attention Backend for ComfyUI
 
-This custom node adds a runtime-switchable attention backend for diffusion transformers (Flux/Flux2) using a truncated Taylor expansion with a symmetry-aware feature map. It is designed for large token counts where quadratic attention becomes expensive.
+This *HIGHLY EXPERIMENTAL* and *TOTALLY_UNPROVEN* custom node adds a
+runtime-switchable attention backend for diffusion transformers (Flux/Flux2)
+using a truncated Taylor expansion with a symmetry-aware feature map. It is
+designed for large token counts where quadratic attention becomes expensive.
 
 ## Install
 
