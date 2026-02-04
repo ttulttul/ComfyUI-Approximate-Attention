@@ -18,6 +18,7 @@ This custom node adds a runtime-switchable attention backend for diffusion trans
   - `max_feature_dim_R`: safety cap for feature dimension.
   - `block_size_q` / `block_size_k`: block sizes for memory control.
   - `fallback_on_negative`: fallback to standard attention if denominators are too small.
+  - `force_fp32`: accumulate Taylor features in fp32 for stability (disable to reduce memory).
 
 When enabled, the node injects `optimized_attention_override` into `transformer_options`, so Flux attention calls will route through the Taylor backend and fall back if unsupported masks or stability issues are detected.
 

@@ -186,3 +186,8 @@ def test_feature_dim_too_large_logs(caplog):
 
     assert "feature_dim_too_large" in caplog.text
     assert "max_feature_dim_R" in caplog.text
+
+
+def test_force_fp32_config_respected():
+    cfg = taylor_attention._resolve_config({"enabled": True, "force_fp32": False})
+    assert cfg.force_fp32 is False

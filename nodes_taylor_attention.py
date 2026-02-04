@@ -20,6 +20,7 @@ def _build_config(
     fallback_on_negative: bool,
     allow_cross_attention: bool,
     max_head_dim: int,
+    force_fp32: bool,
     log_shapes: bool,
     log_fallbacks: bool,
 ) -> Dict[str, Any]:
@@ -36,6 +37,7 @@ def _build_config(
         "fallback_on_negative": bool(fallback_on_negative),
         "allow_cross_attention": bool(allow_cross_attention),
         "max_head_dim": int(max_head_dim),
+        "force_fp32": bool(force_fp32),
         "log_shapes": bool(log_shapes),
         "log_fallbacks": bool(log_fallbacks),
     }
@@ -61,6 +63,7 @@ class TaylorAttentionBackend(io.ComfyNode):
                 io.Boolean.Input("fallback_on_negative", default=True, tooltip="Fallback if denominators are too small."),
                 io.Boolean.Input("allow_cross_attention", default=True),
                 io.Int.Input("max_head_dim", default=128, min=1, max=512, step=1),
+                io.Boolean.Input("force_fp32", default=True, tooltip="Accumulate Taylor features in fp32 for stability."),
                 io.Boolean.Input("log_shapes", default=False),
                 io.Boolean.Input("log_fallbacks", default=True),
             ],
@@ -82,6 +85,7 @@ class TaylorAttentionBackend(io.ComfyNode):
         fallback_on_negative: bool,
         allow_cross_attention: bool,
         max_head_dim: int,
+        force_fp32: bool,
         log_shapes: bool,
         log_fallbacks: bool,
     ) -> io.NodeOutput:
@@ -103,6 +107,7 @@ class TaylorAttentionBackend(io.ComfyNode):
                 fallback_on_negative,
                 allow_cross_attention,
                 max_head_dim,
+                force_fp32,
                 log_shapes,
                 log_fallbacks,
             )
