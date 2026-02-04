@@ -25,6 +25,9 @@ designed for large token counts where quadratic attention becomes expensive.
   - `memory_reserve`: ask ComfyUI to free VRAM before Taylor attention allocations.
   - `memory_reserve_factor`: safety multiplier for the VRAM estimate.
   - `memory_reserve_log`: log reserved VRAM estimates.
+  - `early_probe`: run a denominator probe before full Taylor compute (avoids slow fallback).
+  - `probe_samples`: number of queries sampled for the probe.
+  - `denom_fp32`: compute denominators in fp32 to reduce underflow.
   - `quality_check`: log a sampled softmax vs Taylor comparison per call.
   - `quality_check_samples`: number of sampled queries per call.
   - `quality_check_log_every`: log every N Taylor calls.

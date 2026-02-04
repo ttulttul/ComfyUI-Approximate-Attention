@@ -197,6 +197,12 @@ def test_memory_reserve_config_respected():
     assert cfg.memory_reserve is False
     assert cfg.memory_reserve_factor == 1.5
 
+def test_probe_config_respected():
+    cfg = taylor_attention._resolve_config({"enabled": True, "early_probe": True, "probe_samples": 12, "denom_fp32": True})
+    assert cfg.early_probe is True
+    assert cfg.probe_samples == 12
+    assert cfg.denom_fp32 is True
+
 
 def test_quality_check_logs(caplog):
     device = torch.device("cpu")

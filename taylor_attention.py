@@ -37,6 +37,9 @@ class TaylorAttentionConfig:
     memory_reserve: bool = True
     memory_reserve_factor: float = 1.1
     memory_reserve_log: bool = False
+    early_probe: bool = False
+    probe_samples: int = 8
+    denom_fp32: bool = False
     log_shapes: bool = False
     log_fallbacks: bool = True
     log_every: int = 100
@@ -196,6 +199,48 @@ def _maybe_reserve_memory(
         logger.warning("Taylor attention reserve memory failed: %s", exc)
 
 
+
+
+
+def _probe_denominators(
+    cfg: TaylorAttentionConfig,
+    q: torch.Tensor,
+    z: torch.Tensor,
+    specs,
+    sqrt_betas,
+    sqrt_ws,
+    eps: float,
+    dtype_accum: torch.dtype,
+) -> None:
+    if not cfg.early_probe:
+        return
+    n_q = q.shape[2]
+    samples = min(cfg.probe_samples, n_q)
+    if samples <= 0:
+        return
+
+    idx = torch.randperm(n_q, device=q.device)[:samples]
+    q_probe = q[:, :, idx, :].to(dtype=dtype_accum)
+
+    den_dtype = torch.float32 if cfg.denom_fp32 else dtype_accum
+    den = torch.zeros((q.shape[0], q.shape[1], samples), dtype=den_dtype, device=q.device)
+
+    offset = 0
+    for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
+        m_p = spec.indices.shape[0]
+        phi_q = taylor_sym_features.eval_phi(q_probe, spec.indices)
+        psi_q = phi_q * sqrt_w * sqrt_beta
+        z_slice = z[:, :, offset:offset + m_p]
+        if cfg.denom_fp32:
+            den += torch.einsum("b h n r, b h r -> b h n", psi_q.float(), z_slice.float())
+        else:
+            den += torch.einsum("b h n r, b h r -> b h n", psi_q, z_slice)
+        offset += m_p
+
+    if torch.isnan(den).any() or torch.isinf(den).any():
+        raise TaylorAttentionFallback("denominator_invalid")
+    if cfg.fallback_on_negative and torch.any(den <= eps):
+        raise TaylorAttentionFallback("denominator_too_small")
 def _log_shapes_once(config: TaylorAttentionConfig, transformer_options: Optional[dict], q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor], scale: float, skip_reshape: bool) -> None:
     if not config.log_shapes:
         return
@@ -376,9 +421,6 @@ def taylor_attention(
 
     _maybe_reserve_memory(cfg, q, v, feature_dim, specs, block_q, block_k, transformer_options, dtype_accum)
 
-    s = torch.zeros((batch, heads, feature_dim, v.shape[-1]), dtype=dtype_accum, device=q.device)
-    z = torch.zeros((batch, heads, feature_dim), dtype=dtype_accum, device=q.device)
-
     sqrt_betas = []
     sqrt_ws = []
     for spec in specs:
@@ -386,39 +428,84 @@ def taylor_attention(
         sqrt_betas.append(torch.tensor(math.sqrt(beta), dtype=dtype_accum, device=q.device))
         sqrt_ws.append(spec.sqrt_w.to(dtype=dtype_accum))
 
-    offset = 0
-    for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
-        m_p = spec.indices.shape[0]
-        for start in range(0, n_k, block_k):
-            end = min(start + block_k, n_k)
-            k_blk = k[:, :, start:end, :]
-            v_blk = v[:, :, start:end, :]
-            k_blk_f = k_blk.to(dtype=dtype_accum)
-            v_blk_f = v_blk.to(dtype=dtype_accum)
-            phi_k = taylor_sym_features.eval_phi(k_blk_f, spec.indices)
-            psi_k = phi_k * sqrt_w * sqrt_beta
-            if key_mask is not None:
-                mask_blk = key_mask[:, :, start:end]
-                psi_k = psi_k * mask_blk[..., None]
-            s[:, :, offset:offset + m_p, :] += torch.einsum("b h n r, b h n d -> b h r d", psi_k, v_blk_f)
-            z[:, :, offset:offset + m_p] += psi_k.sum(dim=2)
-        offset += m_p
+    if cfg.early_probe:
+        z = torch.zeros((batch, heads, feature_dim), dtype=dtype_accum, device=q.device)
+        offset = 0
+        for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
+            m_p = spec.indices.shape[0]
+            for start in range(0, n_k, block_k):
+                end = min(start + block_k, n_k)
+                k_blk = k[:, :, start:end, :]
+                k_blk_f = k_blk.to(dtype=dtype_accum)
+                phi_k = taylor_sym_features.eval_phi(k_blk_f, spec.indices)
+                psi_k = phi_k * sqrt_w * sqrt_beta
+                if key_mask is not None:
+                    mask_blk = key_mask[:, :, start:end]
+                    psi_k = psi_k * mask_blk[..., None]
+                z[:, :, offset:offset + m_p] += psi_k.sum(dim=2)
+            offset += m_p
+
+        _probe_denominators(cfg, q, z, specs, sqrt_betas, sqrt_ws, cfg.eps, dtype_accum)
+
+        s = torch.zeros((batch, heads, feature_dim, v.shape[-1]), dtype=dtype_accum, device=q.device)
+        offset = 0
+        for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
+            m_p = spec.indices.shape[0]
+            for start in range(0, n_k, block_k):
+                end = min(start + block_k, n_k)
+                k_blk = k[:, :, start:end, :]
+                v_blk = v[:, :, start:end, :]
+                k_blk_f = k_blk.to(dtype=dtype_accum)
+                v_blk_f = v_blk.to(dtype=dtype_accum)
+                phi_k = taylor_sym_features.eval_phi(k_blk_f, spec.indices)
+                psi_k = phi_k * sqrt_w * sqrt_beta
+                if key_mask is not None:
+                    mask_blk = key_mask[:, :, start:end]
+                    psi_k = psi_k * mask_blk[..., None]
+                s[:, :, offset:offset + m_p, :] += torch.einsum("b h n r, b h n d -> b h r d", psi_k, v_blk_f)
+            offset += m_p
+    else:
+        s = torch.zeros((batch, heads, feature_dim, v.shape[-1]), dtype=dtype_accum, device=q.device)
+        z = torch.zeros((batch, heads, feature_dim), dtype=dtype_accum, device=q.device)
+        offset = 0
+        for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
+            m_p = spec.indices.shape[0]
+            for start in range(0, n_k, block_k):
+                end = min(start + block_k, n_k)
+                k_blk = k[:, :, start:end, :]
+                v_blk = v[:, :, start:end, :]
+                k_blk_f = k_blk.to(dtype=dtype_accum)
+                v_blk_f = v_blk.to(dtype=dtype_accum)
+                phi_k = taylor_sym_features.eval_phi(k_blk_f, spec.indices)
+                psi_k = phi_k * sqrt_w * sqrt_beta
+                if key_mask is not None:
+                    mask_blk = key_mask[:, :, start:end]
+                    psi_k = psi_k * mask_blk[..., None]
+                s[:, :, offset:offset + m_p, :] += torch.einsum("b h n r, b h n d -> b h r d", psi_k, v_blk_f)
+                z[:, :, offset:offset + m_p] += psi_k.sum(dim=2)
+            offset += m_p
 
     out = torch.empty((batch, heads, n_q, v.shape[-1]), dtype=dtype_accum, device=q.device)
+
+    den_dtype = torch.float32 if cfg.denom_fp32 else dtype_accum
 
     for start in range(0, n_q, block_q):
         end = min(start + block_q, n_q)
         q_blk = q[:, :, start:end, :]
         q_blk_f = q_blk.to(dtype=dtype_accum)
         num = torch.zeros((batch, heads, end - start, v.shape[-1]), dtype=dtype_accum, device=q.device)
-        den = torch.zeros((batch, heads, end - start), dtype=dtype_accum, device=q.device)
+        den = torch.zeros((batch, heads, end - start), dtype=den_dtype, device=q.device)
         offset = 0
         for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
             m_p = spec.indices.shape[0]
             phi_q = taylor_sym_features.eval_phi(q_blk_f, spec.indices)
             psi_q = phi_q * sqrt_w * sqrt_beta
             num += torch.einsum("b h n r, b h r d -> b h n d", psi_q, s[:, :, offset:offset + m_p, :])
-            den += torch.einsum("b h n r, b h r -> b h n", psi_q, z[:, :, offset:offset + m_p])
+            z_slice = z[:, :, offset:offset + m_p]
+            if cfg.denom_fp32:
+                den += torch.einsum("b h n r, b h r -> b h n", psi_q.float(), z_slice.float())
+            else:
+                den += torch.einsum("b h n r, b h r -> b h n", psi_q, z_slice)
             offset += m_p
 
         if torch.isnan(den).any() or torch.isinf(den).any():
@@ -426,6 +513,8 @@ def taylor_attention(
         if cfg.fallback_on_negative and torch.any(den <= cfg.eps):
             raise TaylorAttentionFallback("denominator_too_small")
         den = torch.clamp(den, min=cfg.eps)
+        if den.dtype != dtype_accum:
+            den = den.to(dtype_accum)
         out[:, :, start:end, :] = num / den[..., None]
 
     _run_quality_check(cfg, q, k, v, out, key_mask_bool, scale)
