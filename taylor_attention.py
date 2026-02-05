@@ -26,9 +26,9 @@ class TaylorAttentionConfig:
     enabled: bool = True
     P: int = 4
     min_tokens: int = 10000
-    max_feature_dim_R: int = 60000
-    block_size_q: int = 512
-    block_size_k: int = 512
+    max_feature_dim_R: int = 400000
+    block_size_q: int = 32
+    block_size_k: int = 16
     eps: float = 1e-6
     fallback_on_negative: bool = True
     allow_cross_attention: bool = True
