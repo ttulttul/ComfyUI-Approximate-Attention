@@ -18,6 +18,7 @@ class FeatureSpec:
 
 _CPU_CACHE: Dict[Tuple[int, int], List[FeatureSpec]] = {}
 _DEVICE_CACHE: Dict[Tuple[int, int, torch.device], List[FeatureSpec]] = {}
+_BINOM_CACHE: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
 
 
 def feature_dim(d: int, P: int) -> int:
@@ -28,11 +29,109 @@ def feature_dim(d: int, P: int) -> int:
     return sum(math.comb(d + p - 1, p) for p in range(P))
 
 
+def _feature_dim_degree(d: int, p: int) -> int:
+    if p < 0:
+        raise ValueError("p must be non-negative")
+    if d <= 0:
+        raise ValueError("d must be positive")
+    return math.comb(d + p - 1, p)
+
+
 def _build_degree_indices(d: int, p: int) -> torch.Tensor:
     if p == 0:
         return torch.empty((1, 0), dtype=torch.long)
     combos = list(itertools.combinations_with_replacement(range(d), p))
     return torch.tensor(combos, dtype=torch.long)
+
+
+def _get_binom_table(n_max: int, k_max: int, device: torch.device) -> torch.Tensor:
+    key = (n_max, k_max, device)
+    cached = _BINOM_CACHE.get(key)
+    if cached is not None:
+        return cached
+    table = torch.zeros((n_max + 1, k_max + 1), dtype=torch.long)
+    for n in range(n_max + 1):
+        max_k = min(n, k_max)
+        for k in range(max_k + 1):
+            table[n, k] = math.comb(n, k)
+    table = table.to(device=device)
+    _BINOM_CACHE[key] = table
+    return table
+
+
+def _unrank_multichoose(
+    r: torch.Tensor,
+    d: int,
+    p: int,
+    binom_table: torch.Tensor,
+) -> torch.Tensor:
+    # r: [count] on device, returns indices [count, p] with replacement
+    device = r.device
+    if p == 0:
+        return torch.empty((r.numel(), 0), dtype=torch.long, device=device)
+    n = d + p - 1
+    xs = torch.arange(n, device=device, dtype=torch.long)
+    batch = r.numel()
+    comb = torch.zeros((batch, p), dtype=torch.long, device=device)
+    start = torch.zeros((batch,), dtype=torch.long, device=device)
+    r_work = r.clone()
+
+    for i in range(p):
+        k = p - i - 1
+        if k == 0:
+            counts = torch.ones((n,), dtype=torch.long, device=device)
+        else:
+            n_minus = n - xs - 1
+            counts = torch.where(n_minus >= k, binom_table[n_minus, k], torch.zeros_like(n_minus))
+        max_x = n - k - 1
+        counts = torch.where(xs <= max_x, counts, torch.zeros_like(counts))
+        counts_row = counts.unsqueeze(0).expand(batch, -1)
+        mask = xs.unsqueeze(0) >= start.unsqueeze(1)
+        counts_row = torch.where(mask, counts_row, torch.zeros_like(counts_row))
+        prefix = torch.cumsum(counts_row, dim=1)
+        idx = (prefix > r_work.unsqueeze(1)).float().argmax(dim=1)
+        comb[:, i] = idx
+        prev = torch.zeros_like(r_work)
+        has_prev = idx > 0
+        if has_prev.any():
+            prev[has_prev] = prefix[torch.arange(batch, device=device), idx - 1][has_prev]
+        r_work = r_work - prev
+        start = idx + 1
+
+    offsets = torch.arange(p, device=device, dtype=torch.long)
+    return comb - offsets
+
+
+def _compute_sqrt_w(indices: torch.Tensor, p: int) -> torch.Tensor:
+    if p == 0:
+        return torch.ones((indices.shape[0],), dtype=torch.float32, device=indices.device)
+    batch = indices.shape[0]
+    boundaries = torch.ones((batch, p), dtype=torch.bool, device=indices.device)
+    boundaries[:, 1:] = indices[:, 1:] != indices[:, :-1]
+    run_ids = boundaries.cumsum(dim=1) - 1
+    counts = torch.zeros((batch, p), dtype=torch.long, device=indices.device)
+    counts.scatter_add_(1, run_ids, torch.ones_like(run_ids))
+    factorial = torch.tensor([math.factorial(i) for i in range(p + 1)], dtype=torch.float32, device=indices.device)
+    denom = factorial[counts].prod(dim=1)
+    weight = (float(math.factorial(p)) / denom).to(dtype=torch.float32)
+    return torch.sqrt(weight)
+
+
+def iter_feature_specs_streaming(d: int, P: int, device: torch.device, chunk_size: int):
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    n_max = d + P - 1
+    binom_table = _get_binom_table(n_max, P, device)
+    for p in range(P):
+        total = _feature_dim_degree(d, p)
+        if total == 0:
+            continue
+        for start in range(0, total, chunk_size):
+            count = min(chunk_size, total - start)
+            r = torch.arange(start, start + count, device=device, dtype=torch.long)
+            indices = _unrank_multichoose(r, d, p, binom_table)
+            sqrt_w = _compute_sqrt_w(indices, p)
+            yield FeatureSpec(degree=p, indices=indices, sqrt_w=sqrt_w)
 
 
 def _build_degree_weights(indices: torch.Tensor, p: int) -> torch.Tensor:

@@ -73,6 +73,8 @@ If P=4 is unstable without changing model behavior, try `qk_norm_clip` or `qk_no
 
 If you need to run without `sub_head_blocks`, enable `fused_kernel` and set `sub_head_blocks=1`. This switches to a streaming implementation that avoids allocating the full feature tensor. It requires Triton (`pip install triton`) and CUDA; otherwise it falls back to torch ops.
 
+For P>=5, the fused path now streams feature indices on the GPU to avoid huge Python-side tuple construction.
+
 ## Tests
 
 ```bash

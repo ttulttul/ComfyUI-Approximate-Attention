@@ -20,3 +20,4 @@
 - Step stats now log both quality_raw (unmodified) and quality_eff (modified) metrics.
 - Feature-dimension fallback logs now always include the rejected R value.
 - max_feature_dim_R UI limit raised to allow very large feature dimensions when experimenting with higher P.
+- For P>=5, the fused path streams multiset feature indices on GPU to avoid Python tuple construction overhead.

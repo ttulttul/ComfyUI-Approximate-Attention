@@ -671,6 +671,7 @@ def _maybe_reserve_memory(
     block_k: int,
     transformer_options: Optional[dict],
     dtype_accum: torch.dtype,
+    m_max_override: Optional[int] = None,
 ) -> None:
     if not cfg.memory_reserve:
         return
@@ -678,12 +679,14 @@ def _maybe_reserve_memory(
         return
     if q.device.type == "cpu":
         return
-    if len(specs) == 0:
-        return
-
     batch, heads, n_q, _ = q.shape
     d_val = v.shape[-1]
-    m_max = max(spec.indices.shape[0] for spec in specs)
+    if m_max_override is not None:
+        m_max = m_max_override
+    else:
+        if len(specs) == 0:
+            return
+        m_max = max(spec.indices.shape[0] for spec in specs)
     dtype_size = torch.tensor([], dtype=dtype_accum).element_size()
     mem_bytes = _estimate_taylor_memory_bytes(batch, heads, n_q, d_val, feature_dim, m_max, block_q, block_k, dtype_size)
     mem_bytes = int(mem_bytes * cfg.memory_reserve_factor)
@@ -985,16 +988,18 @@ def _taylor_attention_fused(
         key_mask = None
 
     feature_dim = taylor_sym_features.feature_dim(dim_head, cfg.P)
-    specs = taylor_sym_features.get_feature_specs(dim_head, cfg.P, q.device)
-
-    _maybe_reserve_memory(cfg, q, v, feature_dim, specs, block_q, block_k, transformer_options, dtype_accum)
-
-    sqrt_betas = []
-    sqrt_ws = []
-    for spec in specs:
-        beta = (scale ** spec.degree) / math.factorial(spec.degree)
-        sqrt_betas.append(torch.tensor(math.sqrt(beta), dtype=dtype_accum, device=q.device))
-        sqrt_ws.append(spec.sqrt_w.to(dtype=dtype_accum))
+    use_streaming = cfg.P >= 5
+    if use_streaming:
+        max_r = 0
+        for p in range(cfg.P):
+            max_r = max(max_r, math.comb(dim_head + p - 1, p))
+        m_max = min(chunk_size, max_r)
+        _maybe_reserve_memory(cfg, q, v, feature_dim, (), block_q, block_k, transformer_options, dtype_accum, m_max_override=m_max)
+        spec_iter = taylor_sym_features.iter_feature_specs_streaming(dim_head, cfg.P, q.device, chunk_size)
+    else:
+        specs = taylor_sym_features.get_feature_specs(dim_head, cfg.P, q.device)
+        _maybe_reserve_memory(cfg, q, v, feature_dim, specs, block_q, block_k, transformer_options, dtype_accum)
+        spec_iter = iter(specs)
 
     out = torch.zeros((batch, heads, n_q, v.shape[-1]), dtype=dtype_accum, device=q.device)
     den = torch.zeros((batch, heads, n_q), dtype=den_dtype, device=q.device)
@@ -1008,7 +1013,10 @@ def _taylor_attention_fused(
             q_probe = q[:, :, idx, :].to(dtype=dtype_accum)
             den_probe = torch.zeros((batch, heads, samples), dtype=den_dtype, device=q.device)
 
-    for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
+    for spec in spec_iter:
+        sqrt_beta = math.sqrt((scale ** spec.degree) / math.factorial(spec.degree))
+        sqrt_beta = torch.tensor(sqrt_beta, dtype=dtype_accum, device=q.device)
+        sqrt_w = spec.sqrt_w.to(dtype=dtype_accum)
         m_total = spec.indices.shape[0]
         if m_total == 0:
             continue
