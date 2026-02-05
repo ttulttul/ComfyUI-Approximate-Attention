@@ -9,3 +9,5 @@
 - Taylor now aggregates denominator/quality stats per sampling step and logs a single summary per step.
 - Added qk_normalize and scale_mul knobs to stabilize P=4 Taylor attention by shrinking q·k values.
 - Added qk_norm_clip and qk_norm_power to stabilize P=4 without fully normalizing Q/K.
+- Denominator fallbacks can now be gated by a fraction threshold to avoid over-triggering.
+- Quality stats are now computed against unmodified attention, even when Q/K are adjusted.

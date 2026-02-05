@@ -45,6 +45,7 @@ class TaylorAttentionConfig:
     early_probe: bool = True
     probe_samples: int = 16
     denom_fp32: bool = True
+    denom_fallback_frac_limit: float = 0.0
     log_shapes: bool = True
     log_fallbacks: bool = True
     log_every: int = 100
@@ -100,6 +101,7 @@ def _config_summary(cfg: TaylorAttentionConfig) -> Dict[str, Any]:
         "force_fp32": cfg.force_fp32,
         "denom_fp32": cfg.denom_fp32,
         "probe_samples": cfg.probe_samples,
+        "denom_fallback_frac_limit": cfg.denom_fallback_frac_limit,
     }
 
 
@@ -187,7 +189,7 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
         "Taylor step stats: sigma=%s calls=%s taylor=%s fallback=%s denom_fallback_frac=%.6g "
         "den[min=%.6g max=%.6g mean=%.6g frac_le_eps=%.6g] "
         "quality[mean_abs=%.6g max_abs=%.6g mean_rel=%.6g max_rel=%.6g samples=%s] "
-        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g scale_mul=%.3g sub_head_blocks=%s force_fp32=%s denom_fp32=%s probe_samples=%s]",
+        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g scale_mul=%.3g sub_head_blocks=%s force_fp32=%s denom_fp32=%s probe_samples=%s denom_fallback_frac_limit=%.3g]",
         sigma,
         calls,
         step_stats["taylor_calls"],
@@ -210,6 +212,7 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
         cfg_summary["force_fp32"],
         cfg_summary["denom_fp32"],
         cfg_summary["probe_samples"],
+        cfg_summary["denom_fallback_frac_limit"],
     )
 
     if transformer_options is not None:
@@ -272,11 +275,6 @@ def _compute_quality_stats(
     key_mask_bool: Optional[torch.Tensor],
     scale: float,
 ) -> Optional[Dict[str, float]]:
-    if not cfg.quality_check:
-        return None
-    if not _quality_check_should_log(cfg):
-        return None
-
     batch, heads, n_q, dim_head = q.shape
     samples = min(cfg.quality_check_samples, n_q)
     if samples <= 0:
@@ -573,6 +571,8 @@ def taylor_attention(
     skip_output_reshape: bool = False,
     config: Optional[Dict[str, Any]] = None,
     transformer_options: Optional[dict] = None,
+    skip_quality_stats: bool = False,
+    skip_step_log: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     cfg = _resolve_config(config)
@@ -591,6 +591,15 @@ def taylor_attention(
         raise TaylorAttentionFallback("below_min_tokens")
 
     dim_head = q.shape[-1]
+    q_orig = q
+    k_orig = k
+    scale_base = dim_head ** -0.5
+    scale = scale_base * cfg.scale_mul
+    _log_shapes_once(cfg, transformer_options, q, k, v, mask, scale, skip_reshape)
+    if mask is not None:
+        key_mask_bool = _normalize_key_mask(mask, batch, heads, n_q, n_k).to(device=q.device)
+    else:
+        key_mask_bool = None
     sub_head_blocks = max(1, cfg.sub_head_blocks)
     if sub_head_blocks > 1:
         if dim_head % sub_head_blocks != 0:
@@ -631,10 +640,16 @@ def taylor_attention(
                     skip_output_reshape=True,
                     config=sub_config,
                     transformer_options=transformer_options,
+                    skip_quality_stats=True,
+                    skip_step_log=True,
                     **kwargs,
                 )
             )
         out = torch.cat(sub_outputs, dim=-1)
+        if step_stats is not None:
+            quality_stats = _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base)
+            _merge_quality_stats(step_stats["quality"], quality_stats)
+            _maybe_log_step_stats(transformer_options, cfg, step_stats)
         if skip_output_reshape:
             return out
         out = out.permute(0, 2, 1, 3).reshape(batch, n_q, heads * dim_head)
@@ -654,9 +669,6 @@ def taylor_attention(
                 cfg.P,
             )
         raise TaylorAttentionFallback("feature_dim_too_large")
-
-    scale = (dim_head ** -0.5) * cfg.scale_mul
-    _log_shapes_once(cfg, transformer_options, q, k, v, mask, scale, skip_reshape)
 
     dtype_accum = torch.float32 if cfg.force_fp32 else q.dtype
     v_dtype = v.dtype
@@ -681,11 +693,9 @@ def taylor_attention(
     block_q = max(1, cfg.block_size_q)
 
     if mask is not None:
-        key_mask_bool = _normalize_key_mask(mask, batch, heads, n_q, n_k).to(device=q.device)
         key_mask = key_mask_bool.to(dtype=dtype_accum)
         key_mask = key_mask[:, None, :]
     else:
-        key_mask_bool = None
         key_mask = None
 
     specs = taylor_sym_features.get_feature_specs(dim_head, cfg.P, q.device)
@@ -786,21 +796,31 @@ def taylor_attention(
             if step_stats is not None:
                 _merge_den_stats(step_stats["den_stats"], den_stats)
             raise TaylorAttentionFallback("denominator_invalid")
-        if cfg.fallback_on_negative and torch.any(den <= cfg.eps):
-            if step_stats is not None:
-                _merge_den_stats(step_stats["den_stats"], den_stats)
-            raise TaylorAttentionFallback("denominator_too_small")
+        if cfg.fallback_on_negative:
+            den_le = torch.sum(den <= cfg.eps).item()
+            if cfg.denom_fallback_frac_limit > 0:
+                den_frac = den_le / den.numel()
+                if den_frac > cfg.denom_fallback_frac_limit:
+                    if step_stats is not None:
+                        _merge_den_stats(step_stats["den_stats"], den_stats)
+                    raise TaylorAttentionFallback("denominator_too_small")
+            else:
+                if den_le > 0:
+                    if step_stats is not None:
+                        _merge_den_stats(step_stats["den_stats"], den_stats)
+                    raise TaylorAttentionFallback("denominator_too_small")
         den = torch.clamp(den, min=cfg.eps)
         if den.dtype != dtype_accum:
             den = den.to(dtype_accum)
         out[:, :, start:end, :] = num / den[..., None]
 
-    quality_stats = _compute_quality_stats(cfg, q, k, v, out, key_mask_bool, scale)
+    quality_stats = None if skip_quality_stats else _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base)
     if step_stats is not None:
         step_stats["taylor_calls"] += 1
         _merge_den_stats(step_stats["den_stats"], den_stats)
         _merge_quality_stats(step_stats["quality"], quality_stats)
-        _maybe_log_step_stats(transformer_options, cfg, step_stats)
+        if not skip_step_log:
+            _maybe_log_step_stats(transformer_options, cfg, step_stats)
 
     out = out.to(dtype=v_dtype)
     if skip_output_reshape:

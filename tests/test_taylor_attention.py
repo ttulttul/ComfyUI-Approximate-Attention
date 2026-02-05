@@ -204,6 +204,11 @@ def test_probe_config_respected():
     assert cfg.denom_fp32 is True
 
 
+def test_denom_fallback_frac_limit_config():
+    cfg = taylor_attention._resolve_config({"enabled": True, "denom_fallback_frac_limit": 0.001})
+    assert cfg.denom_fallback_frac_limit == 0.001
+
+
 def test_sub_head_blocks_config_respected():
     cfg = taylor_attention._resolve_config({"enabled": True, "sub_head_blocks": 3})
     assert cfg.sub_head_blocks == 3

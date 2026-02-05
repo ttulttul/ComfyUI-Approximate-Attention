@@ -33,7 +33,8 @@ designed for large token counts where quadratic attention becomes expensive.
   - `early_probe`: run a denominator probe before full Taylor compute (default true).
   - `probe_samples`: number of queries sampled for the probe (default 16).
   - `denom_fp32`: compute denominators in fp32 to reduce underflow (default true).
-  - `quality_check`: log a sampled softmax vs Taylor comparison per call (default true).
+  - `denom_fallback_frac_limit`: fallback only if denom<=eps exceeds this fraction (default 0).
+  - `quality_check`: sampled softmax vs Taylor comparison is always computed against unmodified attention.
   - `quality_check_samples`: number of sampled queries per call (default 16).
   - `quality_check_log_every`: log every N Taylor calls (default 1).
   - `log_shapes`: log Taylor attention shapes (default true).
@@ -89,4 +90,5 @@ python benchmarks/benchmark_flux_forward.py --device cuda --dtype float16 --heig
 
 - Taylor attention is approximate and may fall back to standard attention if unsupported masks are detected or denominators become unstable.
 - Taylor logs one per sampling step, including aggregated denominator/quality stats and key config values.
+- Quality stats always compare against unmodified attention; adjust `quality_check_samples` to control cost.
 - Large head dimensions can make feature expansion prohibitively large; `max_feature_dim_R` and `max_head_dim` guard against this.
