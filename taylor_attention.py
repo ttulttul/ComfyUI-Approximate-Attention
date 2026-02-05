@@ -611,11 +611,8 @@ def taylor_attention(
             offset += m_p
 
         _accum_den_stats(den_stats, den, cfg.eps)
-        probe_stats = _init_den_stats()
-    _accum_den_stats(probe_stats, den, eps)
-    _log_den_stats(probe_stats, prefix="Taylor denominator stats (probe)")
 
-    if torch.isnan(den).any() or torch.isinf(den).any():
+        if torch.isnan(den).any() or torch.isinf(den).any():
             _log_den_stats(den_stats, prefix="Taylor denominator stats (partial)")
             raise TaylorAttentionFallback("denominator_invalid")
         if cfg.fallback_on_negative and torch.any(den <= cfg.eps):
