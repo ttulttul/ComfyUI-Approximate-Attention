@@ -515,7 +515,7 @@ class ClockedSweepValues(io.ComfyNode):
                     [io.AnyType],
                 ),
             ],
-            outputs=[io.AnyType.Output("values")],
+            outputs=[io.Float.Output("values", is_output_list=True)],
             is_experimental=True,
         )
 
@@ -582,10 +582,10 @@ class Combinations(io.ComfyNode):
                 ),
             ],
             outputs=[
-                io.AnyType.Output("a_out"),
-                io.AnyType.Output("b_out"),
-                io.AnyType.Output("c_out"),
-                io.AnyType.Output("d_out"),
+                io.Float.Output("a_out", is_output_list=True),
+                io.Float.Output("b_out", is_output_list=True),
+                io.Float.Output("c_out", is_output_list=True),
+                io.Float.Output("d_out", is_output_list=True),
             ],
             is_experimental=True,
         )

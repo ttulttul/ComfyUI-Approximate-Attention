@@ -130,11 +130,11 @@ The `HybridTaylorAttentionBackend` node patches Flux's attention function at run
 
 ## Clocked Sweep Values
 
-The `ClockedSweepValues` node maps a clock list to evenly distributed sweep values. Provide a clock list (any list of floats; length defines output length) and a list of values to sweep. The output is a list the same length as the clock, split into equal contiguous segments per value. You can also enter a single integer string (e.g., `30`) to create a 1..N clock, or leave the clock blank to infer length from the values list.
+The `ClockedSweepValues` node maps a clock list to evenly distributed sweep values. Provide a clock list (any list of floats; length defines output length) and a list of values to sweep. The output is a float list (ComfyUI list output) the same length as the clock, split into equal contiguous segments per value. You can also enter a single integer string (e.g., `30`) to create a 1..N clock, or leave the clock blank to infer length from the values list.
 
 ## Combinations
 
-The `Combinations` node takes up to four value lists (A–D) and returns outputs that cycle each list to cover all combinations. With A=[1,2,3] and B=[4,5], the outputs are:
+The `Combinations` node takes up to four value lists (A–D) and returns float-list outputs that cycle each list to cover all combinations. With A=[1,2,3] and B=[4,5], the outputs are:
 - A_out = [1,2,3,1,2,3]
 - B_out = [4,5,4,5,4,5]
 
