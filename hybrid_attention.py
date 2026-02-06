@@ -20,6 +20,7 @@ class HybridAttentionConfig:
     enabled: bool = True
     local_window: int = 512
     local_chunk: int = 256
+    prefix_tokens: int = 0
     global_dim: int = 16
     global_P: int = 2
     global_weight: float = 0.1
@@ -191,6 +192,7 @@ def _local_attention(
     transformer_options: Optional[dict],
     window: int,
     chunk: int,
+    prefix_tokens: int,
 ):
     from comfy.ldm.modules.attention import optimized_attention
 
@@ -206,11 +208,31 @@ def _local_attention(
         end = min(start + chunk, n_q)
         k_start = max(0, start - window)
         k_end = min(n_k, end + window)
-        mask_slice = _slice_mask(mask, start, end, k_start, k_end)
+        if prefix_tokens > 0 and k_start > prefix_tokens:
+            k_prefix = k[:, :, :prefix_tokens, :]
+            v_prefix = v[:, :, :prefix_tokens, :]
+            k_local = k[:, :, k_start:k_end, :]
+            v_local = v[:, :, k_start:k_end, :]
+            k_cat = torch.cat([k_prefix, k_local], dim=2)
+            v_cat = torch.cat([v_prefix, v_local], dim=2)
+            if mask is not None:
+                mask_prefix = _slice_mask(mask, start, end, 0, prefix_tokens)
+                mask_local = _slice_mask(mask, start, end, k_start, k_end)
+                if mask_prefix is not None and mask_local is not None:
+                    mask_slice = torch.cat([mask_prefix, mask_local], dim=-1)
+                else:
+                    mask_slice = None
+            else:
+                mask_slice = None
+        else:
+            k_cat = k[:, :, k_start:k_end, :]
+            v_cat = v[:, :, k_start:k_end, :]
+            mask_slice = _slice_mask(mask, start, end, k_start, k_end)
+
         out[:, start:end, :] = optimized_attention(
             q[:, :, start:end, :],
-            k[:, :, k_start:k_end, :],
-            v[:, :, k_start:k_end, :],
+            k_cat,
+            v_cat,
             heads,
             skip_reshape=True,
             mask=mask_slice,
@@ -249,9 +271,26 @@ def hybrid_attention(q, k, v, pe, mask=None, transformer_options=None):
         q_rope, k_rope = q, k
 
     heads = q.shape[1]
-    local_out = _local_attention(q_rope, k_rope, v, heads, mask, transformer_options, cfg.local_window, cfg.local_chunk)
+    local_out = _local_attention(
+        q_rope,
+        k_rope,
+        v,
+        heads,
+        mask,
+        transformer_options,
+        cfg.local_window,
+        cfg.local_chunk,
+        cfg.prefix_tokens,
+    )
 
     if global_weight <= 0:
+        if cfg.log_steps:
+            logger.info(
+                "Hybrid attention: sigma=%s local_window=%s prefix_tokens=%s global_weight=0 (global skipped)",
+                sigma,
+                cfg.local_window,
+                cfg.prefix_tokens,
+            )
         return local_out
 
     key_mask = None
@@ -275,9 +314,10 @@ def hybrid_attention(q, k, v, pe, mask=None, transformer_options=None):
     out = local_out + weight * global_out
     if cfg.log_steps:
         logger.info(
-            "Hybrid attention: sigma=%s local_window=%s global_dim=%s global_P=%s global_weight=%.3g",
+            "Hybrid attention: sigma=%s local_window=%s prefix_tokens=%s global_dim=%s global_P=%s global_weight=%.3g",
             sigma,
             cfg.local_window,
+            cfg.prefix_tokens,
             cfg.global_dim,
             cfg.global_P,
             global_weight,
