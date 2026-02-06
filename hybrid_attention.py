@@ -79,10 +79,10 @@ def _compute_global_weight(cfg: HybridAttentionConfig, sigma: Optional[float]) -
     if cfg.global_sigma_high <= cfg.global_sigma_low or cfg.global_sigma_high <= 0:
         return cfg.global_weight
     if sigma <= cfg.global_sigma_low:
-        return 0.0
-    if sigma >= cfg.global_sigma_high:
         return cfg.global_weight
-    return cfg.global_weight * (sigma - cfg.global_sigma_low) / (cfg.global_sigma_high - cfg.global_sigma_low)
+    if sigma >= cfg.global_sigma_high:
+        return 0.0
+    return cfg.global_weight * (cfg.global_sigma_high - sigma) / (cfg.global_sigma_high - cfg.global_sigma_low)
 
 
 def _compute_local_window(cfg: HybridAttentionConfig, sigma: Optional[float]) -> int:
@@ -94,8 +94,8 @@ def _compute_local_window(cfg: HybridAttentionConfig, sigma: Optional[float]) ->
         return max(0, int(cfg.local_window_min))
     if sigma >= cfg.local_window_sigma_high:
         return max(0, int(cfg.local_window_max))
-    t = (sigma - cfg.local_window_sigma_low) / (cfg.local_window_sigma_high - cfg.local_window_sigma_low)
-    window = cfg.local_window_min + (cfg.local_window_max - cfg.local_window_min) * t
+    t = (cfg.local_window_sigma_high - sigma) / (cfg.local_window_sigma_high - cfg.local_window_sigma_low)
+    window = cfg.local_window_max + (cfg.local_window_min - cfg.local_window_max) * t
     return max(0, int(round(window)))
 
 
