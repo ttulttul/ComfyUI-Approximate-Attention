@@ -439,17 +439,22 @@ class HybridTaylorAttentionBackend(io.ComfyNode):
                 force_fp32,
                 log_steps,
             )
-            if not transformer_options.get("_hybrid_wrapper_added"):
-                patcher_extension.add_wrapper(
-                    patcher_extension.WrappersMP.DIFFUSION_MODEL,
-                    hybrid_attention.hybrid_wrapper,
+            if not transformer_options.get("_hybrid_callbacks_added"):
+                patcher_extension.add_callback(
+                    patcher_extension.CallbacksMP.ON_PRE_RUN,
+                    hybrid_attention.pre_run_callback,
                     transformer_options,
                 )
-                transformer_options["_hybrid_wrapper_added"] = True
+                patcher_extension.add_callback(
+                    patcher_extension.CallbacksMP.ON_CLEANUP,
+                    hybrid_attention.cleanup_callback,
+                    transformer_options,
+                )
+                transformer_options["_hybrid_callbacks_added"] = True
         else:
             transformer_options.pop("hybrid_taylor_attention", None)
-            if transformer_options.get("_hybrid_wrapper_added"):
-                transformer_options["_hybrid_wrapper_added"] = False
+            if transformer_options.get("_hybrid_callbacks_added"):
+                transformer_options["_hybrid_callbacks_added"] = False
 
         return io.NodeOutput(m)
 

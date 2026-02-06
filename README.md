@@ -119,7 +119,7 @@ python benchmarks/benchmark_flux_forward.py --device cuda --dtype float16 --heig
 
 ## Hybrid Local/Global Attention (Flux RoPE)
 
-The `HybridTaylorAttentionBackend` node patches Flux's attention function at runtime per diffusion-model call to support a hybrid strategy:
+The `HybridTaylorAttentionBackend` node patches Flux's attention function at runtime per diffusion-model call (via model pre-run/cleanup callbacks) to support a hybrid strategy:
 
 - **Local exact attention** (with RoPE) in a sliding window.
 - **Global low-dim Taylor approximation** using pre-RoPE Q/K projected to a small dimension.

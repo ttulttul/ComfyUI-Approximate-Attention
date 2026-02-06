@@ -376,3 +376,19 @@ def hybrid_wrapper(executor, *args, **kwargs):
     finally:
         kwargs.pop("_hybrid_wrapper_active", None)
         restore_flux_attention()
+
+
+def pre_run_callback(patcher):
+    transformer_options = getattr(patcher.model, "model_options", {}).get("transformer_options", {})
+    cfg = transformer_options.get("hybrid_taylor_attention")
+    if not cfg or not cfg.get("enabled", False):
+        return
+    patch_flux_attention()
+
+
+def cleanup_callback(patcher):
+    transformer_options = getattr(patcher.model, "model_options", {}).get("transformer_options", {})
+    cfg = transformer_options.get("hybrid_taylor_attention")
+    if not cfg or not cfg.get("enabled", False):
+        return
+    restore_flux_attention()
