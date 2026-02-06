@@ -12,6 +12,7 @@ import taylor_sym_features
 logger = logging.getLogger(__name__)
 
 _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
+_PATCH_DEPTH = 0
 _PCA_CACHE: Dict[Tuple[torch.device, int, int], torch.Tensor] = {}
 
 
@@ -326,25 +327,47 @@ def hybrid_attention(q, k, v, pe, mask=None, transformer_options=None):
 
 
 def enable_hybrid_attention() -> None:
-    global _ORIGINAL_FLUX_ATTENTION
-    if _ORIGINAL_FLUX_ATTENTION:
-        return
-    import comfy.ldm.flux.math as flux_math
-    import comfy.ldm.flux.layers as flux_layers
-    _ORIGINAL_FLUX_ATTENTION["math"] = flux_math.attention
-    _ORIGINAL_FLUX_ATTENTION["layers"] = flux_layers.attention
-    flux_math.attention = hybrid_attention
-    flux_layers.attention = hybrid_attention
-    logger.info("Hybrid Taylor attention enabled (Flux attention patched).")
+    patch_flux_attention()
 
 
 def disable_hybrid_attention() -> None:
-    global _ORIGINAL_FLUX_ATTENTION
-    if not _ORIGINAL_FLUX_ATTENTION:
+    restore_flux_attention()
+
+
+def patch_flux_attention() -> None:
+    global _ORIGINAL_FLUX_ATTENTION, _PATCH_DEPTH
+    if _PATCH_DEPTH == 0:
+        import comfy.ldm.flux.math as flux_math
+        import comfy.ldm.flux.layers as flux_layers
+        _ORIGINAL_FLUX_ATTENTION["math"] = flux_math.attention
+        _ORIGINAL_FLUX_ATTENTION["layers"] = flux_layers.attention
+        flux_math.attention = hybrid_attention
+        flux_layers.attention = hybrid_attention
+        logger.info("Hybrid Taylor attention enabled (Flux attention patched).")
+    _PATCH_DEPTH += 1
+
+
+def restore_flux_attention() -> None:
+    global _ORIGINAL_FLUX_ATTENTION, _PATCH_DEPTH
+    if _PATCH_DEPTH <= 0:
         return
-    import comfy.ldm.flux.math as flux_math
-    import comfy.ldm.flux.layers as flux_layers
-    flux_math.attention = _ORIGINAL_FLUX_ATTENTION.get("math", flux_math.attention)
-    flux_layers.attention = _ORIGINAL_FLUX_ATTENTION.get("layers", flux_layers.attention)
-    _ORIGINAL_FLUX_ATTENTION = {}
-    logger.info("Hybrid Taylor attention disabled (Flux attention restored).")
+    _PATCH_DEPTH -= 1
+    if _PATCH_DEPTH == 0 and _ORIGINAL_FLUX_ATTENTION:
+        import comfy.ldm.flux.math as flux_math
+        import comfy.ldm.flux.layers as flux_layers
+        flux_math.attention = _ORIGINAL_FLUX_ATTENTION.get("math", flux_math.attention)
+        flux_layers.attention = _ORIGINAL_FLUX_ATTENTION.get("layers", flux_layers.attention)
+        _ORIGINAL_FLUX_ATTENTION = {}
+        logger.info("Hybrid Taylor attention disabled (Flux attention restored).")
+
+
+def hybrid_wrapper(executor, *args, **kwargs):
+    transformer_options = kwargs.get("transformer_options")
+    cfg = transformer_options.get("hybrid_taylor_attention") if transformer_options else None
+    if not cfg or not cfg.get("enabled", False):
+        return executor.execute(*args, **kwargs)
+    patch_flux_attention()
+    try:
+        return executor.execute(*args, **kwargs)
+    finally:
+        restore_flux_attention()

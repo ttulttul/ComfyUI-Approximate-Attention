@@ -5,6 +5,7 @@ from typing import Dict, Any
 
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
+import comfy.patcher_extension as patcher_extension
 
 import taylor_attention
 import hybrid_attention
@@ -416,7 +417,6 @@ class HybridTaylorAttentionBackend(io.ComfyNode):
         transformer_options = m.model_options.setdefault("transformer_options", {})
 
         if enabled:
-            hybrid_attention.enable_hybrid_attention()
             transformer_options["hybrid_taylor_attention"] = _build_hybrid_config(
                 enabled,
                 local_window,
@@ -439,9 +439,17 @@ class HybridTaylorAttentionBackend(io.ComfyNode):
                 force_fp32,
                 log_steps,
             )
+            if not transformer_options.get("_hybrid_wrapper_added"):
+                patcher_extension.add_wrapper(
+                    patcher_extension.WrappersMP.DIFFUSION_MODEL,
+                    hybrid_attention.hybrid_wrapper,
+                    transformer_options,
+                )
+                transformer_options["_hybrid_wrapper_added"] = True
         else:
             transformer_options.pop("hybrid_taylor_attention", None)
-            hybrid_attention.disable_hybrid_attention()
+            if transformer_options.get("_hybrid_wrapper_added"):
+                transformer_options["_hybrid_wrapper_added"] = False
 
         return io.NodeOutput(m)
 
