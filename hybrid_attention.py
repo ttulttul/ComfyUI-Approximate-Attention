@@ -85,17 +85,24 @@ def _compute_global_weight(cfg: HybridAttentionConfig, sigma: Optional[float]) -
     return cfg.global_weight * (cfg.global_sigma_high - sigma) / (cfg.global_sigma_high - cfg.global_sigma_low)
 
 
-def _compute_local_window(cfg: HybridAttentionConfig, sigma: Optional[float]) -> int:
+def _compute_local_window(cfg: HybridAttentionConfig, sigma: Optional[float], full_window: int) -> int:
+    full_window = max(0, int(full_window))
+    def _resolve_window(value: int) -> int:
+        return full_window if int(value) == 0 else int(value)
+
     if sigma is None:
-        return int(cfg.local_window)
+        return _resolve_window(cfg.local_window)
     if cfg.local_window_sigma_high <= cfg.local_window_sigma_low or cfg.local_window_sigma_high <= 0:
-        return int(cfg.local_window)
+        return _resolve_window(cfg.local_window)
+
+    window_min = _resolve_window(cfg.local_window_min)
+    window_max = _resolve_window(cfg.local_window_max)
     if sigma <= cfg.local_window_sigma_low:
-        return max(0, int(cfg.local_window_min))
+        return max(0, int(window_min))
     if sigma >= cfg.local_window_sigma_high:
-        return max(0, int(cfg.local_window_max))
+        return max(0, int(window_max))
     t = (cfg.local_window_sigma_high - sigma) / (cfg.local_window_sigma_high - cfg.local_window_sigma_low)
-    window = cfg.local_window_max + (cfg.local_window_min - cfg.local_window_max) * t
+    window = window_max + (window_min - window_max) * t
     return max(0, int(round(window)))
 
 
@@ -396,7 +403,7 @@ def hybrid_attention(q, k, v, pe, mask=None, transformer_options=None):
         q_rope, k_rope = q, k
 
     heads = q.shape[1]
-    effective_window = _compute_local_window(cfg, sigma)
+    effective_window = _compute_local_window(cfg, sigma, k.shape[2])
     local_out = _local_attention(
         q_rope,
         k_rope,

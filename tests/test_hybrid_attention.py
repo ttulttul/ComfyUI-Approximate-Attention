@@ -26,10 +26,11 @@ def test_compute_local_window_schedule():
             "local_window_sigma_high": 1.0,
         }
     )
-    assert hybrid_attention._compute_local_window(cfg, 0.4) == 128
-    assert hybrid_attention._compute_local_window(cfg, 1.0) == 0
-    mid = hybrid_attention._compute_local_window(cfg, 0.75)
-    assert 0 < mid < 128
+    full_window = 512
+    assert hybrid_attention._compute_local_window(cfg, 0.4, full_window) == 128
+    assert hybrid_attention._compute_local_window(cfg, 1.0, full_window) == full_window
+    mid = hybrid_attention._compute_local_window(cfg, 0.75, full_window)
+    assert 128 < mid < full_window
 
 
 def test_hybrid_global_weight_ramp():

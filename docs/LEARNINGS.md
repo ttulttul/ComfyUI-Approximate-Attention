@@ -34,4 +34,5 @@
 - PCA projection cache now keys by dtype to avoid bf16/float32 matmul mismatches when force_fp32 is disabled.
 - Hybrid local window can be scheduled by sigma (min/max + sigma low/high) to use full attention early and windowed attention later.
 - Hybrid global weight ramp now decreases with sigma (full at low sigma, zero at high sigma) so approximations can be enabled later in sampling.
+- Local window scheduling treats a value of 0 as "full attention" and substitutes the current sequence length during interpolation.
 - Hybrid global Taylor now aligns accumulation dtype with force_fp32 to avoid bf16/fp32 einsum mismatches.
