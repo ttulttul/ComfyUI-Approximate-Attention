@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
 _PATCH_DEPTH = 0
-_PCA_CACHE: Dict[Tuple[torch.device, int, int], torch.Tensor] = {}
+_PCA_CACHE: Dict[Tuple[torch.device, int, int, torch.dtype], torch.Tensor] = {}
 _HYBRID_QUALITY: Dict[str, float] = {"sum_abs": 0.0, "sum_rel": 0.0, "max_abs": 0.0, "max_rel": 0.0, "samples": 0.0, "calls": 0.0}
 _QUALITY_SAMPLES = 8
 
@@ -97,9 +97,11 @@ def _project_pca(q: torch.Tensor, k: torch.Tensor, d_low: int, samples: int) -> 
     device = q.device
     dim = q.shape[-1]
     d_low = min(d_low, dim)
-    key = (device, dim, d_low)
+    key = (device, dim, d_low, q.dtype)
     cached = _PCA_CACHE.get(key)
     if cached is not None:
+        if cached.dtype != q.dtype:
+            return cached.to(dtype=q.dtype)
         return cached
 
     qk = torch.cat([q, k], dim=2)

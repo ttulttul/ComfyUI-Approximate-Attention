@@ -40,6 +40,14 @@ def test_project_pca_falls_back_on_too_few_samples():
     assert torch.allclose(proj.cpu(), eye_slice)
 
 
+def test_project_pca_respects_dtype_in_cache():
+    hybrid_attention._PCA_CACHE.clear()
+    q = torch.randn(1, 1, 0, 4, dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 1, 4, dtype=torch.bfloat16)
+    proj = hybrid_attention._project_pca(q, k, d_low=2, samples=0)
+    assert proj.dtype == torch.bfloat16
+
+
 def test_pre_run_callback_reads_model_options(monkeypatch):
     called = {"patch": 0}
 
