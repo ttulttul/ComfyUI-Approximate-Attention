@@ -35,4 +35,5 @@
 - Hybrid local window can be scheduled by sigma (min/max + sigma low/high) to use full attention early and windowed attention later.
 - Hybrid global weight ramp now decreases with sigma (full at low sigma, zero at high sigma) so approximations can be enabled later in sampling.
 - Local window scheduling treats a value of 0 as "full attention" and substitutes the current sequence length during interpolation.
+- Local window scheduling now uses a smoothstep (sigmoid-like) curve for gentler start/end transitions.
 - Hybrid global Taylor now aligns accumulation dtype with force_fp32 to avoid bf16/fp32 einsum mismatches.

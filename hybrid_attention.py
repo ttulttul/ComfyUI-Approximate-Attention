@@ -102,6 +102,8 @@ def _compute_local_window(cfg: HybridAttentionConfig, sigma: Optional[float], fu
     if sigma >= cfg.local_window_sigma_high:
         return max(0, int(window_max))
     t = (cfg.local_window_sigma_high - sigma) / (cfg.local_window_sigma_high - cfg.local_window_sigma_low)
+    # Smoothstep easing for gentler start/end and faster mid-transition.
+    t = t * t * (3.0 - 2.0 * t)
     window = window_max + (window_min - window_max) * t
     return max(0, int(round(window)))
 
