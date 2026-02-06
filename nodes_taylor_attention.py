@@ -9,6 +9,7 @@ import comfy.patcher_extension as patcher_extension
 
 import taylor_attention
 import hybrid_attention
+import sweep_utils
 
 logger = logging.getLogger(__name__)
 
@@ -486,10 +487,55 @@ class HybridTaylorAttentionBackend(io.ComfyNode):
         return io.NodeOutput(m)
 
 
+class ClockedSweepValues(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ClockedSweepValues",
+            display_name="Clocked Sweep Values",
+            category="advanced/scheduling",
+            description="Map a clock list to evenly distributed sweep values.",
+            inputs=[
+                io.MultiType.Input(
+                    io.String.Input(
+                        "clock",
+                        multiline=True,
+                        placeholder="0, 1, 2",
+                        tooltip="Clock list (length defines output length). Accepts JSON list, comma/space-separated values, or a list input.",
+                    ),
+                    [io.AnyType],
+                ),
+                io.MultiType.Input(
+                    io.String.Input(
+                        "values",
+                        multiline=True,
+                        placeholder="0.1, 0.2, 0.3",
+                        tooltip="Values to sweep across the clock (JSON list, comma/space-separated, or list input).",
+                    ),
+                    [io.AnyType],
+                ),
+            ],
+            outputs=[io.AnyType.Output("values")],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, clock, values) -> io.NodeOutput:
+        clock_list, values_list = sweep_utils.parse_clock_and_values(clock, values)
+        output = sweep_utils.build_clocked_sweep(clock_list, values_list)
+        logger.info(
+            "Clocked sweep built: clock=%d values=%d output=%d",
+            len(clock_list),
+            len(values_list),
+            len(output),
+        )
+        return io.NodeOutput(output)
+
+
 class TaylorAttentionExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [TaylorAttentionBackend, HybridTaylorAttentionBackend]
+        return [TaylorAttentionBackend, HybridTaylorAttentionBackend, ClockedSweepValues]
 
 
 async def comfy_entrypoint() -> TaylorAttentionExtension:

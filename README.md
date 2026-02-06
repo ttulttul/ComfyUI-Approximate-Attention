@@ -128,5 +128,13 @@ The `HybridTaylorAttentionBackend` node patches Flux's attention function at run
 - Quality stats logs include the hybrid config parameters used for the run.
 - When `log_quality_stats` is enabled, the results are also appended to `output/hybrid-attention-results.jsonl` with config + meta (sigma, shapes, inferred latent resolution, etc.).
 
+## Clocked Sweep Values
+
+The `ClockedSweepValues` node maps a clock list to evenly distributed sweep values. Provide a clock list (any list of floats; length defines output length) and a list of values to sweep. The output is a list the same length as the clock, split into equal contiguous segments per value.
+
+Example: clock length 100, values `[1, 2, 3]` → 33 entries of 1, 33 of 2, 34 of 3.
+
+Inputs accept JSON arrays, comma/space-separated strings, or list inputs.
+
 This is intended for very large images where full attention is prohibitive. It is an approximate inference hack and will change model behavior.
 - Large head dimensions can make feature expansion prohibitively large; `max_feature_dim_R` and `max_head_dim` guard against this.
