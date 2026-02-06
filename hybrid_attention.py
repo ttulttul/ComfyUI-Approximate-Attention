@@ -364,14 +364,15 @@ def restore_flux_attention() -> None:
 def hybrid_wrapper(executor, *args, **kwargs):
     transformer_options = kwargs.get("transformer_options")
     cfg = transformer_options.get("hybrid_taylor_attention") if transformer_options else None
+    if not cfg or not cfg.get("enabled", False):
+        return executor.execute(*args, **kwargs)
     if kwargs.get("_hybrid_wrapper_active"):
         return executor.execute(*args, **kwargs)
     kwargs["_hybrid_wrapper_active"] = True
-    if not cfg or not cfg.get("enabled", False):
-        return executor.execute(*args, **kwargs)
     patch_flux_attention()
     try:
-        return executor.execute(*args, **kwargs)
+        next_exec = executor._create_next_executor()
+        return next_exec.execute(*args, **kwargs)
     finally:
         kwargs.pop("_hybrid_wrapper_active", None)
         restore_flux_attention()
