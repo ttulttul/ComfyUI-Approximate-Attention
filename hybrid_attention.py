@@ -11,7 +11,7 @@ import taylor_sym_features
 
 logger = logging.getLogger(__name__)
 
-_ORIGINAL_FLUX_ATTENTION = None
+_ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
 _PCA_CACHE: Dict[Tuple[torch.device, int, int], torch.Tensor] = {}
 
 
@@ -282,19 +282,24 @@ def hybrid_attention(q, k, v, pe, mask=None, transformer_options=None):
 
 def enable_hybrid_attention() -> None:
     global _ORIGINAL_FLUX_ATTENTION
-    if _ORIGINAL_FLUX_ATTENTION is not None:
+    if _ORIGINAL_FLUX_ATTENTION:
         return
     import comfy.ldm.flux.math as flux_math
-    _ORIGINAL_FLUX_ATTENTION = flux_math.attention
+    import comfy.ldm.flux.layers as flux_layers
+    _ORIGINAL_FLUX_ATTENTION["math"] = flux_math.attention
+    _ORIGINAL_FLUX_ATTENTION["layers"] = flux_layers.attention
     flux_math.attention = hybrid_attention
+    flux_layers.attention = hybrid_attention
     logger.info("Hybrid Taylor attention enabled (Flux attention patched).")
 
 
 def disable_hybrid_attention() -> None:
     global _ORIGINAL_FLUX_ATTENTION
-    if _ORIGINAL_FLUX_ATTENTION is None:
+    if not _ORIGINAL_FLUX_ATTENTION:
         return
     import comfy.ldm.flux.math as flux_math
-    flux_math.attention = _ORIGINAL_FLUX_ATTENTION
-    _ORIGINAL_FLUX_ATTENTION = None
+    import comfy.ldm.flux.layers as flux_layers
+    flux_math.attention = _ORIGINAL_FLUX_ATTENTION.get("math", flux_math.attention)
+    flux_layers.attention = _ORIGINAL_FLUX_ATTENTION.get("layers", flux_layers.attention)
+    _ORIGINAL_FLUX_ATTENTION = {}
     logger.info("Hybrid Taylor attention disabled (Flux attention restored).")
