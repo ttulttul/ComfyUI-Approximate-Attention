@@ -45,3 +45,4 @@
 - ClockedSweepValues and Combinations outputs are marked as float list outputs so downstream nodes receive expanded list values.
 - Flux2TTR patches Flux attention via pre-run/cleanup callbacks and resolves per-layer TTR modules using `transformer_options["block_type"]` and `block_index`, so single-block replacements can stay layer-specific without editing ComfyUI core.
 - ComfyUI node execution may run under `torch.inference_mode()`, so any in-node distillation/training must explicitly use `torch.inference_mode(False)` and `torch.enable_grad()` around backward passes.
+- Flux2TTR inference speed improved substantially by replacing per-token Python scan loops with chunked vectorized prefix updates (`cumsum` over `k⊗v`), and by running CUDA inference in input dtype (bf16/fp16) while keeping training in fp32.

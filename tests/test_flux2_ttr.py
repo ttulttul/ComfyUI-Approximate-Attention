@@ -60,6 +60,18 @@ def test_ttr_flux_layer_shape_and_finite():
     assert torch.isfinite(out).all()
 
 
+def test_ttr_scan_chunked_matches_token_scan():
+    torch.manual_seed(0)
+    cell = flux2_ttr.TTRCell(feature_dim=16, value_dim=8)
+    q = torch.randn(3, 19, 16)
+    k = torch.randn(3, 19, 16)
+    v = torch.randn(3, 19, 8)
+    out_token = cell.scan(q, k, v, chunk_size=1)
+    out_chunked = cell.scan(q, k, v, chunk_size=7)
+    assert out_token.shape == out_chunked.shape
+    assert torch.allclose(out_token, out_chunked, atol=1e-6, rtol=1e-5)
+
+
 def test_runtime_training_uses_teacher_output_then_switches_to_inference():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
@@ -84,6 +96,40 @@ def test_runtime_training_uses_teacher_output_then_switches_to_inference():
     out_infer = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
     assert out_infer.shape == baseline.shape
     assert torch.isfinite(out_infer).all()
+
+
+def test_runtime_layer_range_falls_back_to_teacher():
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+        layer_start=2,
+        layer_end=4,
+    )
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+    opts = {"block_type": "single", "block_index": 0}
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, mask, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg)
+
+    baseline = fallback(q, k, v, None)
+    out = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    assert torch.allclose(out, baseline)
+    assert not runtime.layers
+
+
+def test_runtime_resolve_inference_dtype_cpu_is_fp32():
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0, inference_mixed_precision=True)
+    x = torch.randn(1, 1, 2, 4, dtype=torch.bfloat16)
+    assert runtime._resolve_inference_dtype(x) == torch.float32
+    runtime.inference_mixed_precision = False
+    assert runtime._resolve_inference_dtype(x) == torch.float32
 
 
 def test_runtime_checkpoint_round_trip(tmp_path):

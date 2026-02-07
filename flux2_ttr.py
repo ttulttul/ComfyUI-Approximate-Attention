@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
 import torch
+from einops import rearrange
 from torch import nn
 
 logger = logging.getLogger(__name__)
@@ -51,22 +52,37 @@ class TTRCell(nn.Module):
         output = torch.einsum("bf,bfv->bv", q, w_new)
         return output, w_new
 
-    def scan(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def scan(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: int = 128) -> torch.Tensor:
         batch_heads, seq_len, _ = q.shape
+        if seq_len == 0:
+            return v.new_zeros((batch_heads, 0, self.value_dim))
+
+        chunk = max(1, int(chunk_size))
         w_state = q.new_zeros((batch_heads, self.feature_dim, self.value_dim))
-        outputs = []
-        for token_idx in range(seq_len):
-            out_t, w_state = self.forward_chunk(q[:, token_idx, :], k[:, token_idx, :], v[:, token_idx, :], w_state)
-            # Average by seen token count to keep the unrolled update numerically bounded.
-            outputs.append(out_t / float(token_idx + 1))
-        return torch.stack(outputs, dim=1)
+        inv_counts = torch.arange(1, seq_len + 1, device=q.device, dtype=q.dtype).view(1, seq_len, 1)
+        output_chunks = []
+        for start in range(0, seq_len, chunk):
+            end = min(start + chunk, seq_len)
+            q_chunk = q[:, start:end, :]
+            k_chunk = k[:, start:end, :]
+            v_chunk = v[:, start:end, :]
+
+            # Prefix update of W per token inside the chunk.
+            kv_assoc = torch.einsum("bnf,bnv->bnfv", k_chunk, v_chunk)
+            w_prefix = kv_assoc.cumsum(dim=1) + w_state.unsqueeze(1)
+            out_chunk = torch.einsum("bnf,bnfv->bnv", q_chunk, w_prefix)
+            out_chunk = out_chunk * inv_counts[:, start:end, :].reciprocal()
+            output_chunks.append(out_chunk)
+            w_state = w_prefix[:, -1, :, :]
+        return torch.cat(output_chunks, dim=1)
 
 
 class TTRFluxLayer(nn.Module):
-    def __init__(self, head_dim: int, feature_dim: int = 256):
+    def __init__(self, head_dim: int, feature_dim: int = 256, scan_chunk_tokens: int = 128):
         super().__init__()
         self.head_dim = int(head_dim)
         self.feature_dim = validate_feature_dim(feature_dim)
+        self.scan_chunk_tokens = max(1, int(scan_chunk_tokens))
         self.phi_net = nn.Sequential(
             nn.Linear(self.head_dim, self.feature_dim),
             nn.SiLU(),
@@ -82,20 +98,26 @@ class TTRFluxLayer(nn.Module):
         if q.shape[-1] != self.head_dim:
             raise ValueError(f"TTRFluxLayer expected head_dim={self.head_dim}, got {q.shape[-1]}.")
 
-        batch, heads, seq_len, dim = q.shape
-        q_flat = q.reshape(batch * heads, seq_len, dim)
-        k_flat = k.reshape(batch * heads, seq_len, dim)
-        v_flat = v.reshape(batch * heads, seq_len, dim)
+        batch, heads, _, _ = q.shape
+        q_flat = rearrange(q, "b h n d -> (b h) n d")
+        k_flat = rearrange(k, "b h n d -> (b h) n d")
+        v_flat = rearrange(v, "b h n d -> (b h) n d")
 
-        q_phi = self.phi_net(q_flat)
-        k_phi = self.phi_net(k_flat)
+        # One shared pass through phi_net reduces kernel launch overhead.
+        qk_phi = self.phi_net(torch.cat([q_flat, k_flat], dim=0))
+        q_phi, k_phi = torch.split(qk_phi, q_flat.shape[0], dim=0)
 
-        out_fwd = self.regressor.scan(q_phi, k_phi, v_flat)
-        out_rev = self.regressor.scan(torch.flip(q_phi, dims=(1,)), torch.flip(k_phi, dims=(1,)), torch.flip(v_flat, dims=(1,)))
+        out_fwd = self.regressor.scan(q_phi, k_phi, v_flat, chunk_size=self.scan_chunk_tokens)
+        out_rev = self.regressor.scan(
+            torch.flip(q_phi, dims=(1,)),
+            torch.flip(k_phi, dims=(1,)),
+            torch.flip(v_flat, dims=(1,)),
+            chunk_size=self.scan_chunk_tokens,
+        )
         out_rev = torch.flip(out_rev, dims=(1,))
 
         out = out_fwd + out_rev
-        return out.reshape(batch, heads, seq_len, dim)
+        return rearrange(out, "(b h) n d -> b h n d", b=batch, h=heads)
 
 
 def _key_mask_from_mask(mask: Optional[torch.Tensor], batch: int, keys: int) -> Optional[torch.Tensor]:
@@ -231,11 +253,19 @@ class Flux2TTRRuntime:
         learning_rate: float,
         training: bool,
         steps: int,
+        scan_chunk_size: int = 128,
+        layer_start: int = -1,
+        layer_end: int = -1,
+        inference_mixed_precision: bool = True,
     ):
         self.feature_dim = validate_feature_dim(feature_dim)
         self.learning_rate = float(learning_rate)
         self.training_enabled = bool(training)
         self.steps_remaining = max(0, int(steps))
+        self.scan_chunk_size = max(1, int(scan_chunk_size))
+        self.layer_start = int(layer_start)
+        self.layer_end = int(layer_end)
+        self.inference_mixed_precision = bool(inference_mixed_precision)
         self.last_loss = float("nan")
         self.layers: Dict[str, TTRFluxLayer] = {}
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
@@ -250,7 +280,11 @@ class Flux2TTRRuntime:
     def _ensure_layer(self, layer_key: str, head_dim: int, device: torch.device) -> TTRFluxLayer:
         layer = self.layers.get(layer_key)
         if layer is None:
-            layer = TTRFluxLayer(head_dim=head_dim, feature_dim=self.feature_dim).to(device=device, dtype=torch.float32)
+            layer = TTRFluxLayer(
+                head_dim=head_dim,
+                feature_dim=self.feature_dim,
+                scan_chunk_tokens=self.scan_chunk_size,
+            ).to(device=device, dtype=torch.float32)
             optimizer = torch.optim.AdamW(layer.parameters(), lr=self.learning_rate)
             pending = self.pending_state.get(layer_key)
             if pending:
@@ -276,6 +310,45 @@ class Flux2TTRRuntime:
                     if torch.is_tensor(value):
                         state[key] = value.to(device=device)
         return layer
+
+    def _set_layer_dtype(self, layer_key: str, layer: TTRFluxLayer, target_dtype: torch.dtype) -> None:
+        current_dtype = next(layer.parameters()).dtype
+        if current_dtype == target_dtype:
+            return
+        layer.to(dtype=target_dtype)
+        optimizer = self.optimizers.get(layer_key)
+        if optimizer is None:
+            return
+        device = next(layer.parameters()).device
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if not torch.is_tensor(value):
+                    continue
+                if torch.is_floating_point(value):
+                    state[key] = value.to(device=device, dtype=target_dtype)
+                else:
+                    state[key] = value.to(device=device)
+
+    def _resolve_inference_dtype(self, q: torch.Tensor) -> torch.dtype:
+        if not self.inference_mixed_precision:
+            return torch.float32
+        if q.device.type == "cuda" and q.dtype in (torch.float16, torch.bfloat16):
+            return q.dtype
+        return torch.float32
+
+    def _is_single_block_selected(self, transformer_options: Optional[dict]) -> bool:
+        if transformer_options is None:
+            return True
+        block_type = transformer_options.get("block_type", "single")
+        if block_type != "single":
+            return False
+        block_index = transformer_options.get("block_index")
+        if isinstance(block_index, int):
+            if self.layer_start >= 0 and block_index < self.layer_start:
+                return False
+            if self.layer_end >= 0 and block_index > self.layer_end:
+                return False
+        return True
 
     def _ensure_projection(
         self,
@@ -337,6 +410,8 @@ class Flux2TTRRuntime:
         fallback_attention,
     ) -> torch.Tensor:
         layer_key = self._layer_key_from_options(transformer_options)
+        if not self._is_single_block_selected(transformer_options):
+            return self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
         if not layer_key.startswith("single:"):
             return self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
 
@@ -356,6 +431,7 @@ class Flux2TTRRuntime:
         layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
 
         if self.training_enabled and self.steps_remaining > 0:
+            self._set_layer_dtype(layer_key, layer, torch.float32)
             layer.train()
             with torch.inference_mode(False):
                 with torch.enable_grad():
@@ -384,10 +460,13 @@ class Flux2TTRRuntime:
             return teacher_out
 
         layer.eval()
-        q_in = q_eff.float()
-        k_in = k_eff.float()
-        v_in = v.float()
-        student = layer(q_in, k_in, v_in)
+        inference_dtype = self._resolve_inference_dtype(q_eff)
+        self._set_layer_dtype(layer_key, layer, inference_dtype)
+        q_in = q_eff.to(dtype=inference_dtype)
+        k_in = k_eff.to(dtype=inference_dtype)
+        v_in = v.to(dtype=inference_dtype)
+        with torch.no_grad():
+            student = layer(q_in, k_in, v_in)
         student_out = _flatten_heads(student).to(dtype=v.dtype)
         return student_out
 
@@ -503,6 +582,10 @@ class Flux2TTRRuntime:
             "feature_dim": self.feature_dim,
             "learning_rate": self.learning_rate,
             "last_loss": self.last_loss,
+            "scan_chunk_size": self.scan_chunk_size,
+            "layer_start": self.layer_start,
+            "layer_end": self.layer_end,
+            "inference_mixed_precision": self.inference_mixed_precision,
             "layer_specs": {
                 key: {"num_heads": spec.num_heads, "head_dim": spec.head_dim}
                 for key, spec in self.layer_specs.items()
@@ -533,6 +616,10 @@ class Flux2TTRRuntime:
 
         self.learning_rate = float(payload.get("learning_rate", self.learning_rate))
         self.last_loss = float(payload.get("last_loss", self.last_loss))
+        self.scan_chunk_size = max(1, int(payload.get("scan_chunk_size", self.scan_chunk_size)))
+        self.layer_start = int(payload.get("layer_start", self.layer_start))
+        self.layer_end = int(payload.get("layer_end", self.layer_end))
+        self.inference_mixed_precision = bool(payload.get("inference_mixed_precision", self.inference_mixed_precision))
         specs = payload.get("layer_specs", {})
         for layer_key, meta in specs.items():
             try:

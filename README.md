@@ -139,6 +139,9 @@ The `Flux2TTR` node adds a train/load workflow for replacing Flux single-block a
   - `training` toggle
   - `checkpoint_path`
   - `feature_dim` (must be a multiple of 256 and at least 128)
+  - `scan_chunk_size` (token chunk size for the vectorized scan path)
+  - `layer_start` / `layer_end` (optional single-block index range to patch)
+  - `inference_mixed_precision` (use bf16/fp16 inference path on CUDA)
 - Outputs:
   - patched `MODEL` with Flux attention routed through TTR modules
   - `loss_value` from calibration/load state
@@ -147,6 +150,14 @@ Behavior:
 - `training=true`: runs an in-node distillation calibration loop (teacher = softmax attention) and optionally saves a checkpoint.
 - `training=false`: loads TTR weights from `checkpoint_path` and enables inference with TTR attention.
 - During model execution, Flux attention is patched on pre-run and restored on cleanup; single-block calls route to per-layer `TTRFluxLayer` instances keyed by `block_index`.
+- Inference uses a chunked vectorized scan instead of token-by-token Python loops for better throughput.
+
+Speed tips:
+- Distill once, then run with `training=false` for normal sampling.
+- Keep `feature_dim=256` unless quality demands a higher value.
+- Start `scan_chunk_size` around `128`; raise it for speed if VRAM allows, lower it if memory spikes.
+- Use `layer_start` / `layer_end` to patch only late single blocks as a cheap quality/speed tradeoff.
+- Keep `inference_mixed_precision=true` on CUDA for the fastest inference path.
 
 ## Clocked Sweep Values
 

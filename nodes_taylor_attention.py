@@ -519,6 +519,35 @@ class Flux2TTR(io.ComfyNode):
                     step=256,
                     tooltip="TTR feature dimension (must be a multiple of 256).",
                 ),
+                io.Int.Input(
+                    "scan_chunk_size",
+                    default=128,
+                    min=1,
+                    max=4096,
+                    step=1,
+                    tooltip="Token chunk size for vectorized TTR scan (smaller uses less VRAM, larger can be faster).",
+                ),
+                io.Int.Input(
+                    "layer_start",
+                    default=-1,
+                    min=-1,
+                    max=512,
+                    step=1,
+                    tooltip="Only apply TTR to single blocks with index >= layer_start (-1 disables).",
+                ),
+                io.Int.Input(
+                    "layer_end",
+                    default=-1,
+                    min=-1,
+                    max=512,
+                    step=1,
+                    tooltip="Only apply TTR to single blocks with index <= layer_end (-1 disables).",
+                ),
+                io.Boolean.Input(
+                    "inference_mixed_precision",
+                    default=True,
+                    tooltip="Use input dtype (bf16/fp16) for TTR inference on CUDA for speed.",
+                ),
             ],
             outputs=[io.Model.Output(), io.Float.Output("loss_value")],
             is_experimental=True,
@@ -535,6 +564,10 @@ class Flux2TTR(io.ComfyNode):
         training: bool,
         checkpoint_path: str,
         feature_dim: int,
+        scan_chunk_size: int,
+        layer_start: int,
+        layer_end: int,
+        inference_mixed_precision: bool,
     ) -> io.NodeOutput:
         feature_dim = flux2_ttr.validate_feature_dim(feature_dim)
         checkpoint_path = (checkpoint_path or "").strip()
@@ -554,6 +587,10 @@ class Flux2TTR(io.ComfyNode):
             learning_rate=float(learning_rate),
             training=bool(training),
             steps=train_steps,
+            scan_chunk_size=int(scan_chunk_size),
+            layer_start=int(layer_start),
+            layer_end=int(layer_end),
+            inference_mixed_precision=bool(inference_mixed_precision),
         )
         runtime.register_layer_specs(flux2_ttr.infer_flux_single_layer_specs(m))
 
@@ -585,6 +622,10 @@ class Flux2TTR(io.ComfyNode):
             "runtime_id": runtime_id,
             "training": runtime.training_enabled,
             "feature_dim": feature_dim,
+            "scan_chunk_size": int(scan_chunk_size),
+            "layer_start": int(layer_start),
+            "layer_end": int(layer_end),
+            "inference_mixed_precision": bool(inference_mixed_precision),
             "checkpoint_path": checkpoint_path,
         }
 
@@ -603,10 +644,14 @@ class Flux2TTR(io.ComfyNode):
         )
 
         logger.info(
-            "Flux2TTR configured: training=%s steps=%d feature_dim=%d checkpoint=%s loss=%.6g",
+            "Flux2TTR configured: training=%s steps=%d feature_dim=%d scan_chunk_size=%d layer_range=[%d,%d] mixed_precision=%s checkpoint=%s loss=%.6g",
             training,
             train_steps,
             feature_dim,
+            int(scan_chunk_size),
+            int(layer_start),
+            int(layer_end),
+            bool(inference_mixed_precision),
             checkpoint_path if checkpoint_path else "<none>",
             float(loss_value),
         )
