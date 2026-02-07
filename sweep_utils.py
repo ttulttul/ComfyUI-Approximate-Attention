@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from typing import Iterable, Sequence
 
 import torch
@@ -85,3 +86,25 @@ def build_combinations(values_lists: Sequence[Sequence[float]]) -> list[list[flo
     for values, length in zip(values_lists, lengths):
         outputs.append([float(values[i % length]) for i in range(total)])
     return outputs
+
+
+def generate_seed_batch(
+    seed: int,
+    count: int,
+    *,
+    min_value: int = 0,
+    max_value: int = 0xFFFFFFFFFFFFFFFF,
+) -> list[int]:
+    n = int(count)
+    if n <= 0:
+        raise ValueError("count must be > 0.")
+    lo = int(min_value)
+    hi = int(max_value)
+    if lo < 0:
+        raise ValueError("min_value must be >= 0.")
+    if hi < lo:
+        raise ValueError("max_value must be >= min_value.")
+
+    rng = random.Random(int(seed))
+    span = hi - lo + 1
+    return [lo + rng.randrange(span) for _ in range(n)]

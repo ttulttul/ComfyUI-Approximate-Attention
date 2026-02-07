@@ -74,3 +74,4 @@
 - Flux2TTR training/inference UX is cleaner when shared hyperparameters are emitted as a typed config object (`TTR_TRAINING_CONFIG`) and consumed by both phase nodes, while `run_attention` honors `controller_mask_override` and `controller_threshold` for controller training and quality/speed inference control.
 - Some ComfyUI `comfy_api.latest` builds do not expose `io.VAE`; node schemas should use a compatibility fallback (`AnyType`) to keep extension loading across API variants.
 - For VAE socket compatibility, some builds expose `io.Vae` (camel case) instead of `io.VAE`; checking both keeps node schemas portable.
+- Seed-sweep workflows are easier to build with a dedicated deterministic seed-batch node (`RandomSeedBatch`) instead of overloading float sweep nodes for integer seed generation.

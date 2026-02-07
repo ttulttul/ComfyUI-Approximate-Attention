@@ -1866,6 +1866,48 @@ class Flux2TTRController(io.ComfyNode):
         return io.NodeOutput(m)
 
 
+class RandomSeedBatch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="RandomSeedBatch",
+            display_name="Random Seed Batch",
+            category="advanced/scheduling",
+            description="Generate a deterministic list of random seeds from a base seed.",
+            inputs=[
+                io.Int.Input(
+                    "seed",
+                    default=0,
+                    min=0,
+                    max=0xFFFFFFFFFFFFFFFF,
+                    step=1,
+                    tooltip="Base seed used to deterministically generate the output seed list.",
+                ),
+                io.Int.Input(
+                    "count",
+                    default=8,
+                    min=1,
+                    max=4096,
+                    step=1,
+                    tooltip="Number of random seeds to generate.",
+                ),
+            ],
+            outputs=[io.Int.Output("seeds", is_output_list=True)],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, seed: int, count: int) -> io.NodeOutput:
+        seeds = sweep_utils.generate_seed_batch(int(seed), int(count))
+        logger.info(
+            "RandomSeedBatch generated %d seeds from base seed %d (first=%d).",
+            len(seeds),
+            int(seed),
+            int(seeds[0]) if seeds else -1,
+        )
+        return io.NodeOutput(seeds)
+
+
 class ClockedSweepValues(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -2006,6 +2048,7 @@ class TaylorAttentionExtension(ComfyExtension):
             Flux2TTRTrainer,
             Flux2TTRControllerTrainer,
             Flux2TTRController,
+            RandomSeedBatch,
             ClockedSweepValues,
             Combinations,
         ]

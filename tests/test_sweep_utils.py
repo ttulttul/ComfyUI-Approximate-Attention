@@ -41,3 +41,25 @@ def test_infer_clock_from_values():
 def test_parse_rejects_long_values():
     with pytest.raises(ValueError):
         sweep_utils.build_clocked_sweep([0.0], [1.0, 2.0])
+
+
+def test_generate_seed_batch_is_deterministic_for_same_seed():
+    a = sweep_utils.generate_seed_batch(1234, 5)
+    b = sweep_utils.generate_seed_batch(1234, 5)
+    assert a == b
+    assert len(a) == 5
+
+
+def test_generate_seed_batch_respects_bounds():
+    out = sweep_utils.generate_seed_batch(42, 64, min_value=10, max_value=20)
+    assert len(out) == 64
+    assert all(10 <= x <= 20 for x in out)
+
+
+def test_generate_seed_batch_validates_inputs():
+    with pytest.raises(ValueError):
+        sweep_utils.generate_seed_batch(0, 0)
+    with pytest.raises(ValueError):
+        sweep_utils.generate_seed_batch(0, 1, min_value=-1, max_value=10)
+    with pytest.raises(ValueError):
+        sweep_utils.generate_seed_batch(0, 1, min_value=10, max_value=9)
