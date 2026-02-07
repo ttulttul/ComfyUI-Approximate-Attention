@@ -153,6 +153,52 @@ def test_runtime_resolve_inference_dtype_cpu_is_fp32():
     assert runtime._resolve_inference_dtype(x) == torch.float32
 
 
+def test_memory_reserve_estimate_scales_with_training():
+    infer_bytes = flux2_ttr._estimate_flux2_ttr_memory_bytes(
+        batch=1,
+        heads=24,
+        seq_len=256,
+        head_dim=128,
+        feature_dim=256,
+        chunk_size=128,
+        dtype_size=4,
+        training=False,
+    )
+    train_bytes = flux2_ttr._estimate_flux2_ttr_memory_bytes(
+        batch=1,
+        heads=24,
+        seq_len=256,
+        head_dim=128,
+        feature_dim=256,
+        chunk_size=128,
+        dtype_size=4,
+        training=True,
+    )
+    assert infer_bytes > 0
+    assert train_bytes > infer_bytes
+
+
+def test_maybe_reserve_memory_dedupes(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("Memory reservation test requires CUDA device.")
+    calls = []
+
+    class _MM:
+        @staticmethod
+        def free_memory(mem_bytes, device):
+            calls.append((int(mem_bytes), str(device)))
+
+    monkeypatch.setattr(flux2_ttr, "model_management", _MM)
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    q = torch.randn(1, 2, 32, 4, device="cuda")
+    opts = {}
+
+    flux2_ttr._maybe_reserve_memory(runtime, q, opts, training=False, dtype_accum=torch.float32)
+    flux2_ttr._maybe_reserve_memory(runtime, q, opts, training=False, dtype_accum=torch.float32)
+    assert len(calls) == 1
+    assert "flux2_ttr_memory_reserved" in opts
+
+
 def test_runtime_checkpoint_round_trip(tmp_path):
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=4)

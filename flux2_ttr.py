@@ -16,6 +16,12 @@ logger = logging.getLogger(__name__)
 _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
 _PATCH_DEPTH = 0
 _RUNTIME_REGISTRY: Dict[str, "Flux2TTRRuntime"] = {}
+_MEMORY_RESERVE_FACTOR = 1.1
+
+try:
+    from comfy import model_management
+except Exception:
+    model_management = None
 
 
 def validate_feature_dim(feature_dim: int) -> int:
@@ -218,6 +224,89 @@ def _projection_matrix(in_dim: int, out_dim: int, seed: int, device: torch.devic
     generator = torch.Generator(device=device)
     generator.manual_seed(int(seed))
     return torch.randn((in_dim, out_dim), generator=generator, device=device, dtype=torch.float32) / math.sqrt(max(1, in_dim))
+
+
+def _estimate_flux2_ttr_memory_bytes(
+    batch: int,
+    heads: int,
+    seq_len: int,
+    head_dim: int,
+    feature_dim: int,
+    chunk_size: int,
+    dtype_size: int,
+    training: bool,
+) -> int:
+    bh = batch * heads
+    seq = max(1, int(seq_len))
+    chunk = min(seq, max(1, int(chunk_size)))
+
+    # Core forward tensors for phi projection + bidirectional scan.
+    cat_qk_elems = 2 * bh * seq * head_dim
+    phi_elems = 2 * bh * seq * feature_dim
+    state_elems = bh * feature_dim * head_dim
+    chunk_scan_elems = bh * chunk * feature_dim * head_dim * 2 + bh * chunk * head_dim
+    output_elems = 2 * bh * seq * head_dim
+
+    total_elems = cat_qk_elems + phi_elems + state_elems + chunk_scan_elems + output_elems
+
+    if training:
+        # Training keeps additional buffers for q/k/v clones and autograd.
+        train_clones = 3 * bh * seq * head_dim
+        total_elems += train_clones
+        total_elems = int(total_elems * 1.4)
+
+    return int(total_elems * dtype_size)
+
+
+def _maybe_reserve_memory(
+    runtime: "Flux2TTRRuntime",
+    q: torch.Tensor,
+    transformer_options: Optional[dict],
+    training: bool,
+    dtype_accum: torch.dtype,
+) -> None:
+    if model_management is None:
+        return
+    if q.device.type == "cpu":
+        return
+
+    batch, heads, seq_len, head_dim = q.shape
+    dtype_size = torch.tensor([], dtype=dtype_accum).element_size()
+    mem_bytes = _estimate_flux2_ttr_memory_bytes(
+        batch=batch,
+        heads=heads,
+        seq_len=seq_len,
+        head_dim=head_dim,
+        feature_dim=runtime.feature_dim,
+        chunk_size=runtime.scan_chunk_size,
+        dtype_size=dtype_size,
+        training=training,
+    )
+    mem_bytes = int(mem_bytes * _MEMORY_RESERVE_FACTOR)
+    if mem_bytes <= 0:
+        return
+
+    if transformer_options is not None:
+        key = (
+            "train" if training else "infer",
+            batch,
+            heads,
+            seq_len,
+            head_dim,
+            runtime.feature_dim,
+            runtime.scan_chunk_size,
+            dtype_size,
+            _MEMORY_RESERVE_FACTOR,
+        )
+        if transformer_options.get("flux2_ttr_memory_reserved") == key:
+            return
+        transformer_options["flux2_ttr_memory_reserved"] = key
+
+    try:
+        model_management.free_memory(mem_bytes, q.device)
+        logger.info("Flux2TTR reserved ~%.2f MB for %s", mem_bytes / (1024 * 1024), "training" if training else "inference")
+    except Exception as exc:
+        logger.warning("Flux2TTR reserve memory failed: %s", exc)
 
 
 def infer_flux_single_layer_specs(model: Any) -> list[FluxLayerSpec]:
@@ -434,6 +523,7 @@ class Flux2TTRRuntime:
             with torch.no_grad():
                 teacher_out = self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
             if self.training_enabled and self.steps_remaining > 0:
+                _maybe_reserve_memory(self, q_eff, transformer_options, training=True, dtype_accum=torch.float32)
                 with torch.inference_mode(False):
                     with torch.enable_grad():
                         layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
@@ -466,6 +556,7 @@ class Flux2TTRRuntime:
         layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
         layer.eval()
         inference_dtype = self._resolve_inference_dtype(q_eff)
+        _maybe_reserve_memory(self, q_eff, transformer_options, training=False, dtype_accum=inference_dtype)
         self._set_layer_dtype(layer_key, layer, inference_dtype)
         q_in = q_eff.to(dtype=inference_dtype)
         k_in = k_eff.to(dtype=inference_dtype)
