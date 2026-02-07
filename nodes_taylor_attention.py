@@ -147,9 +147,11 @@ def _extract_layer_idx(layer_key: str) -> Optional[int]:
 
 
 def _vae_input(name: str, *, tooltip: Optional[str] = None):
-    vae_type = getattr(io, "VAE", None)
-    if vae_type is not None and hasattr(vae_type, "Input"):
-        return vae_type.Input(name, tooltip=tooltip)
+    # Comfy API variants use different capitalization for this type.
+    for attr_name in ("Vae", "VAE"):
+        vae_type = getattr(io, attr_name, None)
+        if vae_type is not None and hasattr(vae_type, "Input"):
+            return vae_type.Input(name, tooltip=tooltip)
     logger.warning("Flux2TTR: io.VAE is unavailable in this ComfyUI API build; using AnyType input for '%s'.", name)
     return io.AnyType.Input(name, tooltip=tooltip)
 
