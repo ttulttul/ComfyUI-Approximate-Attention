@@ -66,3 +66,6 @@
 - Per-layer step logs were noisy; aggregate training snapshots (ready layer list + q25–q75 ranges for loss/ema/cosine/nmse across layers) are more actionable during long distillation runs.
 - CPU replay offload still needs a global memory budget; without eviction, full-k/v replay samples across many layers can trigger OS-level process kills even when GPU memory is stable.
 - For Comet monitoring, cross-layer aggregate quantiles (min/p25/p50/p75/max) per metric are much more useful than sparse per-layer step logs for tracking overall distillation progress.
+- Flux2TTR quality-control hooks are much easier to reason about when sigma/CFG are extracted centrally in runtime and passed through replay storage to layer forward, rather than re-derived in each call site.
+- Randomizing swapped training layers per diffusion step (instead of training every eligible layer every call) reduces per-step compute and keeps distillation coverage broad over time.
+- Keeping controller inference in a separate module with standalone checkpoint IO makes it possible to attach/detach Phase-2 routing without changing the Phase-1 TTR checkpoint format.

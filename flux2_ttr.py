@@ -40,12 +40,30 @@ _DEFAULT_TEXT_TOKENS_GUESS = 77
 _DEFAULT_REPLAY_OFFLOAD_CPU = True
 _DEFAULT_REPLAY_STORAGE_DTYPE = "float16"
 _DEFAULT_REPLAY_MAX_BYTES = 768 * 1024 * 1024
-_COMET_AGG_METRICS = ("loss", "mse", "nmse", "cosine_similarity", "ema_loss")
+_DEFAULT_CFG_SCALE = 1.0
+_DEFAULT_MIN_SWAP_LAYERS = 1
+_DEFAULT_MAX_SWAP_LAYERS = -1
+_COMET_AGG_METRICS = (
+    "loss",
+    "mse",
+    "nmse",
+    "cosine_similarity",
+    "ema_loss",
+    "sigma",
+    "cfg_scale",
+    "layers_swapped",
+    "layers_total",
+)
 
 try:
     from comfy import model_management
 except Exception:
     model_management = None
+
+try:
+    import flux2_ttr_controller
+except Exception:
+    flux2_ttr_controller = None
 
 
 @dataclass
@@ -63,6 +81,8 @@ class ReplaySample:
     teacher_sub: torch.Tensor
     key_mask: Optional[torch.Tensor]
     text_token_count: Optional[int]
+    sigma: Optional[float] = None
+    cfg_scale: Optional[float] = None
     nbytes: int = 0
     created_step: int = 0
 
@@ -161,6 +181,8 @@ def _estimate_flux2_ttr_memory_bytes(
     landmark_elems = bh * (q_chunk * landmarks + landmarks * head_dim + q_chunk * head_dim)
 
     total = kv_elems + ksum_elems + chunk_elems + landmark_elems
+    # Sigma/CFG conditioner params/activations are tiny but include a small fixed cushion.
+    total += 16 * 1024
     if training:
         # Extra autograd + replay batch tensors.
         train_elems = bh * (nq * head_dim + nk * head_dim * 2)
@@ -389,6 +411,58 @@ class KernelRegressorAttention(nn.Module):
         return torch.cat(out_chunks, dim=2)
 
 
+class ScalarSinusoidalEmbedding(nn.Module):
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        dim = max(2, int(embed_dim))
+        if dim % 2 != 0:
+            dim += 1
+        self.embed_dim = dim
+        half = dim // 2
+        exponents = torch.arange(half, dtype=torch.float32) / max(1, half - 1)
+        inv_freq = torch.exp(-math.log(10000.0) * exponents)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 0:
+            x = x.reshape(1)
+        x = x.reshape(-1).float()
+        angles = x[:, None] * self.inv_freq[None, :]
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+
+
+class SigmaCFGConditioner(nn.Module):
+    def __init__(self, embed_dim: int = 32, hidden_dim: int = 128):
+        super().__init__()
+        self.sigma_embed = ScalarSinusoidalEmbedding(embed_dim)
+        self.cfg_embed = ScalarSinusoidalEmbedding(embed_dim)
+        mlp_in = self.sigma_embed.embed_dim + self.cfg_embed.embed_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_in, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 4),
+        )
+        # Start as identity modulation so sigma/cfg wiring is backward-compatible.
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(
+        self,
+        sigma: float,
+        cfg_scale: float,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        param = next(self.mlp.parameters())
+        work_dtype = param.dtype if torch.is_floating_point(param) else torch.float32
+        sigma_t = torch.tensor([float(sigma)], device=device, dtype=torch.float32)
+        cfg_t = torch.tensor([float(cfg_scale)], device=device, dtype=torch.float32)
+        emb = torch.cat([self.sigma_embed(sigma_t), self.cfg_embed(cfg_t)], dim=-1).to(dtype=work_dtype)
+        mod = self.mlp(emb).reshape(-1).to(device=device, dtype=dtype)
+        return mod[0], mod[1], mod[2], mod[3]
+
+
 class Flux2HKRAttnLayer(nn.Module):
     def __init__(
         self,
@@ -423,6 +497,7 @@ class Flux2HKRAttnLayer(nn.Module):
             qk_norm=qk_norm,
         )
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init), dtype=torch.float32))
+        self.conditioner = SigmaCFGConditioner(embed_dim=32, hidden_dim=128)
 
         self.last_landmark_count = 0
         self.last_den_min = float("nan")
@@ -520,6 +595,8 @@ class Flux2HKRAttnLayer(nn.Module):
         q_chunk: Optional[int] = None,
         k_chunk: Optional[int] = None,
         text_token_count: Optional[int] = None,
+        sigma: Optional[float] = None,
+        cfg_scale: Optional[float] = None,
     ) -> torch.Tensor:
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("Flux2HKRAttnLayer expects q/k/v with shape [B,H,N,D].")
@@ -541,6 +618,25 @@ class Flux2HKRAttnLayer(nn.Module):
             k_chunk=k_chunk,
         )
         out_land = self._landmark_attention(q, k, v, key_mask=key_mask, text_token_count=text_token_count)
+
+        sigma_value = None
+        if sigma is not None:
+            try:
+                sigma_value = float(sigma)
+            except Exception:
+                sigma_value = None
+        if sigma_value is not None and math.isfinite(sigma_value):
+            cfg_value = _DEFAULT_CFG_SCALE if cfg_scale is None else float(cfg_scale)
+            if not math.isfinite(cfg_value):
+                cfg_value = _DEFAULT_CFG_SCALE
+            scale_k, bias_k, scale_l, bias_l = self.conditioner(
+                sigma=sigma_value,
+                cfg_scale=cfg_value,
+                device=out_kernel.device,
+                dtype=out_kernel.dtype,
+            )
+            out_kernel = out_kernel * (1.0 + scale_k.view(1, 1, 1, 1)) + bias_k.view(1, 1, 1, 1)
+            out_land = out_land * (1.0 + scale_l.view(1, 1, 1, 1)) + bias_l.view(1, 1, 1, 1)
 
         self.last_den_min = float(self.kernel.last_den_min)
         alpha = self.alpha.to(dtype=v.dtype)
@@ -580,6 +676,9 @@ class Flux2TTRRuntime:
         layer_end: int = -1,
         inference_mixed_precision: bool = True,
         training_preview_ttr: bool = True,
+        cfg_scale: float = _DEFAULT_CFG_SCALE,
+        min_swap_layers: int = _DEFAULT_MIN_SWAP_LAYERS,
+        max_swap_layers: int = _DEFAULT_MAX_SWAP_LAYERS,
         comet_enabled: bool = False,
         comet_api_key: str = "",
         comet_project_name: str = "ttr-distillation",
@@ -628,6 +727,10 @@ class Flux2TTRRuntime:
         self.layer_end = int(layer_end)
         self.inference_mixed_precision = bool(inference_mixed_precision)
         self.training_preview_ttr = bool(training_preview_ttr)
+        cfg_value = float(cfg_scale)
+        self.cfg_scale = cfg_value if math.isfinite(cfg_value) else float(_DEFAULT_CFG_SCALE)
+        self.min_swap_layers = max(0, int(min_swap_layers))
+        self.max_swap_layers = int(max_swap_layers)
 
         self.comet_enabled = bool(comet_enabled)
         self.comet_api_key = str(comet_api_key or "")
@@ -655,6 +758,11 @@ class Flux2TTRRuntime:
         self._comet_experiment = None
         self._comet_disabled = False
         self._warned_high_loss = False
+        self._current_step_swap_set: Optional[set[str]] = None
+        self._current_step_id: Optional[Any] = None
+        self._current_step_eligible_count = 0
+        self._controller_cache_key: Optional[Any] = None
+        self._controller_cache_mask: Optional[torch.Tensor] = None
 
     @staticmethod
     def _layer_sort_key(layer_key: str) -> tuple[str, int]:
@@ -785,6 +893,11 @@ class Flux2TTRRuntime:
         self._layer_metric_latest.clear()
         self._layer_metric_running.clear()
         self._layer_metric_count.clear()
+        self._current_step_swap_set = None
+        self._current_step_id = None
+        self._current_step_eligible_count = 0
+        self._controller_cache_key = None
+        self._controller_cache_mask = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -814,6 +927,192 @@ class Flux2TTRRuntime:
             if self.layer_end >= 0 and block_index > self.layer_end:
                 return False
         return True
+
+    @staticmethod
+    def _as_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            x = float(value)
+            return x if math.isfinite(x) else None
+        if torch.is_tensor(value):
+            if value.numel() <= 0:
+                return None
+            return Flux2TTRRuntime._as_float(value.reshape(-1)[0].item())
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return None
+            return Flux2TTRRuntime._as_float(value[0])
+        return None
+
+    @staticmethod
+    def _extract_layer_index(layer_key: str) -> Optional[int]:
+        if not isinstance(layer_key, str) or ":" not in layer_key:
+            return None
+        prefix, suffix = layer_key.split(":", 1)
+        if prefix != "single":
+            return None
+        try:
+            return int(suffix)
+        except Exception:
+            return None
+
+    def _layer_key_within_range(self, layer_key: str) -> bool:
+        idx = self._extract_layer_index(layer_key)
+        if idx is None:
+            return False
+        if self.layer_start >= 0 and idx < self.layer_start:
+            return False
+        if self.layer_end >= 0 and idx > self.layer_end:
+            return False
+        return True
+
+    def _eligible_single_layer_keys(self, current_layer_key: Optional[str] = None) -> list[str]:
+        keys = [key for key in self.layer_specs.keys() if self._layer_key_within_range(key)]
+        if current_layer_key is not None and self._layer_key_within_range(current_layer_key):
+            if current_layer_key not in keys:
+                keys.append(current_layer_key)
+        keys.sort(key=self._layer_sort_key)
+        return keys
+
+    def _extract_sigma(self, transformer_options: Optional[dict]) -> Optional[float]:
+        if not isinstance(transformer_options, dict):
+            return None
+
+        for key in ("sigma", "current_sigma"):
+            sigma = self._as_float(transformer_options.get(key))
+            if sigma is not None:
+                return sigma
+
+        sigmas = transformer_options.get("sigmas")
+        sigma = self._as_float(sigmas)
+        if sigma is not None:
+            return sigma
+
+        inner = transformer_options.get("flux2_ttr")
+        if isinstance(inner, dict):
+            for key in ("sigma", "current_sigma"):
+                sigma = self._as_float(inner.get(key))
+                if sigma is not None:
+                    return sigma
+            sigma = self._as_float(inner.get("sigmas"))
+            if sigma is not None:
+                return sigma
+        return None
+
+    def _extract_cfg_scale(self, transformer_options: Optional[dict]) -> float:
+        if isinstance(transformer_options, dict):
+            for key in ("cfg_scale", "cond_scale", "guidance_scale", "scale"):
+                cfg_scale = self._as_float(transformer_options.get(key))
+                if cfg_scale is not None:
+                    return cfg_scale
+            inner = transformer_options.get("flux2_ttr")
+            if isinstance(inner, dict):
+                for key in ("cfg_scale", "cond_scale", "guidance_scale"):
+                    cfg_scale = self._as_float(inner.get(key))
+                    if cfg_scale is not None:
+                        return cfg_scale
+        return float(self.cfg_scale)
+
+    def _extract_step_id(self, transformer_options: Optional[dict]) -> Any:
+        if isinstance(transformer_options, dict):
+            for key in ("step", "current_step", "sample_step", "timestep", "sigma_idx", "denoise_step"):
+                value = transformer_options.get(key)
+                if isinstance(value, (int, str)):
+                    return (key, value)
+                if torch.is_tensor(value) and value.numel() > 0:
+                    scalar = self._as_float(value)
+                    if scalar is not None:
+                        return (key, scalar)
+
+        sigma = self._extract_sigma(transformer_options)
+        if sigma is not None:
+            return ("sigma", round(float(sigma), 10))
+        return None
+
+    def _extract_resolution(
+        self,
+        transformer_options: Optional[dict],
+        n_key: Optional[int] = None,
+        text_token_count: Optional[int] = None,
+    ) -> tuple[int, int]:
+        if isinstance(transformer_options, dict):
+            candidates = (
+                ("width", "height"),
+                ("latent_width", "latent_height"),
+                ("image_width", "image_height"),
+                ("w", "h"),
+            )
+            for w_key, h_key in candidates:
+                w = transformer_options.get(w_key)
+                h = transformer_options.get(h_key)
+                if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+                    return int(w), int(h)
+            inner = transformer_options.get("flux2_ttr")
+            if isinstance(inner, dict):
+                for w_key, h_key in candidates:
+                    w = inner.get(w_key)
+                    h = inner.get(h_key)
+                    if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+                        return int(w), int(h)
+
+        if isinstance(n_key, int) and n_key > 0:
+            txt = max(0, int(text_token_count or 0))
+            image_tokens = max(1, n_key - txt)
+            side = int(round(math.sqrt(image_tokens)))
+            if side > 0 and side * side == image_tokens:
+                return side, side
+            return image_tokens, 1
+        return 1, 1
+
+    def _resolve_swap_set_for_step(
+        self,
+        transformer_options: Optional[dict],
+        all_eligible_layers: list[str],
+    ) -> set[str]:
+        step_id = self._extract_step_id(transformer_options)
+        if step_id == self._current_step_id and self._current_step_swap_set is not None:
+            return self._current_step_swap_set
+
+        n_eligible = len(all_eligible_layers)
+        if n_eligible <= 0:
+            swap_set: set[str] = set()
+        else:
+            min_n = max(0, min(self.min_swap_layers, n_eligible))
+            max_n = n_eligible if self.max_swap_layers < 0 else max(0, min(self.max_swap_layers, n_eligible))
+            if max_n < min_n:
+                max_n = min_n
+            n_swap = 0 if max_n <= 0 else random.randint(min_n, max_n)
+            swap_set = set(random.sample(all_eligible_layers, n_swap)) if n_swap > 0 else set()
+
+        self._current_step_id = step_id
+        self._current_step_swap_set = swap_set
+        self._current_step_eligible_count = int(n_eligible)
+        return swap_set
+
+    def _get_controller_mask(
+        self,
+        controller: nn.Module,
+        sigma: Optional[float],
+        cfg_scale: float,
+        width: int,
+        height: int,
+    ) -> torch.Tensor:
+        sigma_key = None if sigma is None else round(float(sigma), 10)
+        step_id = (sigma_key, round(float(cfg_scale), 6), int(width), int(height))
+        if step_id == self._controller_cache_key and self._controller_cache_mask is not None:
+            return self._controller_cache_mask
+
+        with torch.no_grad():
+            logits = controller(sigma if sigma is not None else 0.0, cfg_scale, width, height)
+            if logits.ndim > 1:
+                logits = logits.reshape(-1)
+            mask = torch.sigmoid(logits.float())
+        self._controller_cache_key = step_id
+        self._controller_cache_mask = mask
+        return mask
 
     def _ensure_optimizer(self, layer: Flux2HKRAttnLayer) -> torch.optim.Optimizer:
         alpha_params = [layer.alpha]
@@ -958,6 +1257,9 @@ class Flux2TTRRuntime:
                     "huber_beta": float(self.huber_beta),
                     "readiness_threshold": float(self.readiness_threshold),
                     "readiness_min_updates": int(self.readiness_min_updates),
+                    "cfg_scale": float(self.cfg_scale),
+                    "min_swap_layers": int(self.min_swap_layers),
+                    "max_swap_layers": int(self.max_swap_layers),
                 }
             )
             self._comet_experiment = experiment
@@ -979,6 +1281,8 @@ class Flux2TTRRuntime:
         self._layer_metric_count[layer_key] = count
         running = self._layer_metric_running.setdefault(layer_key, {})
         for key, value in metrics.items():
+            if not math.isfinite(float(value)):
+                continue
             prev = running.get(key, float(value))
             running[key] = float(prev + (float(value) - prev) / count)
 
@@ -988,6 +1292,8 @@ class Flux2TTRRuntime:
 
         payload = {}
         for key, value in metrics.items():
+            if not math.isfinite(float(value)):
+                continue
             payload[f"flux2ttr/{layer_key}/{key}"] = float(value)
         for key, value in running.items():
             payload[f"flux2ttr/{layer_key}/avg_{key}"] = float(value)
@@ -1037,6 +1343,10 @@ class Flux2TTRRuntime:
         teacher: torch.Tensor,
         loss_value: float,
         layer_key: str,
+        sigma: Optional[float] = None,
+        cfg_scale: Optional[float] = None,
+        layers_swapped: Optional[float] = None,
+        layers_total: Optional[float] = None,
     ) -> Dict[str, float]:
         diff = (student - teacher).float()
         teacher_f = teacher.float()
@@ -1062,6 +1372,10 @@ class Flux2TTRRuntime:
             "ema_loss": float(ema),
             "updates": float(updates),
             "ready": 1.0 if ready else 0.0,
+            "sigma": float(sigma) if sigma is not None else float("nan"),
+            "cfg_scale": float(cfg_scale) if cfg_scale is not None else float("nan"),
+            "layers_swapped": float(layers_swapped) if layers_swapped is not None else float("nan"),
+            "layers_total": float(layers_total) if layers_total is not None else float("nan"),
         }
 
     def _refresh_layer_ready(self, layer_key: str) -> bool:
@@ -1111,6 +1425,8 @@ class Flux2TTRRuntime:
         head_dim: int,
         key_mask: Optional[torch.Tensor],
         text_token_count: Optional[int],
+        sigma: Optional[float],
+        cfg_scale: Optional[float],
         transformer_options: Optional[dict],
         reserve_memory: bool = True,
     ) -> torch.Tensor:
@@ -1141,6 +1457,8 @@ class Flux2TTRRuntime:
                 q_chunk=self.query_chunk_size,
                 k_chunk=self.key_chunk_size,
                 text_token_count=text_token_count,
+                sigma=sigma,
+                cfg_scale=cfg_scale,
             )
 
         if not torch.isfinite(student).all():
@@ -1191,6 +1509,8 @@ class Flux2TTRRuntime:
         teacher_sub: torch.Tensor,
         key_mask: Optional[torch.Tensor],
         text_token_count: Optional[int],
+        sigma: Optional[float],
+        cfg_scale: Optional[float],
     ) -> None:
         buf = self.replay_buffers.setdefault(layer_key, deque())
         store_device = torch.device("cpu") if self.replay_offload_cpu else q_sub.device
@@ -1225,6 +1545,8 @@ class Flux2TTRRuntime:
             teacher_sub=teacher_store,
             key_mask=key_mask_store,
             text_token_count=text_token_count,
+            sigma=self._as_float(sigma),
+            cfg_scale=self._as_float(cfg_scale),
             nbytes=int(nbytes),
             created_step=int(self._replay_created_counter),
         )
@@ -1316,6 +1638,8 @@ class Flux2TTRRuntime:
                 q_chunk=self.query_chunk_size,
                 k_chunk=self.key_chunk_size,
                 text_token_count=sample.text_token_count,
+                sigma=sample.sigma,
+                cfg_scale=sample.cfg_scale,
             )
             loss = F.smooth_l1_loss(student_sub, teacher_sub, beta=self.huber_beta)
 
@@ -1343,6 +1667,10 @@ class Flux2TTRRuntime:
                 teacher=teacher_sub.detach(),
                 loss_value=loss_value,
                 layer_key=layer_key,
+                sigma=sample.sigma,
+                cfg_scale=sample.cfg_scale,
+                layers_swapped=float(len(self._current_step_swap_set or set())),
+                layers_total=float(self._current_step_eligible_count),
             )
             self._record_training_metrics(layer_key, metrics)
 
@@ -1384,6 +1712,9 @@ class Flux2TTRRuntime:
             )
             return self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
 
+        sigma = self._extract_sigma(transformer_options)
+        cfg_scale = self._extract_cfg_scale(transformer_options)
+
         if pe is not None:
             try:
                 from comfy.ldm.flux.math import apply_rope
@@ -1405,7 +1736,20 @@ class Flux2TTRRuntime:
             teacher_out = self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
 
         if self.training_mode:
+            eligible_layers: list[str] = []
+            swap_set: set[str] = set()
             if self.training_enabled and self.steps_remaining > 0:
+                eligible_layers = self._eligible_single_layer_keys(current_layer_key=layer_key)
+                swap_set = self._resolve_swap_set_for_step(transformer_options, eligible_layers)
+                if layer_key not in swap_set:
+                    if isinstance(transformer_options, dict):
+                        cfg = transformer_options.get("flux2_ttr")
+                        if isinstance(cfg, dict):
+                            cfg["training_steps_remaining"] = int(self.steps_remaining)
+                            cfg["training_updates_done"] = int(self.training_updates_done)
+                            cfg["layers_swapped"] = int(len(swap_set))
+                            cfg["layers_total"] = int(len(eligible_layers))
+                    return teacher_out
                 try:
                     if self.enable_memory_reserve:
                         _maybe_reserve_memory(
@@ -1439,6 +1783,8 @@ class Flux2TTRRuntime:
                         teacher_sub=teacher_sub,
                         key_mask=key_mask,
                         text_token_count=text_token_count,
+                        sigma=sigma,
+                        cfg_scale=cfg_scale,
                     )
 
                     with torch.inference_mode(False):
@@ -1455,6 +1801,8 @@ class Flux2TTRRuntime:
                     if isinstance(cfg, dict):
                         cfg["training_steps_remaining"] = int(self.steps_remaining)
                         cfg["training_updates_done"] = int(self.training_updates_done)
+                        cfg["layers_swapped"] = int(len(swap_set))
+                        cfg["layers_total"] = int(len(eligible_layers))
 
             if not self.training_preview_ttr:
                 return teacher_out
@@ -1471,12 +1819,67 @@ class Flux2TTRRuntime:
                     head_dim=head_dim,
                     key_mask=key_mask,
                     text_token_count=text_token_count,
+                    sigma=sigma,
+                    cfg_scale=cfg_scale,
                     transformer_options=transformer_options,
                     reserve_memory=False,
                 )
             except Exception as exc:
                 logger.warning("Flux2TTR preview fallback on %s: %s", layer_key, exc)
                 return teacher_out
+
+        controller = None
+        if isinstance(transformer_options, dict):
+            cfg = transformer_options.get("flux2_ttr")
+            if isinstance(cfg, dict):
+                controller = cfg.get("controller")
+        if controller is not None:
+            width, height = self._extract_resolution(
+                transformer_options,
+                n_key=int(k.shape[2]),
+                text_token_count=text_token_count,
+            )
+            try:
+                controller_mask = self._get_controller_mask(controller, sigma, cfg_scale, width, height)
+                layer_idx = self._extract_layer_index(layer_key)
+                if layer_idx is None or layer_idx < 0 or layer_idx >= int(controller_mask.numel()):
+                    logger.warning(
+                        "Flux2TTR: controller mask index out of range for %s (idx=%s mask_len=%d); using teacher fallback.",
+                        layer_key,
+                        layer_idx,
+                        int(controller_mask.numel()),
+                    )
+                    return teacher_out if teacher_out is not None else self._teacher_from_fallback(
+                        fallback_attention,
+                        q,
+                        k,
+                        v,
+                        pe,
+                        mask,
+                        transformer_options,
+                    )
+                use_full_attention = bool(float(controller_mask[layer_idx].item()) > 0.5)
+            except Exception as exc:
+                logger.warning("Flux2TTR: controller evaluation failed on %s (%s); using teacher fallback.", layer_key, exc)
+                return teacher_out if teacher_out is not None else self._teacher_from_fallback(
+                    fallback_attention,
+                    q,
+                    k,
+                    v,
+                    pe,
+                    mask,
+                    transformer_options,
+                )
+            if use_full_attention:
+                return teacher_out if teacher_out is not None else self._teacher_from_fallback(
+                    fallback_attention,
+                    q,
+                    k,
+                    v,
+                    pe,
+                    mask,
+                    transformer_options,
+                )
 
         # Inference mode: fail closed when not ready.
         if not self._refresh_layer_ready(layer_key):
@@ -1521,6 +1924,8 @@ class Flux2TTRRuntime:
                 head_dim=head_dim,
                 key_mask=key_mask,
                 text_token_count=text_token_count,
+                sigma=sigma,
+                cfg_scale=cfg_scale,
                 transformer_options=transformer_options,
             )
         except Exception as exc:
@@ -1567,6 +1972,26 @@ class Flux2TTRRuntime:
         return float(self.last_loss)
 
     def checkpoint_state(self) -> Dict[str, Any]:
+        experiment = self._ensure_comet_experiment()
+        if experiment is not None:
+            last_sigma = float("nan")
+            if isinstance(self._current_step_id, tuple) and len(self._current_step_id) == 2 and self._current_step_id[0] == "sigma":
+                maybe_sigma = self._as_float(self._current_step_id[1])
+                if maybe_sigma is not None:
+                    last_sigma = maybe_sigma
+            try:
+                experiment.log_parameters(
+                    {
+                        "cfg_scale": float(self.cfg_scale),
+                        "last_sigma": float(last_sigma),
+                        "min_swap_layers": int(self.min_swap_layers),
+                        "max_swap_layers": int(self.max_swap_layers),
+                    }
+                )
+            except Exception as exc:
+                logger.warning("Flux2TTR: failed to log checkpoint hyperparameters to Comet (%s).", exc)
+                self._comet_disabled = True
+
         layer_states = {}
         for layer_key, layer in self.layers.items():
             layer_states[layer_key] = {k: v.detach().cpu() for k, v in layer.state_dict().items()}
@@ -1606,6 +2031,9 @@ class Flux2TTRRuntime:
             "layer_start": self.layer_start,
             "layer_end": self.layer_end,
             "inference_mixed_precision": self.inference_mixed_precision,
+            "cfg_scale": self.cfg_scale,
+            "min_swap_layers": self.min_swap_layers,
+            "max_swap_layers": self.max_swap_layers,
             "layer_specs": {
                 key: {"num_heads": spec.num_heads, "head_dim": spec.head_dim}
                 for key, spec in self.layer_specs.items()
@@ -1675,6 +2103,9 @@ class Flux2TTRRuntime:
         self.layer_start = int(payload.get("layer_start", self.layer_start))
         self.layer_end = int(payload.get("layer_end", self.layer_end))
         self.inference_mixed_precision = bool(payload.get("inference_mixed_precision", self.inference_mixed_precision))
+        self.cfg_scale = float(payload.get("cfg_scale", self.cfg_scale))
+        self.min_swap_layers = max(0, int(payload.get("min_swap_layers", self.min_swap_layers)))
+        self.max_swap_layers = int(payload.get("max_swap_layers", self.max_swap_layers))
 
         specs = payload.get("layer_specs", {})
         self.layer_specs.clear()
@@ -1701,6 +2132,12 @@ class Flux2TTRRuntime:
 
         for layer_key in set(list(self.layer_update_count.keys()) + list(self.layer_ema_loss.keys())):
             self._refresh_layer_ready(layer_key)
+
+        self._current_step_swap_set = None
+        self._current_step_id = None
+        self._current_step_eligible_count = 0
+        self._controller_cache_key = None
+        self._controller_cache_mask = None
 
         logger.info("Flux2TTR: loaded checkpoint from %s (%d layers).", path, len(self.pending_state))
 
@@ -1755,6 +2192,9 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         layer_end=int(cfg.get("layer_end", -1)),
         inference_mixed_precision=bool(cfg.get("inference_mixed_precision", True)),
         training_preview_ttr=bool(cfg.get("training_preview_ttr", True)),
+        cfg_scale=float(cfg.get("cfg_scale", _DEFAULT_CFG_SCALE)),
+        min_swap_layers=int(cfg.get("min_swap_layers", _DEFAULT_MIN_SWAP_LAYERS)),
+        max_swap_layers=int(cfg.get("max_swap_layers", _DEFAULT_MAX_SWAP_LAYERS)),
         comet_enabled=bool(cfg.get("comet_enabled", False)),
         comet_project_name=str(cfg.get("comet_project_name", "ttr-distillation")),
         comet_workspace=str(cfg.get("comet_workspace", "comet-workspace")),
@@ -1766,6 +2206,9 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
     runtime.steps_remaining = training_remaining
     runtime.training_enabled = bool(cfg.get("training", False)) and training_remaining > 0
     runtime.max_safe_inference_loss = float(cfg.get("max_safe_inference_loss", runtime.max_safe_inference_loss))
+    runtime.cfg_scale = float(cfg.get("cfg_scale", runtime.cfg_scale))
+    runtime.min_swap_layers = max(0, int(cfg.get("min_swap_layers", runtime.min_swap_layers)))
+    runtime.max_swap_layers = int(cfg.get("max_swap_layers", runtime.max_swap_layers))
 
     checkpoint_path = (cfg.get("checkpoint_path") or "").strip()
     if checkpoint_path and os.path.isfile(checkpoint_path):
@@ -1775,12 +2218,30 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         runtime.comet_enabled = bool(cfg.get("comet_enabled", runtime.comet_enabled))
         runtime.comet_project_name = str(cfg.get("comet_project_name", runtime.comet_project_name))
         runtime.comet_workspace = str(cfg.get("comet_workspace", runtime.comet_workspace))
+        runtime.cfg_scale = float(cfg.get("cfg_scale", runtime.cfg_scale))
+        runtime.min_swap_layers = max(0, int(cfg.get("min_swap_layers", runtime.min_swap_layers)))
+        runtime.max_swap_layers = int(cfg.get("max_swap_layers", runtime.max_swap_layers))
     elif not training_mode:
         logger.warning(
             "Flux2TTR: cannot recover inference runtime without a valid checkpoint_path (got %r).",
             checkpoint_path,
         )
         return None
+
+    controller_path = (cfg.get("controller_checkpoint_path") or "").strip()
+    if controller_path and os.path.isfile(controller_path):
+        if flux2_ttr_controller is None:
+            logger.warning(
+                "Flux2TTR: controller_checkpoint_path provided but controller module is unavailable: %s",
+                controller_path,
+            )
+        else:
+            try:
+                controller = flux2_ttr_controller.load_controller_checkpoint(controller_path, map_location="cpu")
+                cfg["controller"] = controller
+                logger.info("Flux2TTR: loaded controller checkpoint: %s", controller_path)
+            except Exception as exc:
+                logger.warning("Flux2TTR: failed to load controller checkpoint %s (%s).", controller_path, exc)
 
     if not training_mode:
         runtime.training_enabled = False

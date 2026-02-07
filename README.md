@@ -152,19 +152,25 @@ The `Flux2TTR` node now uses a **hybrid kernel-regression attention** replacemen
   - `huber_beta`, `grad_clip_norm`
   - `readiness_threshold`, `readiness_min_updates`
   - `layer_start` / `layer_end` (optional single-block index range to patch)
+  - `cfg_scale` (default CFG when runtime options do not expose it)
+  - `min_swap_layers`, `max_swap_layers` (training-only randomized per-step layer swaps within eligible layer range)
   - `inference_mixed_precision` (use bf16/fp16 inference path on CUDA)
+  - `controller_checkpoint_path` (optional Phase-2 controller for inference-time teacher-vs-TTR routing)
 - Outputs:
   - patched `MODEL` with Flux attention routed through per-layer HKR student modules
   - `loss_value` from load/runtime state
 
 Behavior:
 - `training=true`: runs online distillation during sampler execution, with **query-only subsampling** (`q_sub`) and **full k/v context** for student forward passes. Samples are stored in per-layer replay buffers and optimized with Smooth-L1/Huber loss.
+- During training, per-step layer selection is now randomized: only a sampled subset of eligible layers (`min_swap_layers..max_swap_layers`) receives TTR replay updates on that step; non-selected layers stay on teacher output.
 - `training=false`: loads checkpointed HKR layers and uses student attention only for layers that pass readiness checks.
+- HKR student layers now support sigma/CFG conditioning via a tiny layer-level conditioner MLP that modulates kernel and landmark branches (`sigma=None` keeps identity behavior).
 - Readiness is tracked per layer via EMA loss + minimum update count. Layers that are not ready fall back to native Flux attention.
 - Unsupported full per-query masks (`[B,H,Nq,Nk]` style) explicitly fail closed to native attention.
 - During model execution, Flux attention is patched on pre-run and restored on cleanup; single-block calls route to per-layer `Flux2HKRAttnLayer` instances keyed by `block_index`.
+- If a controller checkpoint is provided, inference can dynamically choose per layer whether to use full/native attention or TTR output based on `(sigma, cfg_scale, resolution)` with per-step mask caching.
 - Checkpoint format is `flux2_ttr_v2` and stores layer weights plus readiness/EMA metadata for fail-closed inference.
-- When Comet logging is enabled, Flux2TTR logs per-layer distillation metrics (loss/mse/nmse/cosine/ema/ready) each update.
+- When Comet logging is enabled, Flux2TTR logs per-layer distillation metrics (loss/mse/nmse/cosine/ema/ready plus sigma/cfg/layer-swap stats) each update.
 - Comet logging now also emits global cross-layer distribution stats each update:
   - `flux2ttr/global/{loss|mse|nmse|cosine_similarity|ema_loss}_{min|p25|p50|p75|max}`
   - plus `layers_tracked`, `layers_ready`, and `layers_ready_ratio`.

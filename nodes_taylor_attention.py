@@ -12,6 +12,7 @@ import comfy.patcher_extension as patcher_extension
 import taylor_attention
 import hybrid_attention
 import flux2_ttr
+import flux2_ttr_controller
 import sweep_utils
 
 logger = logging.getLogger(__name__)
@@ -693,10 +694,40 @@ class Flux2TTR(io.ComfyNode):
                     step=1,
                     tooltip="Only apply TTR to single blocks with index <= layer_end (-1 disables).",
                 ),
+                io.Float.Input(
+                    "cfg_scale",
+                    default=1.0,
+                    min=0.0,
+                    max=100.0,
+                    step=1e-3,
+                    tooltip="Default CFG scale used when transformer_options does not provide guidance scale.",
+                ),
+                io.Int.Input(
+                    "min_swap_layers",
+                    default=1,
+                    min=0,
+                    max=512,
+                    step=1,
+                    tooltip="Training mode: minimum number of eligible single layers to swap to TTR per diffusion step.",
+                ),
+                io.Int.Input(
+                    "max_swap_layers",
+                    default=-1,
+                    min=-1,
+                    max=512,
+                    step=1,
+                    tooltip="Training mode: maximum swapped layers per diffusion step (-1 means all eligible layers).",
+                ),
                 io.Boolean.Input(
                     "inference_mixed_precision",
                     default=True,
                     tooltip="Use input dtype (bf16/fp16) for TTR inference on CUDA for speed.",
+                ),
+                io.String.Input(
+                    "controller_checkpoint_path",
+                    default="",
+                    multiline=False,
+                    tooltip="Optional Phase-2 controller checkpoint. When provided in inference mode, per-step controller masks select teacher vs TTR per layer.",
                 ),
             ],
             outputs=[io.Model.Output(), io.Float.Output("loss_value")],
@@ -738,10 +769,15 @@ class Flux2TTR(io.ComfyNode):
         enable_memory_reserve: bool,
         layer_start: int,
         layer_end: int,
+        cfg_scale: float,
+        min_swap_layers: int,
+        max_swap_layers: int,
         inference_mixed_precision: bool,
+        controller_checkpoint_path: str,
     ) -> io.NodeOutput:
         feature_dim = flux2_ttr.validate_feature_dim(feature_dim)
         checkpoint_path = (checkpoint_path or "").strip()
+        controller_checkpoint_path = (controller_checkpoint_path or "").strip()
         train_steps = int(steps)
 
         m = model.clone()
@@ -777,6 +813,9 @@ class Flux2TTR(io.ComfyNode):
             enable_memory_reserve=bool(enable_memory_reserve),
             layer_start=int(layer_start),
             layer_end=int(layer_end),
+            cfg_scale=float(cfg_scale),
+            min_swap_layers=int(min_swap_layers),
+            max_swap_layers=int(max_swap_layers),
             inference_mixed_precision=bool(inference_mixed_precision),
             training_preview_ttr=bool(training_preview_ttr),
             comet_enabled=bool(comet_enabled),
@@ -808,6 +847,16 @@ class Flux2TTR(io.ComfyNode):
             runtime.steps_remaining = 0
             runtime.training_updates_done = 0
             loss_value = float(runtime.last_loss) if not math.isnan(runtime.last_loss) else 0.0
+
+        runtime.cfg_scale = float(cfg_scale)
+        runtime.min_swap_layers = max(0, int(min_swap_layers))
+        runtime.max_swap_layers = int(max_swap_layers)
+
+        controller = None
+        if controller_checkpoint_path:
+            if not os.path.isfile(controller_checkpoint_path):
+                raise FileNotFoundError(f"Flux2TTR: controller checkpoint not found: {controller_checkpoint_path}")
+            controller = flux2_ttr_controller.load_controller_checkpoint(controller_checkpoint_path, map_location="cpu")
 
         runtime_id = flux2_ttr.register_runtime(runtime)
         transformer_options["flux2_ttr"] = {
@@ -843,10 +892,16 @@ class Flux2TTR(io.ComfyNode):
             "enable_memory_reserve": bool(enable_memory_reserve),
             "layer_start": int(layer_start),
             "layer_end": int(layer_end),
+            "cfg_scale": float(cfg_scale),
+            "min_swap_layers": int(min_swap_layers),
+            "max_swap_layers": int(max_swap_layers),
             "inference_mixed_precision": bool(inference_mixed_precision),
             "max_safe_inference_loss": float(runtime.max_safe_inference_loss),
             "checkpoint_path": checkpoint_path,
+            "controller_checkpoint_path": controller_checkpoint_path,
         }
+        if controller is not None:
+            transformer_options["flux2_ttr"]["controller"] = controller
 
         callback_key = "flux2_ttr"
         m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_PRE_RUN, callback_key)
@@ -867,7 +922,7 @@ class Flux2TTR(io.ComfyNode):
                 "Flux2TTR configured: training_mode=%s training_preview_ttr=%s comet_enabled=%s "
                 "training_steps=%d feature_dim=%d q_chunk=%d k_chunk=%d landmarks=%d "
                 "replay=%d replay_offload_cpu=%s replay_max_mb=%d train_steps_per_call=%d readiness=(%.6g,%d) reserve=%s layer_range=[%d,%d] "
-                "mixed_precision=%s checkpoint=%s loss=%.6g"
+                "cfg_scale=%.4g swap_layers=[%d,%d] mixed_precision=%s checkpoint=%s controller=%s loss=%.6g"
             ),
             training,
             bool(training_preview_ttr),
@@ -886,8 +941,12 @@ class Flux2TTR(io.ComfyNode):
             bool(enable_memory_reserve),
             int(layer_start),
             int(layer_end),
+            float(cfg_scale),
+            int(min_swap_layers),
+            int(max_swap_layers),
             bool(inference_mixed_precision),
             checkpoint_path if checkpoint_path else "<none>",
+            controller_checkpoint_path if controller_checkpoint_path else "<none>",
             float(loss_value),
         )
         return io.NodeOutput(m, float(loss_value))

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import flux2_ttr
+import flux2_ttr_controller
 
 
 def _baseline_flat(q, k, v, mask=None):
@@ -88,6 +89,25 @@ def test_flux2_hkr_layer_shape_and_landmarks():
     assert 1 <= layer.last_landmark_count <= 6
 
 
+def test_flux2_hkr_sigma_cfg_conditioning_identity_by_default():
+    torch.manual_seed(0)
+    layer = flux2_ttr.Flux2HKRAttnLayer(head_dim=8, feature_dim=256)
+    q = torch.randn(1, 2, 7, 8)
+    k = torch.randn(1, 2, 12, 8)
+    v = torch.randn(1, 2, 12, 8)
+
+    out_base = layer(q, k, v)
+    out_cond = layer(q, k, v, sigma=0.7, cfg_scale=3.0)
+    assert torch.allclose(out_base, out_cond, atol=1e-6, rtol=1e-6)
+
+
+def test_runtime_extracts_sigma_and_cfg_scale():
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
+    opts = {"sigmas": torch.tensor([0.35]), "flux2_ttr": {"cfg_scale": 6.5}}
+    assert runtime._extract_sigma(opts) == pytest.approx(0.35)
+    assert runtime._extract_cfg_scale(opts) == pytest.approx(6.5)
+
+
 def test_runtime_training_uses_query_subsampling_only():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(
@@ -128,6 +148,32 @@ def test_runtime_training_uses_query_subsampling_only():
     assert sample.k_full.dtype == torch.float16
 
 
+def test_runtime_replay_stores_sigma_and_cfg():
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        training_preview_ttr=False,
+    )
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+    opts = {"block_type": "single", "block_index": 0, "sigmas": torch.tensor([0.42]), "flux2_ttr": {"cfg_scale": 4.0}}
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
+
+    runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    sample = runtime.replay_buffers["single:0"][-1]
+    assert sample.sigma == pytest.approx(0.42)
+    assert sample.cfg_scale == pytest.approx(4.0)
+
+
 def test_runtime_training_preview_uses_student_when_layer_ready():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(
@@ -159,6 +205,51 @@ def test_runtime_training_preview_uses_student_when_layer_ready():
     assert not torch.allclose(out, baseline)
 
 
+def test_runtime_training_uses_randomized_swap_set_per_step(monkeypatch):
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=4,
+        training_preview_ttr=False,
+        min_swap_layers=1,
+        max_swap_layers=1,
+    )
+    runtime.register_layer_specs(
+        [
+            flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4),
+            flux2_ttr.FluxLayerSpec(layer_key="single:1", num_heads=2, head_dim=4),
+            flux2_ttr.FluxLayerSpec(layer_key="single:2", num_heads=2, head_dim=4),
+        ]
+    )
+
+    choices = iter([["single:1"], ["single:0"]])
+    monkeypatch.setattr(flux2_ttr.random, "randint", lambda lo, hi: 1)
+    monkeypatch.setattr(flux2_ttr.random, "sample", lambda pop, k: list(next(choices)))
+
+    q = torch.randn(1, 2, 8, 4)
+    k = torch.randn(1, 2, 8, 4)
+    v = torch.randn(1, 2, 8, 4)
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
+
+    opts_step0_l0 = {"block_type": "single", "block_index": 0, "step": 0}
+    opts_step0_l1 = {"block_type": "single", "block_index": 1, "step": 0}
+    opts_step1_l0 = {"block_type": "single", "block_index": 0, "step": 1}
+
+    runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step0_l0, fallback_attention=fallback)
+    assert runtime.training_updates_done == 0
+
+    runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step0_l1, fallback_attention=fallback)
+    assert runtime.training_updates_done == 1
+
+    runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step1_l0, fallback_attention=fallback)
+    assert runtime.training_updates_done == 2
+
+
 def test_runtime_inference_falls_back_when_not_ready():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
@@ -176,6 +267,52 @@ def test_runtime_inference_falls_back_when_not_ready():
     baseline = fallback(q, k, v, None)
     out = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
     assert torch.allclose(out, baseline)
+
+
+def test_runtime_inference_controller_mask_routes_teacher_vs_student(monkeypatch):
+    class _Controller(torch.nn.Module):
+        def forward(self, sigma, cfg_scale, width, height):
+            del sigma, cfg_scale, width, height
+            return torch.tensor([10.0, -10.0], dtype=torch.float32)
+
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime.register_layer_specs(
+        [
+            flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4),
+            flux2_ttr.FluxLayerSpec(layer_key="single:1", num_heads=2, head_dim=4),
+        ]
+    )
+    runtime.layer_update_count["single:0"] = 99
+    runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ready["single:0"] = True
+    runtime.layer_update_count["single:1"] = 99
+    runtime.layer_ema_loss["single:1"] = 0.0
+    runtime.layer_ready["single:1"] = True
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
+
+    def fake_student(**kwargs):
+        q_eff = kwargs["q_eff"]
+        v_arg = kwargs["v"]
+        return torch.full((q_eff.shape[0], q_eff.shape[2], q_eff.shape[1] * q_eff.shape[3]), 42.0, dtype=v_arg.dtype)
+
+    monkeypatch.setattr(runtime, "_student_from_runtime", fake_student)
+    controller = _Controller()
+
+    opts0 = {"block_type": "single", "block_index": 0, "flux2_ttr": {"controller": controller}}
+    opts1 = {"block_type": "single", "block_index": 1, "flux2_ttr": {"controller": controller}}
+
+    teacher = fallback(q, k, v, None)
+    out0 = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts0, fallback_attention=fallback)
+    out1 = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts1, fallback_attention=fallback)
+    assert torch.allclose(out0, teacher)
+    assert torch.all(out1 == 42.0)
 
 
 def test_runtime_unsupported_mask_falls_back_to_teacher():
@@ -240,6 +377,9 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
         training_preview_ttr=False,
         readiness_min_updates=1,
         readiness_threshold=10.0,
+        cfg_scale=3.5,
+        min_swap_layers=2,
+        max_swap_layers=5,
     )
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
 
@@ -265,6 +405,9 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
     assert "single:0" in runtime_loaded.pending_state
     assert "single:0" in runtime_loaded.layer_update_count
     assert "single:0" in runtime_loaded.layer_ema_loss
+    assert runtime_loaded.cfg_scale == pytest.approx(3.5)
+    assert runtime_loaded.min_swap_layers == 2
+    assert runtime_loaded.max_swap_layers == 5
 
 
 def test_recover_runtime_from_config_inference_requires_checkpoint():
@@ -290,6 +433,9 @@ def test_recover_runtime_from_config_training_without_checkpoint():
         "feature_dim": 256,
         "query_chunk_size": 256,
         "key_chunk_size": 1024,
+        "cfg_scale": 2.25,
+        "min_swap_layers": 3,
+        "max_swap_layers": 7,
         "checkpoint_path": "",
     }
     runtime = flux2_ttr._recover_runtime_from_config(cfg)
@@ -298,6 +444,9 @@ def test_recover_runtime_from_config_training_without_checkpoint():
     assert runtime.training_enabled is True
     assert runtime.training_preview_ttr is False
     assert runtime.steps_remaining == 32
+    assert runtime.cfg_scale == pytest.approx(2.25)
+    assert runtime.min_swap_layers == 3
+    assert runtime.max_swap_layers == 7
 
 
 def test_recover_runtime_from_config_inference_overrides_checkpoint_mode(tmp_path):
@@ -332,6 +481,28 @@ def test_recover_runtime_from_config_inference_overrides_checkpoint_mode(tmp_pat
     assert runtime.training_mode is False
     assert runtime.training_enabled is False
     assert runtime.training_preview_ttr is False
+
+
+def test_recover_runtime_from_config_loads_controller_checkpoint(tmp_path):
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    controller_ckpt = tmp_path / "controller.pt"
+    flux2_ttr_controller.save_controller_checkpoint(controller, str(controller_ckpt))
+
+    cfg = {
+        "training_mode": True,
+        "training": True,
+        "training_steps_total": 2,
+        "training_steps_remaining": 2,
+        "learning_rate": 1e-4,
+        "feature_dim": 256,
+        "query_chunk_size": 256,
+        "key_chunk_size": 1024,
+        "checkpoint_path": "",
+        "controller_checkpoint_path": str(controller_ckpt),
+    }
+    runtime = flux2_ttr._recover_runtime_from_config(cfg)
+    assert runtime is not None
+    assert isinstance(cfg.get("controller"), flux2_ttr_controller.TTRController)
 
 
 def test_calibration_switches_to_real_sample_capture_mode():
@@ -492,6 +663,8 @@ def test_training_oom_recovery_reduces_pressure_and_clears_layer_buffer():
         teacher_sub=torch.randn(1, 2, 4, 4),
         key_mask=torch.ones(1, 8, dtype=torch.bool),
         text_token_count=4,
+        sigma=0.5,
+        cfg_scale=3.0,
     )
     assert len(runtime.replay_buffers[layer_key]) == 1
 
@@ -525,6 +698,8 @@ def test_replay_budget_evicts_old_samples_across_layers():
             teacher_sub=torch.randn(1, 1, 4, 4),
             key_mask=torch.ones(1, 16, dtype=torch.bool),
             text_token_count=4,
+            sigma=0.5,
+            cfg_scale=2.0,
         )
 
     # Push enough samples to force global budget eviction.
