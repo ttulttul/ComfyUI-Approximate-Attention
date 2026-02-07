@@ -298,45 +298,50 @@ class ControllerTrainer:
         actual_full_attn_ratio: float,
     ) -> Dict[str, float]:
         self.controller.train()
-        logits = self.controller(sigma=sigma, cfg_scale=cfg_scale, width=width, height=height)
-        probs = torch.sigmoid(logits)
-
-        mask = sampled_mask.to(device=logits.device, dtype=logits.dtype).reshape(-1).detach()
-        if mask.numel() != probs.numel():
-            raise ValueError(
-                "ControllerTrainer.reinforce_step: sampled_mask length "
-                f"{int(mask.numel())} does not match controller layer count {int(probs.numel())}."
-            )
-
-        log_probs = mask * torch.log(probs + 1e-8) + (1.0 - mask) * torch.log(1.0 - probs + 1e-8)
-        total_log_prob = log_probs.sum()
-
         reward_value = float(reward)
-        baselined_reward = reward_value - self._reward_baseline
-        self._update_reward_baseline(reward_value)
 
-        policy_loss = -baselined_reward * total_log_prob
-        efficiency_penalty = torch.relu(probs.mean() - float(self.target_ttr_ratio))
-        loss = policy_loss + efficiency_penalty
+        # ComfyUI often executes nodes in inference_mode; force grad-enabled training here.
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                logits = self.controller(sigma=sigma, cfg_scale=cfg_scale, width=width, height=height)
+                probs = torch.sigmoid(logits)
 
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if self.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.controller.parameters(), self.grad_clip_norm)
-        self.optimizer.step()
+                mask = sampled_mask.to(device=logits.device, dtype=logits.dtype).reshape(-1).detach().clone()
+                if mask.numel() != probs.numel():
+                    raise ValueError(
+                        "ControllerTrainer.reinforce_step: sampled_mask length "
+                        f"{int(mask.numel())} does not match controller layer count {int(probs.numel())}."
+                    )
 
-        return {
-            "policy_loss": float(policy_loss.detach().item()),
-            "efficiency_penalty": float(efficiency_penalty.detach().item()),
-            "total_loss": float(loss.detach().item()),
-            "reward": reward_value,
-            "reward_baseline": float(self._reward_baseline),
-            "baselined_reward": float(baselined_reward),
-            "mask_mean": float(mask.mean().item()),
-            "probs_mean": float(probs.detach().mean().item()),
-            "actual_full_attn_ratio": float(actual_full_attn_ratio),
-            "target_ttr_ratio": float(self.target_ttr_ratio),
-        }
+                log_probs = mask * torch.log(probs + 1e-8) + (1.0 - mask) * torch.log(1.0 - probs + 1e-8)
+                total_log_prob = log_probs.sum()
+
+                baselined_reward = reward_value - self._reward_baseline
+                self._update_reward_baseline(reward_value)
+
+                policy_loss = -baselined_reward * total_log_prob
+                efficiency_penalty = torch.relu(probs.mean() - float(self.target_ttr_ratio))
+                loss = policy_loss + efficiency_penalty
+
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if self.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.controller.parameters(), self.grad_clip_norm)
+                self.optimizer.step()
+
+                metrics = {
+                    "policy_loss": float(policy_loss.detach().item()),
+                    "efficiency_penalty": float(efficiency_penalty.detach().item()),
+                    "total_loss": float(loss.detach().item()),
+                    "reward": reward_value,
+                    "reward_baseline": float(self._reward_baseline),
+                    "baselined_reward": float(baselined_reward),
+                    "mask_mean": float(mask.mean().item()),
+                    "probs_mean": float(probs.detach().mean().item()),
+                    "actual_full_attn_ratio": float(actual_full_attn_ratio),
+                    "target_ttr_ratio": float(self.target_ttr_ratio),
+                }
+        return metrics
 
     def train_step(
         self,
@@ -359,32 +364,34 @@ class ControllerTrainer:
         if not callable(student_forward_fn):
             raise TypeError("ControllerTrainer.train_step requires a callable student_forward_fn(mask, logits).")
         self.controller.train()
-        logits = self.controller(sigma=sigma, cfg_scale=cfg_scale, width=width, height=height)
-        mask = self.controller.sample_training_mask(logits, temperature=gumbel_temperature, hard=hard_mask)
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                logits = self.controller(sigma=sigma, cfg_scale=cfg_scale, width=width, height=height)
+                mask = self.controller.sample_training_mask(logits, temperature=gumbel_temperature, hard=hard_mask)
 
-        forward_out = student_forward_fn(mask, logits)
-        if not isinstance(forward_out, dict):
-            raise TypeError("student_forward_fn must return a dict with at least 'student_latent'.")
-        student_latent = forward_out.get("student_latent")
-        if not torch.is_tensor(student_latent):
-            raise ValueError("student_forward_fn output must include tensor 'student_latent'.")
-        actual_full_attn_ratio = forward_out.get("actual_full_attn_ratio", mask.mean())
-        student_rgb = forward_out.get("student_rgb")
+                forward_out = student_forward_fn(mask, logits)
+                if not isinstance(forward_out, dict):
+                    raise TypeError("student_forward_fn must return a dict with at least 'student_latent'.")
+                student_latent = forward_out.get("student_latent")
+                if not torch.is_tensor(student_latent):
+                    raise ValueError("student_forward_fn output must include tensor 'student_latent'.")
+                actual_full_attn_ratio = forward_out.get("actual_full_attn_ratio", mask.mean())
+                student_rgb = forward_out.get("student_rgb")
 
-        loss, metrics = self.compute_loss(
-            teacher_latent=teacher_latent,
-            student_latent=student_latent,
-            actual_full_attn_ratio=actual_full_attn_ratio,
-            teacher_rgb=teacher_rgb,
-            student_rgb=student_rgb,
-        )
+                loss, metrics = self.compute_loss(
+                    teacher_latent=teacher_latent,
+                    student_latent=student_latent,
+                    actual_full_attn_ratio=actual_full_attn_ratio,
+                    teacher_rgb=teacher_rgb,
+                    student_rgb=student_rgb,
+                )
 
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if self.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.controller.parameters(), self.grad_clip_norm)
-        self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if self.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.controller.parameters(), self.grad_clip_norm)
+                self.optimizer.step()
 
-        metrics["mask_mean"] = float(mask.detach().mean().item())
-        metrics["layers_full_ratio"] = float(metrics.get("actual_full_attn_ratio", metrics["mask_mean"]))
+                metrics["mask_mean"] = float(mask.detach().mean().item())
+                metrics["layers_full_ratio"] = float(metrics.get("actual_full_attn_ratio", metrics["mask_mean"]))
         return metrics

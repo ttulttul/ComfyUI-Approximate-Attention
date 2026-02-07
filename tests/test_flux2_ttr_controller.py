@@ -135,6 +135,29 @@ def test_controller_trainer_reinforce_step_updates_parameters():
     assert metrics_b["reward_baseline"] < metrics_a["reward_baseline"]
 
 
+def test_controller_trainer_reinforce_step_works_under_inference_mode():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, learning_rate=1e-2, target_ttr_ratio=0.5)
+    before = [p.detach().clone() for p in controller.parameters()]
+
+    with torch.inference_mode():
+        metrics = trainer.reinforce_step(
+            sigma=0.6,
+            cfg_scale=3.5,
+            width=64,
+            height=64,
+            sampled_mask=torch.tensor([1.0, 0.0, 1.0]),
+            reward=0.8,
+            actual_full_attn_ratio=2.0 / 3.0,
+        )
+
+    after = list(controller.parameters())
+    assert any(not torch.allclose(b, a.detach()) for b, a in zip(before, after))
+    assert "total_loss" in metrics
+    assert metrics["reward"] == pytest.approx(0.8)
+
+
 def test_controller_trainer_train_step_uses_mask_for_gradient_flow():
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)

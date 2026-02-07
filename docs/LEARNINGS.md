@@ -75,3 +75,4 @@
 - Some ComfyUI `comfy_api.latest` builds do not expose `io.VAE`; node schemas should use a compatibility fallback (`AnyType`) to keep extension loading across API variants.
 - For VAE socket compatibility, some builds expose `io.Vae` (camel case) instead of `io.VAE`; checking both keeps node schemas portable.
 - Seed-sweep workflows are easier to build with a dedicated deterministic seed-batch node (`RandomSeedBatch`) instead of overloading float sweep nodes for integer seed generation.
+- Controller optimization steps must explicitly run inside `torch.inference_mode(False)` + `torch.enable_grad()` because ComfyUI may execute custom-node code under inference mode, which otherwise strips the grad graph and breaks `loss.backward()`.
