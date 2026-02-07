@@ -587,6 +587,7 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
         comet_api_key="test-key",
         comet_project_name="proj",
         comet_workspace="ws",
+        comet_log_every=1,
     )
     runtime.training_updates_done = 3
     runtime.steps_remaining = 7
@@ -613,6 +614,59 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     assert payload["flux2ttr/global/loss_p50"] == 0.75
     assert payload["flux2ttr/global/mse_min"] == 1.0
     assert payload["flux2ttr/global/mse_max"] == 2.0
+
+
+def test_record_training_metrics_throttles_comet_logging(monkeypatch):
+    metric_calls = []
+
+    class _FakeExperiment:
+        def log_parameters(self, params):
+            return None
+
+        def log_metrics(self, metrics, step=None):
+            metric_calls.append((dict(metrics), int(step) if step is not None else None))
+
+        def end(self):
+            return None
+
+    def _fake_start(api_key, project_name, workspace):
+        del api_key, project_name, workspace
+        return _FakeExperiment()
+
+    fake_comet = types.ModuleType("comet_ml")
+    fake_comet.start = _fake_start
+    monkeypatch.setitem(sys.modules, "comet_ml", fake_comet)
+
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=100,
+        comet_enabled=True,
+        comet_api_key="test-key",
+        comet_project_name="proj",
+        comet_workspace="ws",
+        comet_log_every=50,
+    )
+
+    runtime.training_updates_done = 49
+    runtime.steps_remaining = 51
+    runtime._record_training_metrics("single:0", {"loss": 0.5})
+    assert metric_calls == []
+
+    runtime.training_updates_done = 50
+    runtime.steps_remaining = 50
+    runtime._record_training_metrics("single:0", {"loss": 0.4})
+    assert len(metric_calls) == 1
+    _, step = metric_calls[-1]
+    assert step == 50
+
+    runtime.training_updates_done = 51
+    runtime.steps_remaining = 0
+    runtime._record_training_metrics("single:0", {"loss": 0.3})
+    assert len(metric_calls) == 2
+    _, step = metric_calls[-1]
+    assert step == 51
 
 
 def test_memory_reserve_estimate_scales_with_training():

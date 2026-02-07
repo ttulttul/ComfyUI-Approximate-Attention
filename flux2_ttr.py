@@ -43,6 +43,7 @@ _DEFAULT_REPLAY_MAX_BYTES = 768 * 1024 * 1024
 _DEFAULT_CFG_SCALE = 1.0
 _DEFAULT_MIN_SWAP_LAYERS = 1
 _DEFAULT_MAX_SWAP_LAYERS = -1
+_DEFAULT_COMET_LOG_EVERY = 50
 _COMET_AGG_METRICS = (
     "loss",
     "mse",
@@ -683,6 +684,7 @@ class Flux2TTRRuntime:
         comet_api_key: str = "",
         comet_project_name: str = "ttr-distillation",
         comet_workspace: str = "comet-workspace",
+        comet_log_every: int = _DEFAULT_COMET_LOG_EVERY,
     ):
         self.feature_dim = validate_feature_dim(feature_dim)
         self.learning_rate = float(learning_rate)
@@ -736,6 +738,7 @@ class Flux2TTRRuntime:
         self.comet_api_key = str(comet_api_key or "")
         self.comet_project_name = str(comet_project_name or "ttr-distillation")
         self.comet_workspace = str(comet_workspace or "comet-workspace")
+        self.comet_log_every = max(1, int(comet_log_every))
 
         self.max_safe_inference_loss = float(_MAX_SAFE_INFERENCE_LOSS)
         self.last_loss = float("nan")
@@ -1260,6 +1263,7 @@ class Flux2TTRRuntime:
                     "cfg_scale": float(self.cfg_scale),
                     "min_swap_layers": int(self.min_swap_layers),
                     "max_swap_layers": int(self.max_swap_layers),
+                    "comet_log_every": int(self.comet_log_every),
                 }
             )
             self._comet_experiment = experiment
@@ -1288,6 +1292,10 @@ class Flux2TTRRuntime:
 
         experiment = self._ensure_comet_experiment()
         if experiment is None:
+            return
+
+        should_log = (self.training_updates_done % self.comet_log_every == 0) or (self.steps_remaining <= 0)
+        if not should_log:
             return
 
         payload = {}
@@ -2034,6 +2042,7 @@ class Flux2TTRRuntime:
             "cfg_scale": self.cfg_scale,
             "min_swap_layers": self.min_swap_layers,
             "max_swap_layers": self.max_swap_layers,
+            "comet_log_every": self.comet_log_every,
             "layer_specs": {
                 key: {"num_heads": spec.num_heads, "head_dim": spec.head_dim}
                 for key, spec in self.layer_specs.items()
@@ -2075,6 +2084,7 @@ class Flux2TTRRuntime:
         self.comet_enabled = bool(payload.get("comet_enabled", self.comet_enabled))
         self.comet_project_name = str(payload.get("comet_project_name", self.comet_project_name))
         self.comet_workspace = str(payload.get("comet_workspace", self.comet_workspace))
+        self.comet_log_every = max(1, int(payload.get("comet_log_every", self.comet_log_every)))
         self.last_loss = float(payload.get("last_loss", self.last_loss))
 
         self.query_chunk_size = max(1, int(payload.get("query_chunk_size", self.query_chunk_size)))
@@ -2198,6 +2208,7 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         comet_enabled=bool(cfg.get("comet_enabled", False)),
         comet_project_name=str(cfg.get("comet_project_name", "ttr-distillation")),
         comet_workspace=str(cfg.get("comet_workspace", "comet-workspace")),
+        comet_log_every=int(cfg.get("comet_log_every", _DEFAULT_COMET_LOG_EVERY)),
     )
 
     runtime.training_mode = training_mode
@@ -2209,6 +2220,7 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
     runtime.cfg_scale = float(cfg.get("cfg_scale", runtime.cfg_scale))
     runtime.min_swap_layers = max(0, int(cfg.get("min_swap_layers", runtime.min_swap_layers)))
     runtime.max_swap_layers = int(cfg.get("max_swap_layers", runtime.max_swap_layers))
+    runtime.comet_log_every = max(1, int(cfg.get("comet_log_every", runtime.comet_log_every)))
 
     checkpoint_path = (cfg.get("checkpoint_path") or "").strip()
     if checkpoint_path and os.path.isfile(checkpoint_path):
@@ -2221,6 +2233,7 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         runtime.cfg_scale = float(cfg.get("cfg_scale", runtime.cfg_scale))
         runtime.min_swap_layers = max(0, int(cfg.get("min_swap_layers", runtime.min_swap_layers)))
         runtime.max_swap_layers = int(cfg.get("max_swap_layers", runtime.max_swap_layers))
+        runtime.comet_log_every = max(1, int(cfg.get("comet_log_every", runtime.comet_log_every)))
     elif not training_mode:
         logger.warning(
             "Flux2TTR: cannot recover inference runtime without a valid checkpoint_path (got %r).",

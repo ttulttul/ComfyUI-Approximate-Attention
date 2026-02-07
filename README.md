@@ -170,8 +170,8 @@ Behavior:
 - During model execution, Flux attention is patched on pre-run and restored on cleanup; single-block calls route to per-layer `Flux2HKRAttnLayer` instances keyed by `block_index`.
 - If a controller checkpoint is provided, inference can dynamically choose per layer whether to use full/native attention or TTR output based on `(sigma, cfg_scale, resolution)` with per-step mask caching.
 - Checkpoint format is `flux2_ttr_v2` and stores layer weights plus readiness/EMA metadata for fail-closed inference.
-- When Comet logging is enabled, Flux2TTR logs per-layer distillation metrics (loss/mse/nmse/cosine/ema/ready plus sigma/cfg/layer-swap stats) each update.
-- Comet logging now also emits global cross-layer distribution stats each update:
+- When Comet logging is enabled, Flux2TTR logs per-layer distillation metrics (loss/mse/nmse/cosine/ema/ready plus sigma/cfg/layer-swap stats) every 50 updates by default (and on the final update).
+- Comet logging now also emits global cross-layer distribution stats on the same interval:
   - `flux2ttr/global/{loss|mse|nmse|cosine_similarity|ema_loss}_{min|p25|p50|p75|max}`
   - plus `layers_tracked`, `layers_ready`, and `layers_ready_ratio`.
 

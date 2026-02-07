@@ -868,6 +868,7 @@ class Flux2TTR(io.ComfyNode):
             "comet_enabled": runtime.comet_enabled,
             "comet_project_name": runtime.comet_project_name,
             "comet_workspace": runtime.comet_workspace,
+            "comet_log_every": int(runtime.comet_log_every),
             "training_steps_total": int(runtime.training_steps_total),
             "training_steps_remaining": int(runtime.steps_remaining),
             "learning_rate": float(learning_rate),

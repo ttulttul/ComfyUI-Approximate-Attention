@@ -69,3 +69,4 @@
 - Flux2TTR quality-control hooks are much easier to reason about when sigma/CFG are extracted centrally in runtime and passed through replay storage to layer forward, rather than re-derived in each call site.
 - Randomizing swapped training layers per diffusion step (instead of training every eligible layer every call) reduces per-step compute and keeps distillation coverage broad over time.
 - Keeping controller inference in a separate module with standalone checkpoint IO makes it possible to attach/detach Phase-2 routing without changing the Phase-1 TTR checkpoint format.
+- Comet rate limiting is avoided by throttling Flux2TTR metric submissions to a fixed cadence (50 updates by default) while still logging final-step metrics.
