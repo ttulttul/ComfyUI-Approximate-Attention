@@ -1,45 +1,25 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from flux2_ttr_embeddings import ScalarSinusoidalEmbedding
 
 logger = logging.getLogger(__name__)
 
 _CONTROLLER_CHECKPOINT_FORMAT = "flux2_ttr_controller_v1"
 _LPIPS_EPS = 1e-8
 
-
-class _ScalarSinusoidalEmbedding(nn.Module):
-    def __init__(self, embed_dim: int):
-        super().__init__()
-        dim = max(2, int(embed_dim))
-        if dim % 2 != 0:
-            dim += 1
-        self.embed_dim = dim
-        half = dim // 2
-        exponents = torch.arange(half, dtype=torch.float32) / max(1, half - 1)
-        inv_freq = torch.exp(-math.log(10000.0) * exponents)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 0:
-            x = x.reshape(1)
-        x = x.reshape(-1).float()
-        angles = x[:, None] * self.inv_freq[None, :]
-        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-
-
 class _ResolutionEmbedding(nn.Module):
     def __init__(self, embed_dim: int):
         super().__init__()
-        self.width_embed = _ScalarSinusoidalEmbedding(embed_dim)
-        self.height_embed = _ScalarSinusoidalEmbedding(embed_dim)
+        self.width_embed = ScalarSinusoidalEmbedding(embed_dim)
+        self.height_embed = ScalarSinusoidalEmbedding(embed_dim)
         in_dim = self.width_embed.embed_dim + self.height_embed.embed_dim
         self.proj = nn.Sequential(
             nn.Linear(in_dim, embed_dim),
@@ -62,8 +42,8 @@ class TTRController(nn.Module):
         self.embed_dim = int(embed_dim)
         self.hidden_dim = int(hidden_dim)
 
-        self.sigma_embed = _ScalarSinusoidalEmbedding(self.embed_dim)
-        self.cfg_embed = _ScalarSinusoidalEmbedding(self.embed_dim)
+        self.sigma_embed = ScalarSinusoidalEmbedding(self.embed_dim)
+        self.cfg_embed = ScalarSinusoidalEmbedding(self.embed_dim)
         self.resolution_embed = _ResolutionEmbedding(self.embed_dim)
 
         mlp_in = self.sigma_embed.embed_dim + self.cfg_embed.embed_dim + self.embed_dim
@@ -208,12 +188,26 @@ class ControllerTrainer:
             raise ValueError("LPIPS tensors must have 3 channels.")
         return x.clamp(-1.0, 1.0)
 
+    @staticmethod
+    def _ratio_tensor(
+        actual_full_attn_ratio: float | torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if torch.is_tensor(actual_full_attn_ratio):
+            ratio = actual_full_attn_ratio.to(device=device, dtype=dtype)
+            if ratio.ndim > 0:
+                ratio = ratio.mean()
+            return ratio
+        return torch.tensor(float(actual_full_attn_ratio), device=device, dtype=dtype)
+
     def compute_loss(
         self,
         *,
         teacher_latent: torch.Tensor,
         student_latent: torch.Tensor,
-        actual_full_attn_ratio: float,
+        actual_full_attn_ratio: float | torch.Tensor,
         teacher_rgb: Optional[torch.Tensor] = None,
         student_rgb: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -235,9 +229,12 @@ class ControllerTrainer:
             lpips_term = self.lpips_model(student_rgb, teacher_rgb).mean()
             loss = loss + self.lpips_weight * lpips_term
 
-        efficiency_penalty = torch.relu(
-            torch.tensor(float(actual_full_attn_ratio), device=loss.device) - float(self.target_ttr_ratio)
+        ratio = self._ratio_tensor(
+            actual_full_attn_ratio,
+            device=loss.device,
+            dtype=loss.dtype,
         )
+        efficiency_penalty = torch.relu(ratio - float(self.target_ttr_ratio))
         loss = loss + efficiency_penalty
 
         metrics = {
@@ -246,7 +243,7 @@ class ControllerTrainer:
             "cosine_distance": float(cosine.detach().item()),
             "lpips": float(lpips_term.detach().item()),
             "efficiency_penalty": float(efficiency_penalty.detach().item()),
-            "actual_full_attn_ratio": float(actual_full_attn_ratio),
+            "actual_full_attn_ratio": float(ratio.detach().item()),
             "target_ttr_ratio": float(self.target_ttr_ratio),
         }
         return loss, metrics
@@ -259,15 +256,25 @@ class ControllerTrainer:
         width: int,
         height: int,
         teacher_latent: torch.Tensor,
-        student_latent: torch.Tensor,
-        actual_full_attn_ratio: float,
+        student_forward_fn: Callable[[torch.Tensor, torch.Tensor], Dict[str, Any]],
         teacher_rgb: Optional[torch.Tensor] = None,
-        student_rgb: Optional[torch.Tensor] = None,
         gumbel_temperature: float = 1.0,
+        hard_mask: bool = True,
     ) -> Dict[str, float]:
+        if not callable(student_forward_fn):
+            raise TypeError("ControllerTrainer.train_step requires a callable student_forward_fn(mask, logits).")
         self.controller.train()
         logits = self.controller(sigma=sigma, cfg_scale=cfg_scale, width=width, height=height)
-        mask = self.controller.sample_training_mask(logits, temperature=gumbel_temperature, hard=True)
+        mask = self.controller.sample_training_mask(logits, temperature=gumbel_temperature, hard=hard_mask)
+
+        forward_out = student_forward_fn(mask, logits)
+        if not isinstance(forward_out, dict):
+            raise TypeError("student_forward_fn must return a dict with at least 'student_latent'.")
+        student_latent = forward_out.get("student_latent")
+        if not torch.is_tensor(student_latent):
+            raise ValueError("student_forward_fn output must include tensor 'student_latent'.")
+        actual_full_attn_ratio = forward_out.get("actual_full_attn_ratio", mask.mean())
+        student_rgb = forward_out.get("student_rgb")
 
         loss, metrics = self.compute_loss(
             teacher_latent=teacher_latent,
@@ -282,5 +289,5 @@ class ControllerTrainer:
         self.optimizer.step()
 
         metrics["mask_mean"] = float(mask.detach().mean().item())
-        metrics["layers_full_ratio"] = float(mask.detach().mean().item())
+        metrics["layers_full_ratio"] = float(metrics.get("actual_full_attn_ratio", metrics["mask_mean"]))
         return metrics

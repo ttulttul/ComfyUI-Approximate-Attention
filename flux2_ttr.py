@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from flux2_ttr_embeddings import ScalarSinusoidalEmbedding
+
 logger = logging.getLogger(__name__)
 
 _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
@@ -410,26 +412,6 @@ class KernelRegressorAttention(nn.Module):
 
         self.last_den_min = den_min
         return torch.cat(out_chunks, dim=2)
-
-
-class ScalarSinusoidalEmbedding(nn.Module):
-    def __init__(self, embed_dim: int):
-        super().__init__()
-        dim = max(2, int(embed_dim))
-        if dim % 2 != 0:
-            dim += 1
-        self.embed_dim = dim
-        half = dim // 2
-        exponents = torch.arange(half, dtype=torch.float32) / max(1, half - 1)
-        inv_freq = torch.exp(-math.log(10000.0) * exponents)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 0:
-            x = x.reshape(1)
-        x = x.reshape(-1).float()
-        angles = x[:, None] * self.inv_freq[None, :]
-        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
 
 
 class SigmaCFGConditioner(nn.Module):
@@ -972,13 +954,47 @@ class Flux2TTRRuntime:
             return False
         return True
 
-    def _eligible_single_layer_keys(self, current_layer_key: Optional[str] = None) -> list[str]:
-        keys = [key for key in self.layer_specs.keys() if self._layer_key_within_range(key)]
+    def _single_layer_keys_from_options(self, transformer_options: Optional[dict]) -> list[str]:
+        if not isinstance(transformer_options, dict):
+            return []
+        keys: set[str] = set()
+        inner = transformer_options.get("flux2_ttr") if isinstance(transformer_options.get("flux2_ttr"), dict) else {}
+
+        for key_name in ("all_single_layer_keys", "single_layer_keys"):
+            value = transformer_options.get(key_name)
+            if isinstance(value, (list, tuple)):
+                keys.update(str(v) for v in value if isinstance(v, str) and v.startswith("single:"))
+            value = inner.get(key_name) if isinstance(inner, dict) else None
+            if isinstance(value, (list, tuple)):
+                keys.update(str(v) for v in value if isinstance(v, str) and v.startswith("single:"))
+
+        for count_key in ("num_single_blocks", "single_block_count", "total_single_blocks"):
+            count = transformer_options.get(count_key)
+            if not isinstance(count, int):
+                count = inner.get(count_key) if isinstance(inner, dict) else None
+            if isinstance(count, int) and count > 0:
+                keys.update(f"single:{idx}" for idx in range(count))
+                break
+
+        resolved = [key for key in keys if self._layer_key_within_range(key)]
+        resolved.sort(key=self._layer_sort_key)
+        return resolved
+
+    def _eligible_single_layer_keys(
+        self,
+        current_layer_key: Optional[str] = None,
+        transformer_options: Optional[dict] = None,
+    ) -> list[str]:
+        keys: set[str] = set()
+        keys.update(key for key in self.layer_specs.keys() if self._layer_key_within_range(key))
+        keys.update(key for key in self.layers.keys() if self._layer_key_within_range(key))
+        keys.update(key for key in self.replay_buffers.keys() if self._layer_key_within_range(key))
+        keys.update(self._single_layer_keys_from_options(transformer_options))
         if current_layer_key is not None and self._layer_key_within_range(current_layer_key):
-            if current_layer_key not in keys:
-                keys.append(current_layer_key)
-        keys.sort(key=self._layer_sort_key)
-        return keys
+            keys.add(current_layer_key)
+        ordered = list(keys)
+        ordered.sort(key=self._layer_sort_key)
+        return ordered
 
     def _extract_sigma(self, transformer_options: Optional[dict]) -> Optional[float]:
         if not isinstance(transformer_options, dict):
@@ -1747,7 +1763,10 @@ class Flux2TTRRuntime:
             eligible_layers: list[str] = []
             swap_set: set[str] = set()
             if self.training_enabled and self.steps_remaining > 0:
-                eligible_layers = self._eligible_single_layer_keys(current_layer_key=layer_key)
+                eligible_layers = self._eligible_single_layer_keys(
+                    current_layer_key=layer_key,
+                    transformer_options=transformer_options,
+                )
                 swap_set = self._resolve_swap_set_for_step(transformer_options, eligible_layers)
                 if layer_key not in swap_set:
                     if isinstance(transformer_options, dict):

@@ -70,3 +70,4 @@
 - Randomizing swapped training layers per diffusion step (instead of training every eligible layer every call) reduces per-step compute and keeps distillation coverage broad over time.
 - Keeping controller inference in a separate module with standalone checkpoint IO makes it possible to attach/detach Phase-2 routing without changing the Phase-1 TTR checkpoint format.
 - Comet rate limiting is avoided by throttling Flux2TTR metric submissions to a fixed cadence (50 updates by default) while still logging final-step metrics.
+- Controller training must execute student sampling as a differentiable function of controller mask/logits; passing precomputed student latents into trainer steps disconnects RMSE/cosine/LPIPS losses from controller gradients.

@@ -169,6 +169,7 @@ Behavior:
 - Unsupported full per-query masks (`[B,H,Nq,Nk]` style) explicitly fail closed to native attention.
 - During model execution, Flux attention is patched on pre-run and restored on cleanup; single-block calls route to per-layer `Flux2HKRAttnLayer` instances keyed by `block_index`.
 - If a controller checkpoint is provided, inference can dynamically choose per layer whether to use full/native attention or TTR output based on `(sigma, cfg_scale, resolution)` with per-step mask caching.
+- Phase-2 `ControllerTrainer.train_step` now requires a `student_forward_fn(mask, logits)` callback so reconstruction loss gradients can flow through controller mask decisions (instead of training on detached precomputed student latents).
 - Checkpoint format is `flux2_ttr_v2` and stores layer weights plus readiness/EMA metadata for fail-closed inference.
 - When Comet logging is enabled, Flux2TTR logs per-layer distillation metrics (loss/mse/nmse/cosine/ema/ready plus sigma/cfg/layer-swap stats) every 50 updates by default (and on the final update).
 - Comet logging now also emits global cross-layer distribution stats on the same interval:
