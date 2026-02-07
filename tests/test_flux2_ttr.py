@@ -268,6 +268,33 @@ def test_high_loss_inference_falls_back_to_teacher():
     assert torch.allclose(out, baseline)
 
 
+def test_cleanup_unregisters_runtime_and_releases_resources(monkeypatch):
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime_id = flux2_ttr.register_runtime(runtime)
+
+    called = {"release": 0, "restore": 0}
+
+    def fake_release():
+        called["release"] += 1
+
+    def fake_restore():
+        called["restore"] += 1
+
+    runtime.release_resources = fake_release  # type: ignore[method-assign]
+    monkeypatch.setattr(flux2_ttr, "restore_flux_attention", fake_restore)
+
+    class DummyPatcher:
+        def __init__(self):
+            self.model_options = {
+                "transformer_options": {"flux2_ttr": {"enabled": True, "runtime_id": runtime_id, "training_mode": False}}
+            }
+
+    flux2_ttr.cleanup_callback(DummyPatcher())
+    assert called["release"] == 1
+    assert called["restore"] == 1
+    assert flux2_ttr.get_runtime(runtime_id) is None
+
+
 def test_training_progress_logs_every_10_updates(caplog):
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=10)

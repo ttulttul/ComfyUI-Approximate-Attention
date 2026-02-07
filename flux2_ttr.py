@@ -417,6 +417,27 @@ class Flux2TTRRuntime:
         self._scan_chunk_override_infer: Dict[str, int] = {}
         self._warned_high_loss = False
 
+    def release_resources(self) -> None:
+        for layer in self.layers.values():
+            try:
+                layer.to(device="cpu")
+            except Exception:
+                pass
+        self.layers.clear()
+
+        for optimizer in self.optimizers.values():
+            try:
+                optimizer.state.clear()
+            except Exception:
+                pass
+        self.optimizers.clear()
+
+        self._projection_cache.clear()
+        self._scan_chunk_override_train.clear()
+        self._scan_chunk_override_infer.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def register_layer_specs(self, specs: Iterable[FluxLayerSpec]) -> None:
         for spec in specs:
             self.layer_specs[spec.layer_key] = spec
@@ -1005,9 +1026,14 @@ def cleanup_callback(patcher) -> None:
     cfg = transformer_options.get("flux2_ttr")
     if not cfg or not cfg.get("enabled", False):
         return
-    runtime = get_runtime(cfg.get("runtime_id", ""))
+    runtime_id = cfg.get("runtime_id", "")
+    runtime = get_runtime(runtime_id)
     if runtime is not None and cfg.get("training_mode", False):
         checkpoint_path = (cfg.get("checkpoint_path") or "").strip()
         if checkpoint_path:
             runtime.save_checkpoint(checkpoint_path)
+    if runtime is not None:
+        runtime.release_resources()
+    if isinstance(runtime_id, str) and runtime_id:
+        unregister_runtime(runtime_id)
     restore_flux_attention()
