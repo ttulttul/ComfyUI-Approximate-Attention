@@ -147,7 +147,7 @@ The `Flux2TTR` node adds a train/load workflow for replacing Flux single-block a
   - `loss_value` from calibration/load state
 
 Behavior:
-- `training=true`: runs an in-node distillation calibration loop (teacher = softmax attention) and optionally saves a checkpoint.
+- `training=true`: runs online distillation during the sampler run using native Flux attention as the teacher (`MSE(student, native_attention)`), and automatically saves to `checkpoint_path` at model cleanup when provided.
 - `training=false`: loads TTR weights from `checkpoint_path` and enables inference with TTR attention.
 - During model execution, Flux attention is patched on pre-run and restored on cleanup; single-block calls route to per-layer `TTRFluxLayer` instances keyed by `block_index`.
 - Inference uses a chunked vectorized scan instead of token-by-token Python loops for better throughput.

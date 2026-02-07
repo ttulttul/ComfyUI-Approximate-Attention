@@ -72,7 +72,7 @@ def test_ttr_scan_chunked_matches_token_scan():
     assert torch.allclose(out_token, out_chunked, atol=1e-6, rtol=1e-5)
 
 
-def test_runtime_training_uses_teacher_output_then_switches_to_inference():
+def test_runtime_training_uses_teacher_passthrough():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
@@ -93,9 +93,30 @@ def test_runtime_training_uses_teacher_output_then_switches_to_inference():
     assert runtime.training_enabled is False
     assert not math.isnan(runtime.last_loss)
 
-    out_infer = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
-    assert out_infer.shape == baseline.shape
-    assert torch.isfinite(out_infer).all()
+    # Training mode stays in teacher passthrough for this run.
+    out_passthrough = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    assert torch.allclose(out_passthrough, baseline)
+
+
+def test_runtime_inference_mode_uses_student_output_shape():
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime.training_mode = False
+    runtime.training_enabled = False
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+    opts = {"block_type": "single", "block_index": 0}
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, mask, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg)
+
+    out = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    assert out.shape == (q.shape[0], q.shape[2], q.shape[1] * q.shape[3])
+    assert torch.isfinite(out).all()
 
 
 def test_runtime_layer_range_falls_back_to_teacher():

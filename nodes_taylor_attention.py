@@ -596,22 +596,19 @@ class Flux2TTR(io.ComfyNode):
 
         if training:
             if checkpoint_path and os.path.isfile(checkpoint_path):
-                logger.info("Flux2TTR: loading existing checkpoint before calibration: %s", checkpoint_path)
+                logger.info("Flux2TTR: loading existing checkpoint before online distillation: %s", checkpoint_path)
                 runtime.load_checkpoint(checkpoint_path)
-            loss_value = runtime.calibrate_from_inputs(
-                model=m,
-                latents=latents,
-                conditioning=conditioning,
-                steps=train_steps,
-            )
-            if checkpoint_path:
-                runtime.save_checkpoint(checkpoint_path)
+            runtime.training_mode = True
+            runtime.training_enabled = train_steps > 0
+            runtime.steps_remaining = max(0, train_steps)
+            loss_value = float(runtime.last_loss) if not math.isnan(runtime.last_loss) else 0.0
         else:
             if not checkpoint_path:
                 raise ValueError("Flux2TTR: checkpoint_path is required when training is disabled.")
             if not os.path.isfile(checkpoint_path):
                 raise FileNotFoundError(f"Flux2TTR: checkpoint not found: {checkpoint_path}")
             runtime.load_checkpoint(checkpoint_path)
+            runtime.training_mode = False
             runtime.training_enabled = False
             runtime.steps_remaining = 0
             loss_value = float(runtime.last_loss) if not math.isnan(runtime.last_loss) else 0.0
@@ -621,6 +618,7 @@ class Flux2TTR(io.ComfyNode):
             "enabled": True,
             "runtime_id": runtime_id,
             "training": runtime.training_enabled,
+            "training_mode": runtime.training_mode,
             "feature_dim": feature_dim,
             "scan_chunk_size": int(scan_chunk_size),
             "layer_start": int(layer_start),
@@ -644,7 +642,7 @@ class Flux2TTR(io.ComfyNode):
         )
 
         logger.info(
-            "Flux2TTR configured: training=%s steps=%d feature_dim=%d scan_chunk_size=%d layer_range=[%d,%d] mixed_precision=%s checkpoint=%s loss=%.6g",
+            "Flux2TTR configured: training_mode=%s training_steps=%d feature_dim=%d scan_chunk_size=%d layer_range=[%d,%d] mixed_precision=%s checkpoint=%s loss=%.6g",
             training,
             train_steps,
             feature_dim,

@@ -260,6 +260,7 @@ class Flux2TTRRuntime:
     ):
         self.feature_dim = validate_feature_dim(feature_dim)
         self.learning_rate = float(learning_rate)
+        self.training_mode = bool(training)
         self.training_enabled = bool(training)
         self.steps_remaining = max(0, int(steps))
         self.scan_chunk_size = max(1, int(scan_chunk_size))
@@ -430,33 +431,33 @@ class Flux2TTRRuntime:
         head_dim = spec.head_dim if spec else int(q_eff.shape[-1])
         layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
 
-        if self.training_enabled and self.steps_remaining > 0:
-            self._set_layer_dtype(layer_key, layer, torch.float32)
-            layer.train()
-            with torch.inference_mode(False):
-                with torch.enable_grad():
-                    q_in = q_eff.float()
-                    k_in = k_eff.float()
-                    v_in = v.float()
-                    student = layer(q_in, k_in, v_in)
-                    with torch.no_grad():
-                        teacher_out = self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
+        if self.training_mode:
+            with torch.no_grad():
+                teacher_out = self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
+            if self.training_enabled and self.steps_remaining > 0:
+                self._set_layer_dtype(layer_key, layer, torch.float32)
+                layer.train()
+                with torch.inference_mode(False):
+                    with torch.enable_grad():
+                        q_in = q_eff.float()
+                        k_in = k_eff.float()
+                        v_in = v.float()
+                        student = layer(q_in, k_in, v_in)
                         teacher = (
                             teacher_out.view(q.shape[0], q.shape[2], q.shape[1], q.shape[3])
                             .permute(0, 2, 1, 3)
                             .float()
                         )
-                    loss = torch.nn.functional.mse_loss(student, teacher)
-                    optimizer = self.optimizers[layer_key]
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    optimizer.step()
-
-            self.last_loss = float(loss.item())
-            self.steps_remaining -= 1
-            if self.steps_remaining <= 0:
-                self.training_enabled = False
-                logger.info("Flux2TTR: online distillation complete; inference mode enabled.")
+                        loss = torch.nn.functional.mse_loss(student, teacher)
+                        optimizer = self.optimizers[layer_key]
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        optimizer.step()
+                self.last_loss = float(loss.item())
+                self.steps_remaining -= 1
+                if self.steps_remaining <= 0:
+                    self.training_enabled = False
+                    logger.info("Flux2TTR: online distillation reached configured steps; continuing teacher passthrough for this run.")
             return teacher_out
 
         layer.eval()
@@ -581,6 +582,7 @@ class Flux2TTRRuntime:
             "format": "flux2_ttr_v1",
             "feature_dim": self.feature_dim,
             "learning_rate": self.learning_rate,
+            "training_mode": self.training_mode,
             "last_loss": self.last_loss,
             "scan_chunk_size": self.scan_chunk_size,
             "layer_start": self.layer_start,
@@ -615,6 +617,7 @@ class Flux2TTRRuntime:
             )
 
         self.learning_rate = float(payload.get("learning_rate", self.learning_rate))
+        self.training_mode = bool(payload.get("training_mode", self.training_mode))
         self.last_loss = float(payload.get("last_loss", self.last_loss))
         self.scan_chunk_size = max(1, int(payload.get("scan_chunk_size", self.scan_chunk_size)))
         self.layer_start = int(payload.get("layer_start", self.layer_start))
@@ -728,4 +731,9 @@ def cleanup_callback(patcher) -> None:
     cfg = transformer_options.get("flux2_ttr")
     if not cfg or not cfg.get("enabled", False):
         return
+    runtime = get_runtime(cfg.get("runtime_id", ""))
+    if runtime is not None and cfg.get("training_mode", False):
+        checkpoint_path = (cfg.get("checkpoint_path") or "").strip()
+        if checkpoint_path:
+            runtime.save_checkpoint(checkpoint_path)
     restore_flux_attention()
