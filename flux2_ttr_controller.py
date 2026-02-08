@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 _CONTROLLER_CHECKPOINT_FORMAT = "flux2_ttr_controller_v1"
 _LPIPS_EPS = 1e-8
+DEFAULT_CONTROLLER_CHECKPOINT_EVERY = 10
+
+
+def should_save_controller_checkpoint_step(step: int, checkpoint_every: int = DEFAULT_CONTROLLER_CHECKPOINT_EVERY) -> bool:
+    return int(step) > 0 and int(checkpoint_every) > 0 and (int(step) % int(checkpoint_every) == 0)
 
 class _ResolutionEmbedding(nn.Module):
     def __init__(self, embed_dim: int):

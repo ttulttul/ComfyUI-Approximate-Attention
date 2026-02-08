@@ -1690,6 +1690,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         sigma_value = cls._representative_sigma(model_ttr, scheduler=scheduler, steps=int(steps))
         total_iterations = max(1, int(training_iterations))
         total_steps = total_iterations * max(1, len(latent_items))
+        checkpoint_every = max(1, int(flux2_ttr_controller.DEFAULT_CONTROLLER_CHECKPOINT_EVERY))
         comet_experiment = cls._maybe_start_comet(
             logging_cfg,
             normalized_cfg,
@@ -1706,6 +1707,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 "controller_num_layers": int(controller.num_layers),
                 "eligible_ttr_layers": int(len(ready_layer_indices)),
                 "forced_full_layers": int(forced_full_layer_count),
+                "checkpoint_every": int(checkpoint_every),
                 "checkpoint_path": checkpoint_path,
                 "device": str(device),
                 "comet_experiment": _string_or(logging_cfg.get("comet_experiment"), ""),
@@ -1877,6 +1879,21 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                     }
 
                     global_step += 1
+                    if (
+                        checkpoint_path
+                        and global_step < total_steps
+                        and flux2_ttr_controller.should_save_controller_checkpoint_step(
+                            global_step,
+                            checkpoint_every=checkpoint_every,
+                        )
+                    ):
+                        flux2_ttr_controller.save_controller_checkpoint(controller, checkpoint_path)
+                        logger.info(
+                            "Flux2TTRControllerTrainer: periodic controller checkpoint saved at step %d/%d: %s",
+                            global_step,
+                            total_steps,
+                            checkpoint_path,
+                        )
                     if comet_experiment is not None and (global_step % log_every == 0 or global_step == total_steps):
                         cls._safe_comet_log_metrics(
                             comet_experiment,

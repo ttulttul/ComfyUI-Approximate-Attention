@@ -6,6 +6,20 @@ import torch
 import flux2_ttr_controller
 
 
+def test_should_save_controller_checkpoint_step_defaults_to_every_ten():
+    assert flux2_ttr_controller.should_save_controller_checkpoint_step(0) is False
+    assert flux2_ttr_controller.should_save_controller_checkpoint_step(1) is False
+    assert flux2_ttr_controller.should_save_controller_checkpoint_step(9) is False
+    assert flux2_ttr_controller.should_save_controller_checkpoint_step(10) is True
+    assert flux2_ttr_controller.should_save_controller_checkpoint_step(20) is True
+
+
+def test_should_save_controller_checkpoint_step_respects_custom_interval():
+    assert flux2_ttr_controller.should_save_controller_checkpoint_step(6, checkpoint_every=3) is True
+    assert flux2_ttr_controller.should_save_controller_checkpoint_step(7, checkpoint_every=3) is False
+    assert flux2_ttr_controller.should_save_controller_checkpoint_step(9, checkpoint_every=0) is False
+
+
 def test_ttr_controller_forward_shape():
     controller = flux2_ttr_controller.TTRController(num_layers=6, embed_dim=16, hidden_dim=32)
     logits = controller(sigma=0.5, cfg_scale=4.0, width=128, height=128)
