@@ -136,7 +136,7 @@ Flux2TTR is now split into four nodes:
   - `loss_config` (`rmse_weight`, `cosine_weight`, `lpips_weight`, `huber_beta`)
   - `optimizer_config` (`learning_rate`, `grad_clip_norm`, `alpha_lr_multiplier`, `phi_lr_multiplier`)
   - `schedule_config` (`target_ttr_ratio`, `gumbel_temperature_start`, `gumbel_temperature_end`, `warmup_steps`)
-  - `logging_config` (`comet_enabled`, `comet_api_key`, `comet_project_name`, `comet_workspace`, `log_every`)
+  - `logging_config` (`comet_enabled`, `comet_api_key`, `comet_project_name`, `comet_workspace`, `comet_experiment`, `log_every`)
 
 - `Flux2TTRTrainer` (renamed from `Flux2TTR`): Phase-1 online distillation of TTR layers.
   - Accepts optional `training_config` for shared hyperparameters.
@@ -148,6 +148,7 @@ Flux2TTR is now split into four nodes:
   - Computes RMSE/cosine/LPIPS quality delta and updates controller with REINFORCE.
   - Uses fixed per-run `controller_mask_override` during patched sampling.
   - Logs Comet metrics with `flux2ttr_controller/*` prefixes when `training_config.logging_config.comet_enabled=true`.
+  - Uses `training_config.logging_config.comet_experiment` as a stable Comet experiment key so repeated runs append to one persistent experiment.
   - Comet run parameters now include flattened training config + run config metadata (`steps`, `cfg`, sampler/scheduler, batch size, controller layers, etc.).
   - Outputs: `IMAGE_ORIGINAL`, `IMAGE_PATCHED`, and `TTR_CONTROLLER`.
 

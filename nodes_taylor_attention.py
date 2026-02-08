@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 from typing import Dict, Any, Optional
 
 import torch
@@ -58,6 +59,7 @@ _TRAINING_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "comet_api_key": "",
         "comet_project_name": "ttr-distillation",
         "comet_workspace": "",
+        "comet_experiment": "",
         "log_every": 10,
     },
 }
@@ -72,8 +74,12 @@ _LEGACY_TRAINER_DEFAULTS = {
     "comet_api_key": "",
     "comet_project_name": "ttr-distillation",
     "comet_workspace": "comet-workspace",
+    "comet_experiment": "",
     "log_every": 50,
 }
+
+_CONTROLLER_COMET_EXPERIMENTS: dict[str, Any] = {}
+_CONTROLLER_COMET_LOGGED_PARAM_KEYS: set[str] = set()
 
 
 @io.comfytype(io_type="TTR_TRAINING_CONFIG")
@@ -134,6 +140,10 @@ def _string_or(value: Any, default: str) -> str:
     if value is None:
         return str(default)
     return str(value)
+
+
+def _default_comet_experiment_name() -> str:
+    return f"exp_{random.getrandbits(64)}"
 
 
 def _extract_layer_idx(layer_key: str) -> Optional[int]:
@@ -202,6 +212,7 @@ def _build_training_config_payload(
     comet_api_key: str,
     comet_project_name: str,
     comet_workspace: str,
+    comet_experiment: str,
     log_every: int,
 ) -> dict[str, dict[str, Any]]:
     return {
@@ -228,6 +239,7 @@ def _build_training_config_payload(
             "comet_api_key": str(comet_api_key or ""),
             "comet_project_name": str(comet_project_name or "ttr-distillation"),
             "comet_workspace": str(comet_workspace or ""),
+            "comet_experiment": str(comet_experiment or ""),
             "log_every": max(1, int(log_every)),
         },
     }
@@ -731,6 +743,12 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
                 io.String.Input("comet_api_key", default="", multiline=False),
                 io.String.Input("comet_project_name", default="ttr-distillation", multiline=False),
                 io.String.Input("comet_workspace", default="", multiline=False),
+                io.String.Input(
+                    "comet_experiment",
+                    default=_default_comet_experiment_name(),
+                    multiline=False,
+                    tooltip="Comet experiment key. Use a stable value to keep logging to one persistent experiment.",
+                ),
                 io.Int.Input("log_every", default=10, min=1, max=1000000, step=1),
             ],
             outputs=[TTRTrainingConfig.Output("training_config")],
@@ -756,6 +774,7 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
         comet_api_key: str,
         comet_project_name: str,
         comet_workspace: str,
+        comet_experiment: str,
         log_every: int,
     ) -> io.NodeOutput:
         training_config = _build_training_config_payload(
@@ -775,6 +794,7 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
             comet_api_key=comet_api_key,
             comet_project_name=comet_project_name,
             comet_workspace=comet_workspace,
+            comet_experiment=comet_experiment,
             log_every=log_every,
         )
         return io.NodeOutput(training_config)
@@ -1024,6 +1044,7 @@ class Flux2TTRTrainer(io.ComfyNode):
             comet_api_key = _string_or(logging_cfg.get("comet_api_key"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["comet_api_key"])
             comet_project_name = _string_or(logging_cfg.get("comet_project_name"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["comet_project_name"])
             comet_workspace = _string_or(logging_cfg.get("comet_workspace"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["comet_workspace"])
+            comet_experiment = _string_or(logging_cfg.get("comet_experiment"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["comet_experiment"])
             comet_log_every = max(1, _int_or(logging_cfg.get("log_every"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["log_every"]))
         else:
             learning_rate = float(_LEGACY_TRAINER_DEFAULTS["learning_rate"])
@@ -1035,6 +1056,7 @@ class Flux2TTRTrainer(io.ComfyNode):
             comet_api_key = str(_LEGACY_TRAINER_DEFAULTS["comet_api_key"])
             comet_project_name = str(_LEGACY_TRAINER_DEFAULTS["comet_project_name"])
             comet_workspace = str(_LEGACY_TRAINER_DEFAULTS["comet_workspace"])
+            comet_experiment = str(_LEGACY_TRAINER_DEFAULTS["comet_experiment"])
             comet_log_every = int(_LEGACY_TRAINER_DEFAULTS["log_every"])
 
         target_ttr_ratio = _float_or(
@@ -1071,6 +1093,7 @@ class Flux2TTRTrainer(io.ComfyNode):
             comet_api_key=comet_api_key,
             comet_project_name=comet_project_name,
             comet_workspace=comet_workspace,
+            comet_experiment=comet_experiment,
             log_every=comet_log_every,
         )
 
@@ -1478,19 +1501,40 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 return None
             project_name = _string_or(logging_cfg.get("comet_project_name"), "ttr-distillation")
             workspace = _string_or(logging_cfg.get("comet_workspace"), "").strip() or None
-            experiment = comet_ml.start(api_key=api_key or None, project_name=project_name, workspace=workspace)
+            experiment_key = _string_or(logging_cfg.get("comet_experiment"), "").strip()
+            if not experiment_key:
+                experiment_key = _default_comet_experiment_name()
+                logging_cfg["comet_experiment"] = experiment_key
+                logger.info("Flux2TTRControllerTrainer: auto-generated comet_experiment=%s", experiment_key)
+
+            cached = _CONTROLLER_COMET_EXPERIMENTS.get(experiment_key)
+            if cached is not None:
+                logger.info("Flux2TTRControllerTrainer: reusing persistent Comet experiment %s.", experiment_key)
+                return cached
+
+            experiment = comet_ml.start(
+                api_key=api_key or None,
+                project_name=project_name,
+                workspace=workspace,
+                experiment_key=experiment_key,
+            )
             params: dict[str, Any] = {
                 "flux2ttr_phase": "controller_train",
                 "project_name": project_name,
                 "workspace": workspace or "",
+                "comet_experiment": experiment_key,
             }
             Flux2TTRControllerTrainer._flatten_comet_params("training_config", training_config, params)
             Flux2TTRControllerTrainer._flatten_comet_params("run_config", run_config, params)
-            experiment.log_parameters(params)
+            if experiment_key not in _CONTROLLER_COMET_LOGGED_PARAM_KEYS:
+                experiment.log_parameters(params)
+                _CONTROLLER_COMET_LOGGED_PARAM_KEYS.add(experiment_key)
+            _CONTROLLER_COMET_EXPERIMENTS[experiment_key] = experiment
             logger.info(
-                "Flux2TTRControllerTrainer: Comet logging enabled (project=%s workspace=%s).",
+                "Flux2TTRControllerTrainer: Comet logging enabled (project=%s workspace=%s experiment=%s).",
                 project_name,
                 workspace or "<none>",
+                experiment_key,
             )
             return experiment
         except Exception as exc:
@@ -1592,6 +1636,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 "controller_num_layers": int(controller.num_layers),
                 "checkpoint_path": checkpoint_path,
                 "device": str(device),
+                "comet_experiment": _string_or(logging_cfg.get("comet_experiment"), ""),
             },
         )
 
@@ -1765,11 +1810,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                     global_step if global_step > 0 else 0,
                 )
         finally:
-            if comet_experiment is not None:
-                try:
-                    comet_experiment.end()
-                except Exception:
-                    pass
+            pass
 
         if checkpoint_path:
             flux2_ttr_controller.save_controller_checkpoint(controller, checkpoint_path)
