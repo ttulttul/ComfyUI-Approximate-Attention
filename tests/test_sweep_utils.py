@@ -1,4 +1,5 @@
 import pytest
+import json
 
 import sweep_utils
 
@@ -85,3 +86,29 @@ def test_normalize_comet_experiment_key_generates_default_when_empty():
     out = sweep_utils.normalize_comet_experiment_key("")
     assert out.isalnum()
     assert 30 <= len(out) <= 50
+
+
+def test_load_prompt_list_from_json_valid(tmp_path):
+    path = tmp_path / "prompts.json"
+    path.write_text(json.dumps(["alpha", "beta", "gamma"]), encoding="utf-8")
+    prompts = sweep_utils.load_prompt_list_from_json(str(path))
+    assert prompts == ["alpha", "beta", "gamma"]
+
+
+def test_load_prompt_list_from_json_requires_array(tmp_path):
+    path = tmp_path / "not_array.json"
+    path.write_text(json.dumps({"prompt": "alpha"}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        sweep_utils.load_prompt_list_from_json(str(path))
+
+
+def test_load_prompt_list_from_json_requires_strings(tmp_path):
+    path = tmp_path / "mixed.json"
+    path.write_text(json.dumps(["alpha", 123, "gamma"]), encoding="utf-8")
+    with pytest.raises(ValueError):
+        sweep_utils.load_prompt_list_from_json(str(path))
+
+
+def test_load_prompt_list_from_json_missing_file():
+    with pytest.raises(FileNotFoundError):
+        sweep_utils.load_prompt_list_from_json("/tmp/does-not-exist-prompts.json")

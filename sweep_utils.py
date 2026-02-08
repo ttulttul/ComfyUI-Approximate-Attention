@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from typing import Iterable, Sequence
 
@@ -130,3 +131,27 @@ def normalize_comet_experiment_key(
     if len(key) > max_len:
         key = key[:max_len]
     return key
+
+
+def load_prompt_list_from_json(json_path: str) -> list[str]:
+    path = str(json_path or "").strip()
+    if not path:
+        raise ValueError("json_path is required.")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"JSON file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            payload = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected JSON array of strings in {path}.")
+
+    prompts: list[str] = []
+    for idx, item in enumerate(payload):
+        if not isinstance(item, str):
+            raise ValueError(f"Expected string at index {idx} in {path}, got {type(item).__name__}.")
+        prompts.append(item)
+    return prompts

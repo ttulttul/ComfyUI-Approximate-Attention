@@ -215,6 +215,15 @@ The `RandomSeedBatch` node generates a deterministic list of random integer seed
 - Output:
   - `seeds` (`INT` list) for wiring into nodes that accept list/batched seed values.
 
+## Load Prompt List From JSON
+
+The `LoadPromptListFromJSON` node reads a JSON file that must contain a simple array of strings, then outputs that array as a string list.
+
+- Input:
+  - `json_path` (`STRING`) path to the JSON file.
+- Output:
+  - `prompts` (`STRING` list) for list/batched prompt wiring.
+
 ## Combinations
 
 The `Combinations` node takes up to four value lists (A–D) and returns float-list outputs that cycle each list to cover all combinations. With A=[1,2,3] and B=[4,5], the outputs are:

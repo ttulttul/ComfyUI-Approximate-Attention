@@ -2054,6 +2054,37 @@ class RandomSeedBatch(io.ComfyNode):
         return io.NodeOutput(seeds)
 
 
+class LoadPromptListFromJSON(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="LoadPromptListFromJSON",
+            display_name="LoadPromptListFromJSON",
+            category="advanced/scheduling",
+            description="Load a JSON file containing an array of prompt strings.",
+            inputs=[
+                io.String.Input(
+                    "json_path",
+                    default="",
+                    multiline=False,
+                    tooltip="Path to JSON file containing a simple array of strings.",
+                ),
+            ],
+            outputs=[io.String.Output("prompts", is_output_list=True)],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, json_path: str) -> io.NodeOutput:
+        prompts = sweep_utils.load_prompt_list_from_json(json_path)
+        logger.info(
+            "LoadPromptListFromJSON loaded %d prompts from %s.",
+            len(prompts),
+            str(json_path or "").strip(),
+        )
+        return io.NodeOutput(prompts)
+
+
 class ClockedSweepValues(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -2195,6 +2226,7 @@ class TaylorAttentionExtension(ComfyExtension):
             Flux2TTRControllerTrainer,
             Flux2TTRController,
             RandomSeedBatch,
+            LoadPromptListFromJSON,
             ClockedSweepValues,
             Combinations,
         ]
