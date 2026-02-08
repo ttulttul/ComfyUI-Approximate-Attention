@@ -147,6 +147,7 @@ Flux2TTR is now split into four nodes:
   - Runs dual-path sampling (`model_original` teacher vs `model_ttr` student).
   - Computes RMSE/cosine/LPIPS quality delta and updates controller with REINFORCE.
   - Uses fixed per-run `controller_mask_override` during patched sampling.
+  - Restricts TTR substitution to readiness-qualified layers from the Phase-1 checkpoint; non-ready layers are forced to full attention.
   - Logs Comet metrics with `flux2ttr_controller/*` prefixes when `training_config.logging_config.comet_enabled=true`.
   - Uses `training_config.logging_config.comet_experiment` as a stable Comet experiment key so repeated runs append to one persistent experiment.
   - `comet_experiment` is normalized to Comet constraints: alphanumeric only, length 32-50. Short values are padded with trailing `X`.

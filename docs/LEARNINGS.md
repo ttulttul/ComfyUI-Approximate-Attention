@@ -81,3 +81,4 @@
 - Persisting controller-trainer Comet logging across repeated workflow runs requires a stable `comet_experiment` key and avoiding per-run `experiment.end()` teardown; keeping keyed experiment handles alive prevents accidental run fragmentation.
 - Comet experiment keys should be normalized at the node boundary (strip non-alnum, enforce 32-50 chars, pad short values with `X`) to avoid API rejections and implicit run splitting from malformed identifiers.
 - Prompt-list workflows are simpler with a dedicated JSON loader node that strictly validates `array<string>` input, instead of overloading text widgets for long prompt batches.
+- Controller training quality is more stable when mask sampling excludes non-ready Phase-1 TTR layers; forcing unready layers to full attention avoids training signal contamination from fallback-heavy student runs.

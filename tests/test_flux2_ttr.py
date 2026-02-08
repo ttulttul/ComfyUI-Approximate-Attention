@@ -516,6 +516,65 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
     assert runtime_loaded.max_swap_layers == 5
 
 
+def test_checkpoint_state_includes_per_layer_readiness_criteria():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        readiness_threshold=0.12,
+        readiness_min_updates=3,
+    )
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
+    runtime.layer_update_count["single:0"] = 5
+    runtime.layer_ema_loss["single:0"] = 0.1
+    runtime.layer_readiness_threshold["single:0"] = 0.2
+    runtime.layer_readiness_min_updates["single:0"] = 4
+    runtime._refresh_layer_ready("single:0")
+
+    payload = runtime.checkpoint_state()
+    assert "layer_readiness" in payload
+    assert "single:0" in payload["layer_readiness"]
+    meta = payload["layer_readiness"]["single:0"]
+    assert float(meta["readiness_threshold"]) == pytest.approx(0.2)
+    assert int(meta["readiness_min_updates"]) == 4
+    assert bool(meta["ready"]) is True
+
+
+def test_load_checkpoint_restores_per_layer_readiness_thresholds(tmp_path):
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        readiness_threshold=1.0,
+        readiness_min_updates=0,
+    )
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
+    runtime.layer_update_count["single:0"] = 5
+    runtime.layer_ema_loss["single:0"] = 0.1
+    runtime.layer_readiness_threshold["single:0"] = 0.05
+    runtime.layer_readiness_min_updates["single:0"] = 3
+    runtime._refresh_layer_ready("single:0")
+    assert runtime.layer_ready["single:0"] is False
+
+    ckpt = tmp_path / "flux2_ttr_layer_readiness.pt"
+    runtime.save_checkpoint(str(ckpt))
+
+    loaded = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+        readiness_threshold=10.0,
+        readiness_min_updates=0,
+    )
+    loaded.load_checkpoint(str(ckpt))
+    assert loaded.layer_readiness_threshold["single:0"] == pytest.approx(0.05)
+    assert loaded.layer_readiness_min_updates["single:0"] == 3
+    assert loaded.layer_ready["single:0"] is False
+
+
 def test_recover_runtime_from_config_inference_requires_checkpoint():
     cfg = {
         "training_mode": False,

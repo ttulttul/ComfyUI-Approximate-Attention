@@ -734,6 +734,8 @@ class Flux2TTRRuntime:
         self.layer_update_count: Dict[str, int] = {}
         self.layer_ready: Dict[str, bool] = {}
         self.layer_last_loss: Dict[str, float] = {}
+        self.layer_readiness_threshold: Dict[str, float] = {}
+        self.layer_readiness_min_updates: Dict[str, int] = {}
 
         self.capture_remaining = 0
 
@@ -1405,7 +1407,13 @@ class Flux2TTRRuntime:
     def _refresh_layer_ready(self, layer_key: str) -> bool:
         updates = int(self.layer_update_count.get(layer_key, 0))
         ema = float(self.layer_ema_loss.get(layer_key, float("inf")))
-        ready = updates >= self.readiness_min_updates and ema <= self.readiness_threshold
+        threshold = float(self.layer_readiness_threshold.get(layer_key, self.readiness_threshold))
+        min_updates = int(self.layer_readiness_min_updates.get(layer_key, self.readiness_min_updates))
+        if layer_key not in self.layer_readiness_threshold:
+            self.layer_readiness_threshold[layer_key] = threshold
+        if layer_key not in self.layer_readiness_min_updates:
+            self.layer_readiness_min_updates[layer_key] = min_updates
+        ready = updates >= min_updates and ema <= threshold
         prev = self.layer_ready.get(layer_key)
         self.layer_ready[layer_key] = bool(ready)
         if prev is None or bool(prev) != bool(ready):
@@ -1415,7 +1423,7 @@ class Flux2TTRRuntime:
                 ready,
                 updates,
                 ema,
-                self.readiness_threshold,
+                threshold,
             )
         return bool(ready)
 
@@ -2042,6 +2050,21 @@ class Flux2TTRRuntime:
             if layer_key not in layer_states:
                 layer_states[layer_key] = state
 
+        readiness_keys = set(layer_states.keys())
+        readiness_keys.update(self.layer_specs.keys())
+        readiness_keys.update(self.layer_ema_loss.keys())
+        readiness_keys.update(self.layer_update_count.keys())
+        readiness_keys.update(self.layer_ready.keys())
+        layer_readiness = {}
+        for layer_key in sorted(readiness_keys):
+            layer_readiness[layer_key] = {
+                "readiness_threshold": float(self.layer_readiness_threshold.get(layer_key, self.readiness_threshold)),
+                "readiness_min_updates": int(self.layer_readiness_min_updates.get(layer_key, self.readiness_min_updates)),
+                "ema_loss": float(self.layer_ema_loss.get(layer_key, float("inf"))),
+                "update_count": int(self.layer_update_count.get(layer_key, 0)),
+                "ready": bool(self.layer_ready.get(layer_key, False)),
+            }
+
         return {
             "format": "flux2_ttr_v2",
             "feature_dim": self.feature_dim,
@@ -2086,6 +2109,7 @@ class Flux2TTRRuntime:
             "layer_update_count": dict(self.layer_update_count),
             "layer_ready": dict(self.layer_ready),
             "layer_last_loss": dict(self.layer_last_loss),
+            "layer_readiness": layer_readiness,
             "layers": layer_states,
         }
 
@@ -2168,6 +2192,20 @@ class Flux2TTRRuntime:
         self.layer_update_count = {str(k): int(v) for k, v in payload.get("layer_update_count", {}).items()}
         self.layer_ready = {str(k): bool(v) for k, v in payload.get("layer_ready", {}).items()}
         self.layer_last_loss = {str(k): float(v) for k, v in payload.get("layer_last_loss", {}).items()}
+        self.layer_readiness_threshold = {}
+        self.layer_readiness_min_updates = {}
+        for layer_key, meta in payload.get("layer_readiness", {}).items():
+            if not isinstance(meta, dict):
+                continue
+            key = str(layer_key)
+            self.layer_readiness_threshold[key] = float(meta.get("readiness_threshold", self.readiness_threshold))
+            self.layer_readiness_min_updates[key] = int(meta.get("readiness_min_updates", self.readiness_min_updates))
+            if key not in self.layer_ema_loss and "ema_loss" in meta:
+                self.layer_ema_loss[key] = float(meta.get("ema_loss", float("inf")))
+            if key not in self.layer_update_count and "update_count" in meta:
+                self.layer_update_count[key] = int(meta.get("update_count", 0))
+            if key not in self.layer_ready and "ready" in meta:
+                self.layer_ready[key] = bool(meta.get("ready", False))
 
         self.pending_state = payload.get("layers", {})
         for layer_key, layer in self.layers.items():

@@ -1572,21 +1572,42 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         flux_cfg["training_mode"] = False
         flux_cfg["training"] = False
 
-        layer_indices: list[int] = []
+        layer_index_to_key: dict[int, str] = {}
         for layer_key in runtime.layer_specs:
             if not layer_key.startswith("single:"):
                 continue
             idx = _extract_layer_idx(layer_key)
             if idx is not None and idx >= 0:
-                layer_indices.append(idx)
-        if not layer_indices:
+                layer_index_to_key[idx] = layer_key
+        if not layer_index_to_key:
             for layer_key in runtime.layer_ready:
                 idx = _extract_layer_idx(layer_key)
                 if idx is not None and idx >= 0:
-                    layer_indices.append(idx)
+                    layer_index_to_key[idx] = layer_key
+        layer_indices = sorted(layer_index_to_key.keys())
         if not layer_indices:
             raise ValueError("Flux2TTRControllerTrainer: unable to infer eligible TTR layer count from model_ttr.")
         num_layers = max(layer_indices) + 1
+
+        ready_layer_indices: list[int] = []
+        for idx in layer_indices:
+            layer_key = layer_index_to_key[idx]
+            if runtime._refresh_layer_ready(layer_key):
+                ready_layer_indices.append(idx)
+        if not ready_layer_indices:
+            raise ValueError(
+                "Flux2TTRControllerTrainer requires readiness-qualified TTR layers. "
+                "Run Flux2TTRTrainer longer or lower readiness_threshold."
+            )
+        ttr_eligible_mask_cpu = torch.zeros(num_layers, dtype=torch.bool)
+        ttr_eligible_mask_cpu[ready_layer_indices] = True
+        forced_full_layer_count = int((~ttr_eligible_mask_cpu).sum().item())
+        logger.info(
+            "Flux2TTRControllerTrainer layer readiness: eligible_ttr=%d/%d forced_full=%d",
+            int(len(ready_layer_indices)),
+            int(num_layers),
+            forced_full_layer_count,
+        )
 
         normalized_cfg = _normalize_training_config(training_config)
         loss_cfg = normalized_cfg["loss_config"]
@@ -1638,6 +1659,8 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 "total_steps": int(total_steps),
                 "denoise": float(denoise),
                 "controller_num_layers": int(controller.num_layers),
+                "eligible_ttr_layers": int(len(ready_layer_indices)),
+                "forced_full_layers": int(forced_full_layer_count),
                 "checkpoint_path": checkpoint_path,
                 "device": str(device),
                 "comet_experiment": _string_or(logging_cfg.get("comet_experiment"), ""),
@@ -1692,8 +1715,11 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             hard=True,
                         )
                     sampled_mask = (sampled_mask.detach() > 0.5).to(dtype=torch.float32)
-                    actual_full_attn_ratio = float(sampled_mask.mean().item())
-                    flux_cfg["controller_mask_override"] = sampled_mask.detach().cpu()
+                    effective_mask = sampled_mask.clone()
+                    ttr_eligible_mask = ttr_eligible_mask_cpu.to(device=effective_mask.device)
+                    effective_mask[~ttr_eligible_mask] = 1.0
+                    actual_full_attn_ratio = float(effective_mask.mean().item())
+                    flux_cfg["controller_mask_override"] = effective_mask.detach().cpu()
 
                     try:
                         student_latent = cls._sample_model(
@@ -1728,7 +1754,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         cfg_scale=float(cfg),
                         width=width,
                         height=height,
-                        sampled_mask=sampled_mask,
+                        sampled_mask=effective_mask,
                         reward=reward,
                         actual_full_attn_ratio=actual_full_attn_ratio,
                     )
@@ -1755,6 +1781,8 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         "width": float(width),
                         "height": float(height),
                         "step": float(global_step + 1),
+                        "eligible_ttr_layers": float(len(ready_layer_indices)),
+                        "forced_full_layers": float(forced_full_layer_count),
                     }
 
                     global_step += 1
@@ -1793,6 +1821,8 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                     del teacher_rgb
                     del student_rgb
                     del sampled_mask
+                    del effective_mask
+                    del ttr_eligible_mask
                     cls._empty_cuda_cache()
 
                 if iter_original_images:
