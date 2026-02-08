@@ -1477,6 +1477,16 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
             if sanitized is None:
                 continue
             payload[f"flux2ttr_controller/{key}"] = sanitized
+
+        # Backward/forward compatibility: ensure eligible full-attention ratio
+        # is always present under a stable key in Comet dashboards.
+        eligible_key = "flux2ttr_controller/full_attn_eligible"
+        if eligible_key not in payload:
+            fallback = Flux2TTRControllerTrainer._sanitize_metric(
+                metrics.get("full_attn_ratio", metrics.get("actual_full_attn_ratio"))
+            )
+            if fallback is not None:
+                payload[eligible_key] = fallback
         return payload
 
     @staticmethod
