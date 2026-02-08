@@ -51,6 +51,7 @@ _TRAINING_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
     "schedule_config": {
         "target_ttr_ratio": 0.7,
         "lambda_eff": 1.0,
+        "lambda_entropy": 0.1,
         "gumbel_temperature_start": 1.0,
         "gumbel_temperature_end": 0.5,
         "warmup_steps": 0,
@@ -207,6 +208,7 @@ def _build_training_config_payload(
     phi_lr_multiplier: float,
     target_ttr_ratio: float,
     lambda_eff: float,
+    lambda_entropy: float,
     gumbel_temperature_start: float,
     gumbel_temperature_end: float,
     warmup_steps: int,
@@ -233,6 +235,7 @@ def _build_training_config_payload(
         "schedule_config": {
             "target_ttr_ratio": float(target_ttr_ratio),
             "lambda_eff": max(0.0, float(lambda_eff)),
+            "lambda_entropy": max(0.0, float(lambda_entropy)),
             "gumbel_temperature_start": float(gumbel_temperature_start),
             "gumbel_temperature_end": float(gumbel_temperature_end),
             "warmup_steps": int(warmup_steps),
@@ -740,6 +743,7 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
                 io.Float.Input("phi_lr_multiplier", default=1.0, min=0.0, max=100.0, step=1e-3),
                 io.Float.Input("target_ttr_ratio", default=0.7, min=0.0, max=1.0, step=1e-3),
                 io.Float.Input("lambda_eff", default=1.0, min=0.0, max=100.0, step=1e-3),
+                io.Float.Input("lambda_entropy", default=0.1, min=0.0, max=1.0, step=1e-3),
                 io.Float.Input("gumbel_temperature_start", default=1.0, min=1e-4, max=10.0, step=1e-3),
                 io.Float.Input("gumbel_temperature_end", default=0.5, min=1e-4, max=10.0, step=1e-3),
                 io.Int.Input("warmup_steps", default=0, min=0, max=1000000, step=1),
@@ -772,6 +776,7 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
         phi_lr_multiplier: float,
         target_ttr_ratio: float,
         lambda_eff: float,
+        lambda_entropy: float,
         gumbel_temperature_start: float,
         gumbel_temperature_end: float,
         warmup_steps: int,
@@ -793,6 +798,7 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
             phi_lr_multiplier=phi_lr_multiplier,
             target_ttr_ratio=target_ttr_ratio,
             lambda_eff=lambda_eff,
+            lambda_entropy=lambda_entropy,
             gumbel_temperature_start=gumbel_temperature_start,
             gumbel_temperature_end=gumbel_temperature_end,
             warmup_steps=warmup_steps,
@@ -1091,6 +1097,10 @@ class Flux2TTRTrainer(io.ComfyNode):
             schedule_cfg.get("lambda_eff"),
             _TRAINING_CONFIG_DEFAULTS["schedule_config"]["lambda_eff"],
         )
+        lambda_entropy = _float_or(
+            schedule_cfg.get("lambda_entropy"),
+            _TRAINING_CONFIG_DEFAULTS["schedule_config"]["lambda_entropy"],
+        )
         gumbel_temperature_start = _float_or(
             schedule_cfg.get("gumbel_temperature_start"),
             _TRAINING_CONFIG_DEFAULTS["schedule_config"]["gumbel_temperature_start"],
@@ -1115,6 +1125,7 @@ class Flux2TTRTrainer(io.ComfyNode):
             phi_lr_multiplier=phi_lr_multiplier,
             target_ttr_ratio=target_ttr_ratio,
             lambda_eff=lambda_eff,
+            lambda_entropy=lambda_entropy,
             gumbel_temperature_start=gumbel_temperature_start,
             gumbel_temperature_end=gumbel_temperature_end,
             warmup_steps=warmup_steps,
@@ -1666,6 +1677,10 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
             schedule_cfg.get("gumbel_temperature_end"),
             _TRAINING_CONFIG_DEFAULTS["schedule_config"]["gumbel_temperature_end"],
         )
+        lambda_entropy = _float_or(
+            schedule_cfg.get("lambda_entropy"),
+            _TRAINING_CONFIG_DEFAULTS["schedule_config"]["lambda_entropy"],
+        )
         log_every = max(1, _int_or(logging_cfg.get("log_every"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["log_every"]))
 
         checkpoint_path = (checkpoint_path or "").strip()
@@ -1685,7 +1700,12 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         flux_cfg["controller"] = controller
         flux_cfg["controller_threshold"] = 0.5
 
-        trainer = flux2_ttr_controller.ControllerTrainer(controller=controller, training_config=normalized_cfg, device=device)
+        trainer = flux2_ttr_controller.ControllerTrainer(
+            controller=controller,
+            training_config=normalized_cfg,
+            lambda_entropy=float(lambda_entropy),
+            device=device,
+        )
         if checkpoint_path and os.path.isfile(checkpoint_path):
             try:
                 payload = flux2_ttr_controller.load_controller_training_state(checkpoint_path, map_location="cpu")
@@ -1889,6 +1909,9 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         "reinforce_total_loss": float(reinforce_metrics["total_loss"]),
                         "efficiency_penalty_weighted": float(reinforce_metrics.get("efficiency_penalty_weighted", 0.0)),
                         "lambda_eff": float(reinforce_metrics.get("lambda_eff", 1.0)),
+                        "lambda_entropy": float(reinforce_metrics.get("lambda_entropy", lambda_entropy)),
+                        "entropy": float(reinforce_metrics.get("entropy", 0.0)),
+                        "entropy_bonus": float(reinforce_metrics.get("entropy_bonus", 0.0)),
                         "actual_full_attn_ratio": full_attn_ratio_eligible,
                         "actual_ttr_ratio": float(max(0.0, 1.0 - full_attn_ratio_eligible)),
                         "actual_full_attn_ratio_overall": full_attn_ratio_overall,
@@ -1934,7 +1957,8 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             (
                                 "Flux2TTRControllerTrainer step=%d/%d iter=%d loss=%.6g rmse=%.6g cosine=%.6g "
                                 "lpips=%.6g full_attn_eligible=%.4g full_attn_overall=%.4g "
-                                "target_full=%.4g eff_penalty=%.6g reward_baseline=%.6g"
+                                "target_full=%.4g eff_penalty=%.6g entropy=%.6g "
+                                "entropy_bonus=%.6g reward_baseline=%.6g"
                             ),
                             global_step,
                             total_steps,
@@ -1947,6 +1971,8 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             metrics["full_attn_overall"],
                             metrics["target_full_attn_ratio"],
                             metrics["efficiency_penalty"],
+                            metrics["entropy"],
+                            metrics["entropy_bonus"],
                             metrics["reward_baseline"],
                         )
 

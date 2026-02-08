@@ -135,7 +135,7 @@ Flux2TTR is now split into four nodes:
 - `Flux2TTRTrainingParameters`: emits a shared `TTR_TRAINING_CONFIG` dict with:
   - `loss_config` (`rmse_weight`, `cosine_weight`, `lpips_weight`, `huber_beta`)
   - `optimizer_config` (`learning_rate`, `grad_clip_norm`, `alpha_lr_multiplier`, `phi_lr_multiplier`)
-  - `schedule_config` (`target_ttr_ratio`, `lambda_eff`, `gumbel_temperature_start`, `gumbel_temperature_end`, `warmup_steps`)
+  - `schedule_config` (`target_ttr_ratio`, `lambda_eff`, `lambda_entropy`, `gumbel_temperature_start`, `gumbel_temperature_end`, `warmup_steps`)
   - `logging_config` (`comet_enabled`, `comet_api_key`, `comet_project_name`, `comet_workspace`, `comet_experiment`, `log_every`)
 
 - `Flux2TTRTrainer` (renamed from `Flux2TTR`): Phase-1 online distillation of TTR layers.
@@ -151,6 +151,7 @@ Flux2TTR is now split into four nodes:
   - Restricts TTR substitution to readiness-qualified layers from the Phase-1 checkpoint; non-ready layers are forced to full attention.
   - Efficiency targets (`target_ttr_ratio`) are enforced over readiness-qualified/controllable layers only (not clamped layers), with both `*_eligible` and `*_overall` ratios logged for interpretability.
   - Efficiency cost is routed through REINFORCE reward shaping (`lambda_eff`) rather than a direct differentiable penalty path through logits.
+  - Controller rewards include an entropy bonus (`lambda_entropy * H`) over eligible Bernoulli routing probabilities to reduce policy collapse when logits saturate.
   - Logs Comet metrics with `flux2ttr_controller/*` prefixes when `training_config.logging_config.comet_enabled=true`.
   - Uses `training_config.logging_config.comet_experiment` as a stable Comet experiment key so repeated runs append to one persistent experiment.
   - `comet_experiment` is normalized to Comet constraints: alphanumeric only, length 32-50. Short values are padded with trailing `X`.

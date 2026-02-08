@@ -42,7 +42,12 @@ def test_ttr_controller_checkpoint_round_trip(tmp_path):
 def test_controller_checkpoint_persists_and_restores_trainer_state(tmp_path):
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
-    trainer = flux2_ttr_controller.ControllerTrainer(controller, learning_rate=1e-2, target_ttr_ratio=0.6)
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        learning_rate=1e-2,
+        target_ttr_ratio=0.6,
+        lambda_entropy=0.35,
+    )
     trainer.reinforce_step(
         sigma=0.8,
         cfg_scale=3.0,
@@ -59,21 +64,28 @@ def test_controller_checkpoint_persists_and_restores_trainer_state(tmp_path):
 
     assert payload["reward_baseline"] is not None
     assert payload["reward_count"] is not None
+    assert payload["lambda_entropy"] == pytest.approx(0.35)
     assert payload["optimizer_state_dict"] is not None
 
     loaded_controller = flux2_ttr_controller.load_controller_checkpoint(str(path))
-    restored_trainer = flux2_ttr_controller.ControllerTrainer(loaded_controller, learning_rate=1e-2, target_ttr_ratio=0.6)
+    restored_trainer = flux2_ttr_controller.ControllerTrainer(
+        loaded_controller,
+        learning_rate=1e-2,
+        target_ttr_ratio=0.6,
+        lambda_entropy=0.1,
+    )
     assert len(restored_trainer.optimizer.state) == 0
     restored_trainer.restore_training_state(payload)
 
     assert restored_trainer.reward_baseline == pytest.approx(trainer.reward_baseline)
     assert restored_trainer.reward_count == trainer.reward_count
+    assert restored_trainer.lambda_entropy == pytest.approx(0.35)
     assert len(restored_trainer.optimizer.state) > 0
 
 
 def test_controller_trainer_restore_training_state_is_backward_compatible():
     controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
-    trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0, lambda_entropy=0.42)
     trainer.restore_training_state(
         {
             "format": "flux2_ttr_controller_v1",
@@ -85,6 +97,7 @@ def test_controller_trainer_restore_training_state_is_backward_compatible():
     )
     assert trainer.reward_baseline == pytest.approx(0.0)
     assert trainer.reward_count == 0
+    assert trainer.lambda_entropy == pytest.approx(0.42)
     assert len(trainer.optimizer.state) == 0
 
 
@@ -227,7 +240,7 @@ def test_controller_trainer_training_config_overrides_defaults():
     training_config = {
         "loss_config": {"rmse_weight": 2.5, "cosine_weight": 0.75, "lpips_weight": 0.0},
         "optimizer_config": {"learning_rate": 3e-4, "grad_clip_norm": 0.25},
-        "schedule_config": {"target_ttr_ratio": 0.4, "lambda_eff": 2.25},
+        "schedule_config": {"target_ttr_ratio": 0.4, "lambda_eff": 2.25, "lambda_entropy": 0.35},
     }
     trainer = flux2_ttr_controller.ControllerTrainer(
         controller,
@@ -238,12 +251,14 @@ def test_controller_trainer_training_config_overrides_defaults():
         lpips_weight=0.0,
         target_ttr_ratio=0.9,
         lambda_eff=7.0,
+        lambda_entropy=0.9,
         grad_clip_norm=3.0,
     )
     assert trainer.rmse_weight == pytest.approx(2.5)
     assert trainer.cosine_weight == pytest.approx(0.75)
     assert trainer.target_ttr_ratio == pytest.approx(0.4)
     assert trainer.lambda_eff == pytest.approx(2.25)
+    assert trainer.lambda_entropy == pytest.approx(0.35)
     assert trainer.grad_clip_norm == pytest.approx(0.25)
     assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
 
@@ -278,6 +293,7 @@ def test_controller_trainer_reinforce_step_updates_parameters():
         controller,
         learning_rate=1e-2,
         target_ttr_ratio=0.6,
+        lambda_entropy=0.0,
         grad_clip_norm=1.0,
     )
     before = [p.detach().clone() for p in controller.parameters()]
@@ -323,6 +339,7 @@ def test_controller_trainer_reinforce_penalty_uses_full_attention_budget():
         controller,
         learning_rate=0.0,
         target_ttr_ratio=0.7,
+        lambda_entropy=0.0,
         grad_clip_norm=1.0,
     )
     metrics = trainer.reinforce_step(
@@ -357,6 +374,7 @@ def test_controller_trainer_reinforce_penalty_weight_scales_reward():
         learning_rate=0.0,
         target_ttr_ratio=0.7,
         lambda_eff=2.0,
+        lambda_entropy=0.0,
         grad_clip_norm=1.0,
     )
     metrics = trainer.reinforce_step(
@@ -387,6 +405,7 @@ def test_controller_trainer_reinforce_penalty_uses_eligible_layers_only():
         controller,
         learning_rate=0.0,
         target_ttr_ratio=0.5,  # target_full_attn_ratio=0.5 over eligible layers.
+        lambda_entropy=0.0,
         grad_clip_norm=1.0,
     )
     metrics = trainer.reinforce_step(
@@ -415,10 +434,50 @@ def test_controller_trainer_reinforce_penalty_uses_eligible_layers_only():
     assert metrics["forced_full_layer_count"] == pytest.approx(2.0)
 
 
+def test_controller_trainer_reinforce_entropy_bonus_uses_eligible_layers():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
+    with torch.no_grad():
+        for param in controller.parameters():
+            param.zero_()
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        learning_rate=0.0,
+        target_ttr_ratio=1.0,  # target_full_attn_ratio=0.0, so zero mask has no efficiency penalty.
+        lambda_eff=1.0,
+        lambda_entropy=0.2,
+        grad_clip_norm=1.0,
+    )
+    metrics = trainer.reinforce_step(
+        sigma=0.8,
+        cfg_scale=3.0,
+        width=64,
+        height=64,
+        sampled_mask=torch.tensor([0.0, 0.0, 1.0, 1.0]),
+        reward=0.0,
+        actual_full_attn_ratio=0.0,
+        eligible_layer_mask=torch.tensor([True, True, False, False]),
+        actual_full_attn_ratio_overall=0.5,
+    )
+
+    expected_entropy = float(torch.log(torch.tensor(2.0)).item())
+    expected_bonus = 0.2 * expected_entropy
+    assert metrics["entropy"] == pytest.approx(expected_entropy, abs=1e-6)
+    assert metrics["entropy_bonus"] == pytest.approx(expected_bonus, abs=1e-6)
+    assert metrics["reward_quality"] == pytest.approx(0.0)
+    assert metrics["reward"] == pytest.approx(expected_bonus, abs=1e-6)
+    assert metrics["lambda_entropy"] == pytest.approx(0.2)
+
+
 def test_controller_trainer_reinforce_step_works_under_inference_mode():
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
-    trainer = flux2_ttr_controller.ControllerTrainer(controller, learning_rate=1e-2, target_ttr_ratio=0.5)
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        learning_rate=1e-2,
+        target_ttr_ratio=0.5,
+        lambda_entropy=0.0,
+    )
     before = [p.detach().clone() for p in controller.parameters()]
 
     with torch.inference_mode():
@@ -442,7 +501,12 @@ def test_controller_trainer_reinforce_step_works_under_inference_mode():
 def test_controller_trainer_reinforce_step_with_eligible_mask_works_under_inference_mode():
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
-    trainer = flux2_ttr_controller.ControllerTrainer(controller, learning_rate=1e-2, target_ttr_ratio=0.5)
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        learning_rate=1e-2,
+        target_ttr_ratio=0.5,
+        lambda_entropy=0.0,
+    )
     before = [p.detach().clone() for p in controller.parameters()]
 
     with torch.inference_mode():

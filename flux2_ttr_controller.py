@@ -114,6 +114,7 @@ def controller_checkpoint_state(
         "state_dict": {k: v.detach().cpu() for k, v in controller.state_dict().items()},
         "reward_baseline": float(trainer.reward_baseline) if trainer is not None else None,
         "reward_count": int(trainer.reward_count) if trainer is not None else None,
+        "lambda_entropy": float(trainer.lambda_entropy) if trainer is not None else None,
         "optimizer_state_dict": trainer.optimizer.state_dict() if trainer is not None else None,
     }
 
@@ -169,6 +170,7 @@ class ControllerTrainer:
         lpips_weight: float = 0.0,
         target_ttr_ratio: float = 0.7,
         lambda_eff: float = 1.0,
+        lambda_entropy: float = 0.1,
         grad_clip_norm: float = 1.0,
         device: Optional[torch.device] = None,
     ):
@@ -185,6 +187,7 @@ class ControllerTrainer:
             lpips_weight = float(loss_cfg.get("lpips_weight", lpips_weight))
             target_ttr_ratio = float(sched_cfg.get("target_ttr_ratio", target_ttr_ratio))
             lambda_eff = float(sched_cfg.get("lambda_eff", lambda_eff))
+            lambda_entropy = float(sched_cfg.get("lambda_entropy", lambda_entropy))
             learning_rate = float(opt_cfg.get("learning_rate", learning_rate))
             grad_clip_norm = float(opt_cfg.get("grad_clip_norm", grad_clip_norm))
 
@@ -205,6 +208,7 @@ class ControllerTrainer:
         self.lpips_weight = float(lpips_weight)
         self.target_ttr_ratio = float(target_ttr_ratio)
         self.lambda_eff = max(0.0, float(lambda_eff))
+        self.lambda_entropy = max(0.0, float(lambda_entropy))
         self.grad_clip_norm = max(0.0, float(grad_clip_norm))
         self._reward_baseline = 0.0
         self._reward_count = 0
@@ -225,7 +229,8 @@ class ControllerTrainer:
         logger.info(
             (
                 "ControllerTrainer initialized: lr=%.6g rmse=%.4g cosine=%.4g lpips=%.4g "
-                "target_ttr_ratio=%.4g target_full_attn_ratio=%.4g lambda_eff=%.4g grad_clip=%.4g"
+                "target_ttr_ratio=%.4g target_full_attn_ratio=%.4g "
+                "lambda_eff=%.4g lambda_entropy=%.4g grad_clip=%.4g"
             ),
             float(learning_rate),
             self.rmse_weight,
@@ -234,6 +239,7 @@ class ControllerTrainer:
             self.target_ttr_ratio,
             self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio),
             self.lambda_eff,
+            self.lambda_entropy,
             self.grad_clip_norm,
         )
 
@@ -253,6 +259,8 @@ class ControllerTrainer:
             self._reward_baseline = float(payload["reward_baseline"])
         if "reward_count" in payload and payload["reward_count"] is not None:
             self._reward_count = int(payload["reward_count"])
+        if "lambda_entropy" in payload and payload["lambda_entropy"] is not None:
+            self.lambda_entropy = max(0.0, float(payload["lambda_entropy"]))
         if "optimizer_state_dict" in payload and payload["optimizer_state_dict"] is not None:
             try:
                 with torch.inference_mode(False):
@@ -460,6 +468,11 @@ class ControllerTrainer:
             with torch.enable_grad():
                 logits = self.controller(sigma=sigma, cfg_scale=cfg_scale, width=width, height=height)
                 probs = torch.sigmoid(logits)
+                probs_clamped = probs.clamp(min=1e-6, max=1.0 - 1e-6)
+                per_layer_entropy = -(
+                    probs_clamped * torch.log(probs_clamped)
+                    + (1.0 - probs_clamped) * torch.log(1.0 - probs_clamped)
+                )
 
                 mask = sampled_mask.to(device=logits.device, dtype=logits.dtype).reshape(-1).detach().clone()
                 if mask.numel() != probs.numel():
@@ -490,6 +503,8 @@ class ControllerTrainer:
                 if eligible_count <= 0:
                     raise ValueError("ControllerTrainer.reinforce_step: eligible_layer_mask must include at least one layer.")
                 forced_full_layer_count = int(total_layer_count - eligible_count)
+                entropy = per_layer_entropy[eligible].mean()
+                entropy_bonus = float(self.lambda_entropy * entropy.detach().item())
 
                 log_probs = mask * torch.log(probs + 1e-8) + (1.0 - mask) * torch.log(1.0 - probs + 1e-8)
                 # Restrict policy gradient to controllable layers only.
@@ -499,7 +514,7 @@ class ControllerTrainer:
                 actual_full_attn_eligible = float(mask[eligible].mean().item())
                 efficiency_penalty_value = max(0.0, actual_full_attn_eligible - float(target_full_attn_ratio))
                 efficiency_penalty_weighted = float(self.lambda_eff * efficiency_penalty_value)
-                reward_value = reward_quality - efficiency_penalty_weighted
+                reward_value = reward_quality - efficiency_penalty_weighted + entropy_bonus
                 baselined_reward = reward_value - self._reward_baseline
                 self._update_reward_baseline(reward_value)
 
@@ -536,6 +551,8 @@ class ControllerTrainer:
                     "reward_quality": reward_quality,
                     "reward_baseline": float(self._reward_baseline),
                     "baselined_reward": float(baselined_reward),
+                    "entropy": float(entropy.detach().item()),
+                    "entropy_bonus": float(entropy_bonus),
                     "mask_mean": mask_mean_eligible,
                     "mask_mean_overall": mask_mean_overall,
                     "full_attn_mask_mean": mask_mean_eligible,
@@ -555,6 +572,7 @@ class ControllerTrainer:
                     "target_ttr_ratio": float(self.target_ttr_ratio),
                     "target_full_attn_ratio": float(target_full_attn_ratio),
                     "lambda_eff": float(self.lambda_eff),
+                    "lambda_entropy": float(self.lambda_entropy),
                     "eligible_layer_count": float(eligible_count),
                     "total_layer_count": float(total_layer_count),
                     "forced_full_layer_count": float(forced_full_layer_count),
