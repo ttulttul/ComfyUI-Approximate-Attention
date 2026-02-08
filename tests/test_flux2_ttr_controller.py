@@ -229,6 +229,45 @@ def test_controller_trainer_reinforce_penalty_uses_full_attention_budget():
     assert metrics["efficiency_penalty"] == pytest.approx(0.2, abs=1e-6)
 
 
+def test_controller_trainer_reinforce_penalty_uses_eligible_layers_only():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
+    with torch.no_grad():
+        for param in controller.parameters():
+            param.zero_()
+        # First two layers (eligible) keep p=0.5, last two layers (forced full) keep p~1.0.
+        controller.mlp[-1].bias.copy_(torch.tensor([0.0, 0.0, 10.0, 10.0]))
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        learning_rate=0.0,
+        target_ttr_ratio=0.5,  # target_full_attn_ratio=0.5 over eligible layers.
+        grad_clip_norm=1.0,
+    )
+    metrics = trainer.reinforce_step(
+        sigma=0.8,
+        cfg_scale=3.0,
+        width=64,
+        height=64,
+        sampled_mask=torch.tensor([1.0, 1.0, 1.0, 1.0]),
+        reward=0.0,
+        actual_full_attn_ratio=1.0,
+        eligible_layer_mask=torch.tensor([True, True, False, False]),
+        actual_full_attn_ratio_overall=1.0,
+    )
+
+    # Eligible subset has mean 0.5, so penalty should be exactly zero.
+    assert metrics["target_full_attn_ratio"] == pytest.approx(0.5)
+    assert metrics["probs_mean"] == pytest.approx(0.5, abs=1e-4)
+    assert metrics["probs_mean_overall"] > 0.7
+    assert metrics["efficiency_penalty"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["expected_full_attn_ratio"] == pytest.approx(0.5, abs=1e-4)
+    assert metrics["expected_full_attn_ratio_overall"] == pytest.approx(0.75, abs=1e-4)
+    assert metrics["actual_full_attn_ratio"] == pytest.approx(1.0)
+    assert metrics["actual_full_attn_ratio_overall"] == pytest.approx(1.0)
+    assert metrics["eligible_layer_count"] == pytest.approx(2.0)
+    assert metrics["forced_full_layer_count"] == pytest.approx(2.0)
+
+
 def test_controller_trainer_reinforce_step_works_under_inference_mode():
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)

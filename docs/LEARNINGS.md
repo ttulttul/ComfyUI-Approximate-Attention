@@ -84,3 +84,4 @@
 - Controller training quality is more stable when mask sampling excludes non-ready Phase-1 TTR layers; forcing unready layers to full attention avoids training signal contamination from fallback-heavy student runs.
 - Controller efficiency penalties must compare full-attention usage against `1 - target_ttr_ratio`; treating `target_ttr_ratio` as a full-attention budget silently under-penalizes high full-attention masks.
 - LPIPS in controller training must ensure the LPIPS module and decoded RGB tensors are on the same device at call time; static init-time placement can drift and trigger CPU/CUDA mismatch errors.
+- When some layers are forced to full attention (unready TTR), controller efficiency penalties and routing ratios must be computed over eligible layers only; overall ratios should be logged separately for throughput visibility.

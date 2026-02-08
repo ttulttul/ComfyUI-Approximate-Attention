@@ -377,6 +377,8 @@ class ControllerTrainer:
         sampled_mask: torch.Tensor,
         reward: float,
         actual_full_attn_ratio: float,
+        eligible_layer_mask: Optional[torch.Tensor] = None,
+        actual_full_attn_ratio_overall: Optional[float] = None,
     ) -> Dict[str, float]:
         self.controller.train()
         reward_value = float(reward)
@@ -394,16 +396,33 @@ class ControllerTrainer:
                         f"{int(mask.numel())} does not match controller layer count {int(probs.numel())}."
                     )
 
+                if eligible_layer_mask is not None:
+                    eligible = eligible_layer_mask.to(device=logits.device, dtype=torch.bool).reshape(-1)
+                    if eligible.numel() != probs.numel():
+                        raise ValueError(
+                            "ControllerTrainer.reinforce_step: eligible_layer_mask length "
+                            f"{int(eligible.numel())} does not match controller layer count {int(probs.numel())}."
+                        )
+                else:
+                    eligible = torch.ones_like(probs, dtype=torch.bool)
+
+                eligible_count = int(eligible.sum().item())
+                total_layer_count = int(probs.numel())
+                if eligible_count <= 0:
+                    raise ValueError("ControllerTrainer.reinforce_step: eligible_layer_mask must include at least one layer.")
+                forced_full_layer_count = int(total_layer_count - eligible_count)
+
                 log_probs = mask * torch.log(probs + 1e-8) + (1.0 - mask) * torch.log(1.0 - probs + 1e-8)
-                total_log_prob = log_probs.sum()
+                # Restrict policy gradient to controllable layers only.
+                total_log_prob = log_probs[eligible].sum()
 
                 baselined_reward = reward_value - self._reward_baseline
                 self._update_reward_baseline(reward_value)
 
                 policy_loss = -baselined_reward * total_log_prob
                 target_full_attn_ratio = self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio)
-                probs_mean = probs.mean()
-                efficiency_penalty = torch.relu(probs_mean - float(target_full_attn_ratio))
+                probs_mean_eligible = probs[eligible].mean()
+                efficiency_penalty = torch.relu(probs_mean_eligible - float(target_full_attn_ratio))
                 loss = policy_loss + efficiency_penalty
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -412,9 +431,20 @@ class ControllerTrainer:
                     torch.nn.utils.clip_grad_norm_(self.controller.parameters(), self.grad_clip_norm)
                 self.optimizer.step()
 
-                mask_mean = float(mask.mean().item())
-                probs_mean_value = float(probs_mean.detach().item())
+                mask_mean_overall = float(mask.mean().item())
+                mask_mean_eligible = float(mask[eligible].mean().item())
+                probs_mean_overall = float(probs.detach().mean().item())
+                probs_mean_eligible_value = float(probs_mean_eligible.detach().item())
+                expected_full_attn_ratio_overall = float(
+                    (probs_mean_eligible_value * float(eligible_count) + float(forced_full_layer_count))
+                    / float(max(1, total_layer_count))
+                )
                 actual_full_attn_ratio_value = float(actual_full_attn_ratio)
+                actual_full_attn_ratio_overall_value = (
+                    float(actual_full_attn_ratio_overall)
+                    if actual_full_attn_ratio_overall is not None
+                    else mask_mean_overall
+                )
                 metrics = {
                     "policy_loss": float(policy_loss.detach().item()),
                     "efficiency_penalty": float(efficiency_penalty.detach().item()),
@@ -422,16 +452,27 @@ class ControllerTrainer:
                     "reward": reward_value,
                     "reward_baseline": float(self._reward_baseline),
                     "baselined_reward": float(baselined_reward),
-                    "mask_mean": mask_mean,
-                    "full_attn_mask_mean": mask_mean,
-                    "ttr_mask_mean": float(1.0 - mask_mean),
-                    "probs_mean": probs_mean_value,
-                    "expected_full_attn_ratio": probs_mean_value,
-                    "expected_ttr_ratio": float(1.0 - probs_mean_value),
+                    "mask_mean": mask_mean_eligible,
+                    "mask_mean_overall": mask_mean_overall,
+                    "full_attn_mask_mean": mask_mean_eligible,
+                    "full_attn_mask_mean_overall": mask_mean_overall,
+                    "ttr_mask_mean": float(1.0 - mask_mean_eligible),
+                    "ttr_mask_mean_overall": float(1.0 - mask_mean_overall),
+                    "probs_mean": probs_mean_eligible_value,
+                    "probs_mean_overall": probs_mean_overall,
+                    "expected_full_attn_ratio": probs_mean_eligible_value,
+                    "expected_full_attn_ratio_overall": expected_full_attn_ratio_overall,
+                    "expected_ttr_ratio": float(1.0 - probs_mean_eligible_value),
+                    "expected_ttr_ratio_overall": float(1.0 - expected_full_attn_ratio_overall),
                     "actual_full_attn_ratio": actual_full_attn_ratio_value,
+                    "actual_full_attn_ratio_overall": actual_full_attn_ratio_overall_value,
                     "actual_ttr_ratio": float(1.0 - actual_full_attn_ratio_value),
+                    "actual_ttr_ratio_overall": float(1.0 - actual_full_attn_ratio_overall_value),
                     "target_ttr_ratio": float(self.target_ttr_ratio),
                     "target_full_attn_ratio": float(target_full_attn_ratio),
+                    "eligible_layer_count": float(eligible_count),
+                    "total_layer_count": float(total_layer_count),
+                    "forced_full_layer_count": float(forced_full_layer_count),
                 }
         return metrics
 
