@@ -38,8 +38,29 @@ def test_controller_trainer_compute_loss_without_lpips():
     )
     assert loss.item() > 0
     assert metrics["actual_full_attn_ratio"] == pytest.approx(0.4)
+    assert metrics["actual_ttr_ratio"] == pytest.approx(0.6)
+    assert metrics["target_ttr_ratio"] == pytest.approx(0.7)
+    assert metrics["target_full_attn_ratio"] == pytest.approx(0.3)
     assert "rmse" in metrics
     assert "cosine_distance" in metrics
+
+
+def test_controller_trainer_efficiency_penalty_uses_ttr_target_semantics():
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0, target_ttr_ratio=0.7)
+    teacher = torch.zeros(1, 4, 4, 4)
+    student = torch.ones_like(teacher) * 0.25
+    _, metrics = trainer.compute_loss(
+        teacher_latent=teacher,
+        student_latent=student,
+        actual_full_attn_ratio=0.9,
+        include_efficiency_penalty=False,
+    )
+
+    assert metrics["target_ttr_ratio"] == pytest.approx(0.7)
+    assert metrics["target_full_attn_ratio"] == pytest.approx(0.3)
+    assert metrics["actual_ttr_ratio"] == pytest.approx(0.1)
+    assert metrics["efficiency_penalty"] == pytest.approx(0.6)
 
 
 def test_controller_trainer_lpips_requires_dependency(monkeypatch):
@@ -135,6 +156,36 @@ def test_controller_trainer_reinforce_step_updates_parameters():
     assert metrics_b["reward_baseline"] < metrics_a["reward_baseline"]
 
 
+def test_controller_trainer_reinforce_penalty_uses_full_attention_budget():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
+    with torch.no_grad():
+        for param in controller.parameters():
+            param.zero_()
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        learning_rate=0.0,
+        target_ttr_ratio=0.7,
+        grad_clip_norm=1.0,
+    )
+    metrics = trainer.reinforce_step(
+        sigma=0.8,
+        cfg_scale=3.0,
+        width=64,
+        height=64,
+        sampled_mask=torch.tensor([1.0, 1.0, 1.0]),
+        reward=0.0,
+        actual_full_attn_ratio=1.0,
+    )
+
+    assert metrics["target_ttr_ratio"] == pytest.approx(0.7)
+    assert metrics["target_full_attn_ratio"] == pytest.approx(0.3)
+    assert metrics["probs_mean"] == pytest.approx(0.5)
+    assert metrics["expected_full_attn_ratio"] == pytest.approx(0.5)
+    assert metrics["expected_ttr_ratio"] == pytest.approx(0.5)
+    assert metrics["efficiency_penalty"] == pytest.approx(0.2, abs=1e-6)
+
+
 def test_controller_trainer_reinforce_step_works_under_inference_mode():
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
@@ -192,7 +243,7 @@ def test_controller_trainer_train_step_uses_mask_for_gradient_flow():
         rmse_weight=1.0,
         cosine_weight=0.0,
         lpips_weight=0.0,
-        target_ttr_ratio=2.0,  # Disable efficiency penalty so RMSE path must drive gradients.
+        target_ttr_ratio=0.0,  # Disable efficiency penalty so RMSE path must drive gradients.
     )
     teacher = torch.zeros(1, 4, 4, 4)
     before = [p.detach().clone() for p in controller.parameters()]

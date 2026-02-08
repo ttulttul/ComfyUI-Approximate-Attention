@@ -198,12 +198,16 @@ class ControllerTrainer:
                     "ControllerTrainer: lpips_weight > 0 requires the 'lpips' package."
                 ) from exc
         logger.info(
-            "ControllerTrainer initialized: lr=%.6g rmse=%.4g cosine=%.4g lpips=%.4g target_ratio=%.4g grad_clip=%.4g",
+            (
+                "ControllerTrainer initialized: lr=%.6g rmse=%.4g cosine=%.4g lpips=%.4g "
+                "target_ttr_ratio=%.4g target_full_attn_ratio=%.4g grad_clip=%.4g"
+            ),
             float(learning_rate),
             self.rmse_weight,
             self.cosine_weight,
             self.lpips_weight,
             self.target_ttr_ratio,
+            self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio),
             self.grad_clip_norm,
         )
 
@@ -270,6 +274,13 @@ class ControllerTrainer:
             return ratio
         return torch.tensor(float(actual_full_attn_ratio), device=device, dtype=dtype)
 
+    @staticmethod
+    def _target_full_attn_ratio_from_ttr_ratio(target_ttr_ratio: float) -> float:
+        # target_ttr_ratio is semantically "desired TTR usage fraction", so
+        # full-attention usage should be constrained by (1 - target_ttr_ratio).
+        target_ttr = max(0.0, min(1.0, float(target_ttr_ratio)))
+        return 1.0 - target_ttr
+
     def compute_loss(
         self,
         *,
@@ -303,18 +314,23 @@ class ControllerTrainer:
             device=loss.device,
             dtype=loss.dtype,
         )
-        efficiency_penalty = torch.relu(ratio - float(self.target_ttr_ratio))
+        target_full_attn_ratio = self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio)
+        target_full_ratio = torch.tensor(target_full_attn_ratio, device=loss.device, dtype=loss.dtype)
+        efficiency_penalty = torch.relu(ratio - target_full_ratio)
         if include_efficiency_penalty:
             loss = loss + efficiency_penalty
 
+        actual_full_attn_ratio_value = float(ratio.detach().item())
         metrics = {
             "loss": float(loss.detach().item()),
             "rmse": float(rmse.detach().item()),
             "cosine_distance": float(cosine.detach().item()),
             "lpips": float(lpips_term.detach().item()),
             "efficiency_penalty": float(efficiency_penalty.detach().item()),
-            "actual_full_attn_ratio": float(ratio.detach().item()),
+            "actual_full_attn_ratio": actual_full_attn_ratio_value,
+            "actual_ttr_ratio": float(1.0 - actual_full_attn_ratio_value),
             "target_ttr_ratio": float(self.target_ttr_ratio),
+            "target_full_attn_ratio": float(target_full_attn_ratio),
         }
         return loss, metrics
 
@@ -360,7 +376,9 @@ class ControllerTrainer:
                 self._update_reward_baseline(reward_value)
 
                 policy_loss = -baselined_reward * total_log_prob
-                efficiency_penalty = torch.relu(probs.mean() - float(self.target_ttr_ratio))
+                target_full_attn_ratio = self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio)
+                probs_mean = probs.mean()
+                efficiency_penalty = torch.relu(probs_mean - float(target_full_attn_ratio))
                 loss = policy_loss + efficiency_penalty
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -369,6 +387,9 @@ class ControllerTrainer:
                     torch.nn.utils.clip_grad_norm_(self.controller.parameters(), self.grad_clip_norm)
                 self.optimizer.step()
 
+                mask_mean = float(mask.mean().item())
+                probs_mean_value = float(probs_mean.detach().item())
+                actual_full_attn_ratio_value = float(actual_full_attn_ratio)
                 metrics = {
                     "policy_loss": float(policy_loss.detach().item()),
                     "efficiency_penalty": float(efficiency_penalty.detach().item()),
@@ -376,10 +397,16 @@ class ControllerTrainer:
                     "reward": reward_value,
                     "reward_baseline": float(self._reward_baseline),
                     "baselined_reward": float(baselined_reward),
-                    "mask_mean": float(mask.mean().item()),
-                    "probs_mean": float(probs.detach().mean().item()),
-                    "actual_full_attn_ratio": float(actual_full_attn_ratio),
+                    "mask_mean": mask_mean,
+                    "full_attn_mask_mean": mask_mean,
+                    "ttr_mask_mean": float(1.0 - mask_mean),
+                    "probs_mean": probs_mean_value,
+                    "expected_full_attn_ratio": probs_mean_value,
+                    "expected_ttr_ratio": float(1.0 - probs_mean_value),
+                    "actual_full_attn_ratio": actual_full_attn_ratio_value,
+                    "actual_ttr_ratio": float(1.0 - actual_full_attn_ratio_value),
                     "target_ttr_ratio": float(self.target_ttr_ratio),
+                    "target_full_attn_ratio": float(target_full_attn_ratio),
                 }
         return metrics
 

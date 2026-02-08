@@ -1759,21 +1759,36 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         actual_full_attn_ratio=actual_full_attn_ratio,
                     )
 
+                    full_attn_ratio = float(reinforce_metrics.get("actual_full_attn_ratio", actual_full_attn_ratio))
+                    expected_full_attn_ratio = float(reinforce_metrics.get("probs_mean", full_attn_ratio))
+                    target_ttr_ratio = float(reinforce_metrics.get("target_ttr_ratio", 0.0))
+                    target_full_attn_ratio = float(
+                        reinforce_metrics.get(
+                            "target_full_attn_ratio",
+                            max(0.0, min(1.0, 1.0 - target_ttr_ratio)),
+                        )
+                    )
                     metrics = {
                         "loss": float(quality_loss.detach().item()),
                         "rmse": float(quality_metrics["rmse"]),
                         "cosine_distance": float(quality_metrics["cosine_distance"]),
                         "lpips": float(quality_metrics["lpips"]),
                         "efficiency_penalty": float(reinforce_metrics["efficiency_penalty"]),
-                        "mask_mean": float(actual_full_attn_ratio),
-                        "probs_mean": float(reinforce_metrics.get("probs_mean", actual_full_attn_ratio)),
+                        "mask_mean": full_attn_ratio,
+                        "probs_mean": expected_full_attn_ratio,
+                        "full_attn_ratio": full_attn_ratio,
+                        "ttr_ratio": float(max(0.0, 1.0 - full_attn_ratio)),
+                        "expected_full_attn_ratio": expected_full_attn_ratio,
+                        "expected_ttr_ratio": float(max(0.0, 1.0 - expected_full_attn_ratio)),
                         "reward": float(reinforce_metrics.get("reward", reward)),
                         "baselined_reward": float(reinforce_metrics.get("baselined_reward", 0.0)),
                         "reward_baseline": float(reinforce_metrics["reward_baseline"]),
                         "policy_loss": float(reinforce_metrics["policy_loss"]),
                         "reinforce_total_loss": float(reinforce_metrics["total_loss"]),
-                        "actual_full_attn_ratio": float(reinforce_metrics.get("actual_full_attn_ratio", actual_full_attn_ratio)),
-                        "target_ttr_ratio": float(reinforce_metrics.get("target_ttr_ratio", 0.0)),
+                        "actual_full_attn_ratio": full_attn_ratio,
+                        "actual_ttr_ratio": float(max(0.0, 1.0 - full_attn_ratio)),
+                        "target_ttr_ratio": target_ttr_ratio,
+                        "target_full_attn_ratio": target_full_attn_ratio,
                         "gumbel_temperature": float(gumbel_temperature),
                         "sigma": float(sigma_value),
                         "iteration": float(iteration + 1),
@@ -1797,7 +1812,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         logger.info(
                             (
                                 "Flux2TTRControllerTrainer step=%d/%d iter=%d loss=%.6g rmse=%.6g cosine=%.6g "
-                                "lpips=%.6g mask_mean=%.4g eff_penalty=%.6g reward_baseline=%.6g"
+                                "lpips=%.6g full_attn=%.4g target_full=%.4g eff_penalty=%.6g reward_baseline=%.6g"
                             ),
                             global_step,
                             total_steps,
@@ -1806,7 +1821,8 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             metrics["rmse"],
                             metrics["cosine_distance"],
                             metrics["lpips"],
-                            metrics["mask_mean"],
+                            metrics["full_attn_ratio"],
+                            metrics["target_full_attn_ratio"],
                             metrics["efficiency_penalty"],
                             metrics["reward_baseline"],
                         )
