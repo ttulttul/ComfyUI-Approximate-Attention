@@ -856,13 +856,29 @@ class Flux2TTRTrainer(io.ComfyNode):
                     step=1,
                     tooltip="Key chunk size for kernel KV/Ksum accumulation.",
                 ),
+                io.Float.Input(
+                    "landmark_fraction",
+                    default=0.08,
+                    min=0.01,
+                    max=0.5,
+                    step=1e-3,
+                    tooltip="Fraction of image tokens used as landmarks for exact softmax residual.",
+                ),
                 io.Int.Input(
-                    "landmark_count",
-                    default=128,
+                    "landmark_min",
+                    default=64,
                     min=1,
                     max=1024,
                     step=1,
-                    tooltip="Number of landmark keys used for exact softmax residual.",
+                    tooltip="Minimum landmark count used at low resolution.",
+                ),
+                io.Int.Input(
+                    "landmark_max",
+                    default=512,
+                    min=1,
+                    max=2048,
+                    step=1,
+                    tooltip="Maximum landmark count used at high resolution.",
                 ),
                 io.Int.Input(
                     "text_tokens_guess",
@@ -1008,7 +1024,9 @@ class Flux2TTRTrainer(io.ComfyNode):
         feature_dim: int,
         query_chunk_size: int,
         key_chunk_size: int,
-        landmark_count: int,
+        landmark_fraction: float,
+        landmark_min: int,
+        landmark_max: int,
         text_tokens_guess: int,
         alpha_init: float,
         training_query_token_cap: int,
@@ -1124,7 +1142,9 @@ class Flux2TTRTrainer(io.ComfyNode):
             steps=train_steps,
             scan_chunk_size=int(query_chunk_size),
             key_chunk_size=int(key_chunk_size),
-            landmark_count=int(landmark_count),
+            landmark_fraction=float(landmark_fraction),
+            landmark_min=int(landmark_min),
+            landmark_max=int(landmark_max),
             text_tokens_guess=int(text_tokens_guess),
             alpha_init=float(alpha_init),
             alpha_lr_multiplier=float(alpha_lr_multiplier),
@@ -1205,7 +1225,9 @@ class Flux2TTRTrainer(io.ComfyNode):
             "query_chunk_size": int(query_chunk_size),
             "scan_chunk_size": int(query_chunk_size),
             "key_chunk_size": int(key_chunk_size),
-            "landmark_count": int(landmark_count),
+            "landmark_fraction": float(landmark_fraction),
+            "landmark_min": int(landmark_min),
+            "landmark_max": int(landmark_max),
             "text_tokens_guess": int(text_tokens_guess),
             "alpha_init": float(alpha_init),
             "alpha_lr_multiplier": float(alpha_lr_multiplier),
@@ -1251,7 +1273,7 @@ class Flux2TTRTrainer(io.ComfyNode):
         logger.info(
             (
                 "Flux2TTRTrainer configured: training_mode=%s training_preview_ttr=%s comet_enabled=%s "
-                "training_steps=%d feature_dim=%d q_chunk=%d k_chunk=%d landmarks=%d "
+                "training_steps=%d feature_dim=%d q_chunk=%d k_chunk=%d landmarks=(fraction=%.4g,min=%d,max=%d) "
                 "lr=%.6g alpha_lr_mul=%.4g phi_lr_mul=%.4g huber_beta=%.6g grad_clip=%.4g "
                 "replay=%d replay_offload_cpu=%s replay_max_mb=%d train_steps_per_call=%d readiness=(%.6g,%d) reserve=%s layer_range=[%d,%d] "
                 "cfg_scale=%.4g swap_layers=[%d,%d] mixed_precision=%s checkpoint=%s controller=%s loss=%.6g"
@@ -1263,7 +1285,9 @@ class Flux2TTRTrainer(io.ComfyNode):
             feature_dim,
             int(query_chunk_size),
             int(key_chunk_size),
-            int(landmark_count),
+            float(landmark_fraction),
+            int(landmark_min),
+            int(landmark_max),
             float(learning_rate),
             float(alpha_lr_multiplier),
             float(phi_lr_multiplier),
@@ -1979,7 +2003,12 @@ class Flux2TTRController(io.ComfyNode):
         )
         query_chunk_size = _int_or(prev_cfg.get("query_chunk_size", 256) if isinstance(prev_cfg, dict) else 256, 256)
         key_chunk_size = _int_or(prev_cfg.get("key_chunk_size", 1024) if isinstance(prev_cfg, dict) else 1024, 1024)
-        landmark_count = _int_or(prev_cfg.get("landmark_count", 128) if isinstance(prev_cfg, dict) else 128, 128)
+        landmark_fraction = _float_or(
+            prev_cfg.get("landmark_fraction", 0.08) if isinstance(prev_cfg, dict) else 0.08,
+            0.08,
+        )
+        landmark_min = _int_or(prev_cfg.get("landmark_min", 64) if isinstance(prev_cfg, dict) else 64, 64)
+        landmark_max = _int_or(prev_cfg.get("landmark_max", 512) if isinstance(prev_cfg, dict) else 512, 512)
         text_tokens_guess = _int_or(prev_cfg.get("text_tokens_guess", 77) if isinstance(prev_cfg, dict) else 77, 77)
         alpha_init = _float_or(prev_cfg.get("alpha_init", 0.1) if isinstance(prev_cfg, dict) else 0.1, 0.1)
         alpha_lr_multiplier = _float_or(
@@ -2017,7 +2046,9 @@ class Flux2TTRController(io.ComfyNode):
             steps=0,
             scan_chunk_size=int(query_chunk_size),
             key_chunk_size=int(key_chunk_size),
-            landmark_count=int(landmark_count),
+            landmark_fraction=float(landmark_fraction),
+            landmark_min=int(landmark_min),
+            landmark_max=int(landmark_max),
             text_tokens_guess=int(text_tokens_guess),
             alpha_init=float(alpha_init),
             alpha_lr_multiplier=float(alpha_lr_multiplier),
@@ -2065,7 +2096,9 @@ class Flux2TTRController(io.ComfyNode):
             "query_chunk_size": int(query_chunk_size),
             "scan_chunk_size": int(query_chunk_size),
             "key_chunk_size": int(key_chunk_size),
-            "landmark_count": int(landmark_count),
+            "landmark_fraction": float(landmark_fraction),
+            "landmark_min": int(landmark_min),
+            "landmark_max": int(landmark_max),
             "text_tokens_guess": int(text_tokens_guess),
             "alpha_init": float(alpha_init),
             "alpha_lr_multiplier": float(alpha_lr_multiplier),

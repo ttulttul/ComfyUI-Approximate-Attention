@@ -74,7 +74,9 @@ def test_flux2_hkr_layer_shape_and_landmarks():
     layer = flux2_ttr.Flux2HKRAttnLayer(
         head_dim=8,
         feature_dim=256,
-        landmark_count=6,
+        landmark_fraction=0.5,
+        landmark_min=1,
+        landmark_max=6,
         text_tokens_guess=3,
     )
 
@@ -87,6 +89,21 @@ def test_flux2_hkr_layer_shape_and_landmarks():
     assert out.shape == (1, 2, 7, 8)
     assert torch.isfinite(out).all()
     assert 1 <= layer.last_landmark_count <= 6
+
+
+def test_flux2_hkr_effective_landmark_count_scales_with_image_tokens():
+    layer = flux2_ttr.Flux2HKRAttnLayer(
+        head_dim=8,
+        feature_dim=256,
+        landmark_fraction=0.08,
+        landmark_min=64,
+        landmark_max=512,
+    )
+    assert layer._effective_landmark_count(0) == 64
+    assert layer._effective_landmark_count(1024) == 82
+    assert layer._effective_landmark_count(2304) == 184
+    assert layer._effective_landmark_count(4096) == 328
+    assert layer._effective_landmark_count(10000) == 512
 
 
 def test_flux2_hkr_sigma_cfg_conditioning_identity_by_default():
@@ -481,6 +498,9 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
         training=True,
         steps=2,
         training_preview_ttr=False,
+        landmark_fraction=0.12,
+        landmark_min=48,
+        landmark_max=640,
         readiness_min_updates=1,
         readiness_threshold=10.0,
         cfg_scale=3.5,
@@ -511,6 +531,9 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
     assert "single:0" in runtime_loaded.pending_state
     assert "single:0" in runtime_loaded.layer_update_count
     assert "single:0" in runtime_loaded.layer_ema_loss
+    assert runtime_loaded.landmark_fraction == pytest.approx(0.12)
+    assert runtime_loaded.landmark_min == 48
+    assert runtime_loaded.landmark_max == 640
     assert runtime_loaded.cfg_scale == pytest.approx(3.5)
     assert runtime_loaded.min_swap_layers == 2
     assert runtime_loaded.max_swap_layers == 5
@@ -575,6 +598,40 @@ def test_load_checkpoint_restores_per_layer_readiness_thresholds(tmp_path):
     assert loaded.layer_ready["single:0"] is False
 
 
+def test_load_checkpoint_old_landmark_count_falls_back_to_dynamic_defaults(tmp_path):
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        landmark_fraction=0.2,
+        landmark_min=8,
+        landmark_max=32,
+    )
+    payload = runtime.checkpoint_state()
+    payload.pop("landmark_fraction", None)
+    payload.pop("landmark_min", None)
+    payload.pop("landmark_max", None)
+    payload["landmark_count"] = 96
+
+    ckpt = tmp_path / "flux2_ttr_old_landmark_count.pt"
+    torch.save(payload, ckpt)
+
+    loaded = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+        landmark_fraction=0.2,
+        landmark_min=8,
+        landmark_max=32,
+    )
+    loaded.load_checkpoint(str(ckpt))
+    assert loaded.landmark_fraction == pytest.approx(0.08)
+    assert loaded.landmark_min == 64
+    assert loaded.landmark_max == 512
+
+
 def test_recover_runtime_from_config_inference_requires_checkpoint():
     cfg = {
         "training_mode": False,
@@ -598,6 +655,9 @@ def test_recover_runtime_from_config_training_without_checkpoint():
         "feature_dim": 256,
         "query_chunk_size": 256,
         "key_chunk_size": 1024,
+        "landmark_fraction": 0.2,
+        "landmark_min": 32,
+        "landmark_max": 320,
         "cfg_scale": 2.25,
         "min_swap_layers": 3,
         "max_swap_layers": 7,
@@ -609,6 +669,9 @@ def test_recover_runtime_from_config_training_without_checkpoint():
     assert runtime.training_enabled is True
     assert runtime.training_preview_ttr is False
     assert runtime.steps_remaining == 32
+    assert runtime.landmark_fraction == pytest.approx(0.2)
+    assert runtime.landmark_min == 32
+    assert runtime.landmark_max == 320
     assert runtime.cfg_scale == pytest.approx(2.25)
     assert runtime.min_swap_layers == 3
     assert runtime.max_swap_layers == 7
@@ -863,6 +926,36 @@ def test_memory_reserve_estimate_scales_with_training():
     assert train_bytes > infer_bytes
 
 
+def test_memory_reserve_estimate_scales_with_landmark_max():
+    small = flux2_ttr._estimate_flux2_ttr_memory_bytes(
+        batch=1,
+        heads=24,
+        n_query=256,
+        n_key=4096,
+        head_dim=128,
+        feature_dim=256,
+        q_chunk_size=256,
+        k_chunk_size=1024,
+        dtype_size=4,
+        training=False,
+        landmark_max=64,
+    )
+    large = flux2_ttr._estimate_flux2_ttr_memory_bytes(
+        batch=1,
+        heads=24,
+        n_query=256,
+        n_key=4096,
+        head_dim=128,
+        feature_dim=256,
+        q_chunk_size=256,
+        k_chunk_size=1024,
+        dtype_size=4,
+        training=False,
+        landmark_max=512,
+    )
+    assert large > small
+
+
 def test_training_oom_recovery_reduces_pressure_and_clears_layer_buffer():
     runtime = flux2_ttr.Flux2TTRRuntime(
         feature_dim=256,
@@ -892,7 +985,7 @@ def test_training_oom_recovery_reduces_pressure_and_clears_layer_buffer():
     assert runtime.training_query_token_cap <= 64
     assert runtime.query_chunk_size <= 128
     assert runtime.key_chunk_size <= 512
-    assert runtime.landmark_count <= 64
+    assert runtime.landmark_max <= 256
     assert len(runtime.replay_buffers[layer_key]) == 0
 
 

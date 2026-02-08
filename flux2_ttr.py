@@ -37,7 +37,9 @@ _DEFAULT_READY_MIN_UPDATES = 24
 _DEFAULT_ALPHA_LR_MUL = 5.0
 _DEFAULT_PHI_LR_MUL = 1.0
 _DEFAULT_GRAD_CLIP = 1.0
-_DEFAULT_LANDMARK_COUNT = 128
+_DEFAULT_LANDMARK_FRACTION = 0.08
+_DEFAULT_LANDMARK_MIN = 64
+_DEFAULT_LANDMARK_MAX = 512
 _DEFAULT_TEXT_TOKENS_GUESS = 77
 _DEFAULT_REPLAY_OFFLOAD_CPU = True
 _DEFAULT_REPLAY_STORAGE_DTYPE = "float16"
@@ -167,6 +169,7 @@ def _estimate_flux2_ttr_memory_bytes(
     k_chunk_size: int,
     dtype_size: int,
     training: bool,
+    landmark_max: int = _DEFAULT_LANDMARK_MAX,
 ) -> int:
     bh = batch * heads
     nq = max(1, int(n_query))
@@ -180,7 +183,7 @@ def _estimate_flux2_ttr_memory_bytes(
     chunk_elems = bh * (k_chunk * feature_dim + k_chunk * head_dim + q_chunk * feature_dim + q_chunk * head_dim)
 
     # Landmark branch: q_chunk x landmarks score matrix and softmax output.
-    landmarks = min(nk, _DEFAULT_LANDMARK_COUNT)
+    landmarks = min(nk, max(1, int(landmark_max)))
     landmark_elems = bh * (q_chunk * landmarks + landmarks * head_dim + q_chunk * head_dim)
 
     total = kv_elems + ksum_elems + chunk_elems + landmark_elems
@@ -225,6 +228,7 @@ def _maybe_reserve_memory(
         k_chunk_size=runtime.key_chunk_size,
         dtype_size=dtype_size,
         training=training,
+        landmark_max=runtime.landmark_max,
     )
     if training:
         scale = (runtime.feature_dim / 256.0) * (head_dim / 128.0) * max(1.0, (batch * heads) / 24.0)
@@ -246,6 +250,7 @@ def _maybe_reserve_memory(
             runtime.feature_dim,
             runtime.query_chunk_size,
             runtime.key_chunk_size,
+            runtime.landmark_max,
             dtype_size,
             _MEMORY_RESERVE_FACTOR,
         )
@@ -457,7 +462,9 @@ class Flux2HKRAttnLayer(nn.Module):
         key_chunk_size: int = _DEFAULT_K_CHUNK,
         split_qk: bool = False,
         qk_norm: bool = True,
-        landmark_count: int = _DEFAULT_LANDMARK_COUNT,
+        landmark_fraction: float = _DEFAULT_LANDMARK_FRACTION,
+        landmark_min: int = _DEFAULT_LANDMARK_MIN,
+        landmark_max: int = _DEFAULT_LANDMARK_MAX,
         text_tokens_guess: int = _DEFAULT_TEXT_TOKENS_GUESS,
         landmark_qk_norm: bool = False,
         alpha_init: float = 0.1,
@@ -468,7 +475,9 @@ class Flux2HKRAttnLayer(nn.Module):
         self.eps = float(eps)
         self.query_chunk_size = max(1, int(query_chunk_size))
         self.key_chunk_size = max(1, int(key_chunk_size))
-        self.landmark_count = max(1, int(landmark_count))
+        self.landmark_fraction = max(0.0, min(1.0, float(landmark_fraction)))
+        self.landmark_min = max(1, int(landmark_min))
+        self.landmark_max = max(self.landmark_min, int(landmark_max))
         self.text_tokens_guess = max(0, int(text_tokens_guess))
         self.landmark_qk_norm = bool(landmark_qk_norm)
 
@@ -494,17 +503,23 @@ class Flux2HKRAttnLayer(nn.Module):
             return torch.arange(start, end, device=device, dtype=torch.long)
         return torch.linspace(start, end - 1, steps=count, device=device, dtype=torch.float32).round().to(dtype=torch.long)
 
+    def _effective_landmark_count(self, n_image_tokens: int) -> int:
+        """Compute landmark count dynamically from the number of image tokens."""
+        raw = round(max(0, int(n_image_tokens)) * self.landmark_fraction)
+        return max(self.landmark_min, min(self.landmark_max, raw))
+
     def _select_landmarks(
         self,
         num_keys: int,
         device: torch.device,
         key_mask: Optional[torch.Tensor],
         text_token_count: Optional[int],
+        effective_landmarks: int,
     ) -> torch.Tensor:
         if num_keys <= 0:
             return torch.empty((0,), device=device, dtype=torch.long)
 
-        target = min(self.landmark_count, num_keys)
+        target = min(int(effective_landmarks), num_keys)
         text_count = self.text_tokens_guess if text_token_count is None else max(0, int(text_token_count))
         text_count = min(text_count, num_keys)
 
@@ -544,7 +559,11 @@ class Flux2HKRAttnLayer(nn.Module):
         text_token_count: Optional[int],
     ) -> torch.Tensor:
         batch, heads, _, _ = q.shape
-        idx = self._select_landmarks(k.shape[2], q.device, key_mask, text_token_count)
+        n_keys = int(k.shape[2])
+        text_count = max(0, int(text_token_count or 0))
+        n_image_tokens = max(0, n_keys - text_count)
+        effective_landmarks = self._effective_landmark_count(n_image_tokens)
+        idx = self._select_landmarks(n_keys, q.device, key_mask, text_token_count, effective_landmarks)
         self.last_landmark_count = int(idx.numel())
         if idx.numel() == 0:
             return v.new_zeros((batch, heads, q.shape[2], v.shape[-1]))
@@ -639,7 +658,9 @@ class Flux2TTRRuntime:
         steps: int,
         scan_chunk_size: int = _DEFAULT_Q_CHUNK,
         key_chunk_size: int = _DEFAULT_K_CHUNK,
-        landmark_count: int = _DEFAULT_LANDMARK_COUNT,
+        landmark_fraction: float = _DEFAULT_LANDMARK_FRACTION,
+        landmark_min: int = _DEFAULT_LANDMARK_MIN,
+        landmark_max: int = _DEFAULT_LANDMARK_MAX,
         text_tokens_guess: int = _DEFAULT_TEXT_TOKENS_GUESS,
         alpha_init: float = 0.1,
         alpha_lr_multiplier: float = _DEFAULT_ALPHA_LR_MUL,
@@ -680,7 +701,9 @@ class Flux2TTRRuntime:
 
         self.query_chunk_size = max(1, int(scan_chunk_size))
         self.key_chunk_size = max(1, int(key_chunk_size))
-        self.landmark_count = max(1, int(landmark_count))
+        self.landmark_fraction = max(0.0, min(1.0, float(landmark_fraction)))
+        self.landmark_min = max(1, int(landmark_min))
+        self.landmark_max = max(self.landmark_min, int(landmark_max))
         self.text_tokens_guess = max(0, int(text_tokens_guess))
         self.alpha_init = float(alpha_init)
         self.alpha_lr_multiplier = max(0.0, float(alpha_lr_multiplier))
@@ -1149,6 +1172,12 @@ class Flux2TTRRuntime:
             raise RuntimeError("Flux2TTR: no parameters available for optimizer.")
         return torch.optim.AdamW(groups)
 
+    def _sync_layer_landmark_config(self, layer: Flux2HKRAttnLayer) -> None:
+        layer.landmark_fraction = max(0.0, min(1.0, float(self.landmark_fraction)))
+        layer.landmark_min = max(1, int(self.landmark_min))
+        layer.landmark_max = max(layer.landmark_min, int(self.landmark_max))
+        layer.text_tokens_guess = max(0, int(self.text_tokens_guess))
+
     def _ensure_layer(self, layer_key: str, head_dim: int, device: torch.device) -> Flux2HKRAttnLayer:
         layer = self.layers.get(layer_key)
         if layer is None:
@@ -1157,10 +1186,13 @@ class Flux2TTRRuntime:
                 feature_dim=self.feature_dim,
                 query_chunk_size=self.query_chunk_size,
                 key_chunk_size=self.key_chunk_size,
-                landmark_count=self.landmark_count,
+                landmark_fraction=self.landmark_fraction,
+                landmark_min=self.landmark_min,
+                landmark_max=self.landmark_max,
                 text_tokens_guess=self.text_tokens_guess,
                 alpha_init=self.alpha_init,
             ).to(device=device, dtype=torch.float32)
+            self._sync_layer_landmark_config(layer)
             optimizer = self._ensure_optimizer(layer)
             pending = self.pending_state.get(layer_key)
             if pending:
@@ -1176,14 +1208,20 @@ class Flux2TTRRuntime:
             self.optimizers[layer_key] = optimizer
             self.replay_buffers.setdefault(layer_key, deque())
             logger.info(
-                "Flux2TTR: created HKR layer %s (head_dim=%d feature_dim=%d landmarks=%d).",
+                (
+                    "Flux2TTR: created HKR layer %s (head_dim=%d feature_dim=%d "
+                    "landmarks=fraction=%.4g min=%d max=%d)."
+                ),
                 layer_key,
                 head_dim,
                 self.feature_dim,
-                self.landmark_count,
+                self.landmark_fraction,
+                self.landmark_min,
+                self.landmark_max,
             )
             return layer
 
+        self._sync_layer_landmark_config(layer)
         layer_device = next(layer.parameters()).device
         if layer_device != device:
             layer.to(device=device)
@@ -1271,7 +1309,9 @@ class Flux2TTRRuntime:
                     "feature_dim": int(self.feature_dim),
                     "query_chunk_size": int(self.query_chunk_size),
                     "key_chunk_size": int(self.key_chunk_size),
-                    "landmark_count": int(self.landmark_count),
+                    "landmark_fraction": float(self.landmark_fraction),
+                    "landmark_min": int(self.landmark_min),
+                    "landmark_max": int(self.landmark_max),
                     "training_query_token_cap": int(self.training_query_token_cap),
                     "replay_buffer_size": int(self.replay_buffer_size),
                     "train_steps_per_call": int(self.train_steps_per_call),
@@ -1595,7 +1635,7 @@ class Flux2TTRRuntime:
         old_q_cap = self.training_query_token_cap
         old_q_chunk = self.query_chunk_size
         old_k_chunk = self.key_chunk_size
-        old_landmarks = self.landmark_count
+        old_landmarks = self.landmark_max
 
         changed = False
         if self.training_query_token_cap > 32:
@@ -1607,8 +1647,8 @@ class Flux2TTRRuntime:
         if self.key_chunk_size > 256:
             self.key_chunk_size = max(256, self.key_chunk_size // 2)
             changed = True
-        if self.landmark_count > 32:
-            self.landmark_count = max(32, self.landmark_count // 2)
+        if self.landmark_max > self.landmark_min:
+            self.landmark_max = max(self.landmark_min, self.landmark_max // 2)
             changed = True
 
         layer_buf = self.replay_buffers.get(layer_key)
@@ -1625,7 +1665,7 @@ class Flux2TTRRuntime:
             logger.warning(
                 (
                     "Flux2TTR OOM recovery on %s: training_query_token_cap %d->%d, "
-                    "q_chunk %d->%d, k_chunk %d->%d, landmarks %d->%d; cleared layer replay buffer."
+                    "q_chunk %d->%d, k_chunk %d->%d, landmark_max %d->%d; cleared layer replay buffer."
                 ),
                 layer_key,
                 old_q_cap,
@@ -1635,7 +1675,7 @@ class Flux2TTRRuntime:
                 old_k_chunk,
                 self.key_chunk_size,
                 old_landmarks,
-                self.landmark_count,
+                self.landmark_max,
             )
         return changed
 
@@ -2077,7 +2117,9 @@ class Flux2TTRRuntime:
             "last_loss": self.last_loss,
             "query_chunk_size": self.query_chunk_size,
             "key_chunk_size": self.key_chunk_size,
-            "landmark_count": self.landmark_count,
+            "landmark_fraction": self.landmark_fraction,
+            "landmark_min": self.landmark_min,
+            "landmark_max": self.landmark_max,
             "text_tokens_guess": self.text_tokens_guess,
             "alpha_init": self.alpha_init,
             "alpha_lr_multiplier": self.alpha_lr_multiplier,
@@ -2148,7 +2190,24 @@ class Flux2TTRRuntime:
 
         self.query_chunk_size = max(1, int(payload.get("query_chunk_size", self.query_chunk_size)))
         self.key_chunk_size = max(1, int(payload.get("key_chunk_size", self.key_chunk_size)))
-        self.landmark_count = max(1, int(payload.get("landmark_count", self.landmark_count)))
+        # Backward compat: old checkpoints only stored landmark_count, which
+        # cannot be converted into a resolution-aware fraction. Fall back to
+        # module defaults unless explicit fraction/min/max are present.
+        if "landmark_fraction" in payload:
+            self.landmark_fraction = max(0.0, min(1.0, float(payload["landmark_fraction"])))
+        else:
+            self.landmark_fraction = float(_DEFAULT_LANDMARK_FRACTION)
+        if "landmark_min" in payload:
+            self.landmark_min = max(1, int(payload["landmark_min"]))
+        else:
+            self.landmark_min = int(_DEFAULT_LANDMARK_MIN)
+        if "landmark_max" in payload:
+            self.landmark_max = max(self.landmark_min, int(payload["landmark_max"]))
+        else:
+            self.landmark_max = int(_DEFAULT_LANDMARK_MAX)
+        self.landmark_fraction = max(0.0, min(1.0, float(self.landmark_fraction)))
+        self.landmark_min = max(1, int(self.landmark_min))
+        self.landmark_max = max(self.landmark_min, int(self.landmark_max))
         self.text_tokens_guess = max(0, int(payload.get("text_tokens_guess", self.text_tokens_guess)))
         self.alpha_init = float(payload.get("alpha_init", self.alpha_init))
         self.alpha_lr_multiplier = float(payload.get("alpha_lr_multiplier", self.alpha_lr_multiplier))
@@ -2255,7 +2314,9 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         steps=training_total,
         scan_chunk_size=int(cfg.get("query_chunk_size", cfg.get("scan_chunk_size", _DEFAULT_Q_CHUNK))),
         key_chunk_size=int(cfg.get("key_chunk_size", _DEFAULT_K_CHUNK)),
-        landmark_count=int(cfg.get("landmark_count", _DEFAULT_LANDMARK_COUNT)),
+        landmark_fraction=float(cfg.get("landmark_fraction", _DEFAULT_LANDMARK_FRACTION)),
+        landmark_min=int(cfg.get("landmark_min", _DEFAULT_LANDMARK_MIN)),
+        landmark_max=int(cfg.get("landmark_max", _DEFAULT_LANDMARK_MAX)),
         text_tokens_guess=int(cfg.get("text_tokens_guess", _DEFAULT_TEXT_TOKENS_GUESS)),
         alpha_init=float(cfg.get("alpha_init", 0.1)),
         alpha_lr_multiplier=float(cfg.get("alpha_lr_multiplier", _DEFAULT_ALPHA_LR_MUL)),

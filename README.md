@@ -185,6 +185,7 @@ Speed tips:
 - Distill once, then run with `training=false` for normal sampling.
 - Keep `feature_dim=256` unless quality demands a higher value.
 - Start with `query_chunk_size=256`, `key_chunk_size=1024`; tune upward for speed if VRAM allows.
+- Landmark sampling is now dynamic: `effective_landmarks = clamp(round(n_image_tokens * landmark_fraction), landmark_min, landmark_max)` (defaults: `0.08`, `64`, `512`).
 - Keep `training_query_token_cap` in the `64-256` range for practical replay memory during online distillation (`128` default).
 - `replay_buffer_size` now defaults to `8` (instead of large buffers) to keep VRAM stable during online training.
 - Replay samples are offloaded to CPU in reduced precision by default, then moved back to GPU per optimization step.
@@ -196,7 +197,7 @@ Speed tips:
 - Note: this reservation is advisory/offload-oriented (via `free_memory`), not a persistent allocation; Flux2TTR now releases runtime GPU state and unregisters runtime objects at cleanup to avoid VRAM buildup across repeated runs.
 - If a cached graph references a missing Flux2TTR runtime ID, the node now attempts to recover runtime state from its saved config + `checkpoint_path` instead of immediately falling back.
 - Training at `feature_dim=256` typically needs roughly a few GB of extra VRAM; reservation is intended to offload earlier nodes before HKR allocations.
-- If training hits OOM, Flux2TTR now auto-reduces training pressure (`training_query_token_cap`, chunk sizes, landmarks) and clears the active layer replay buffer before disabling training.
+- If training hits OOM, Flux2TTR now auto-reduces training pressure (`training_query_token_cap`, chunk sizes, `landmark_max`) and clears the active layer replay buffer before disabling training.
 - If training still OOMs, Flux2TTR disables training for the run and falls back gracefully (teacher passthrough or preview fallback) instead of crashing generation.
 - If checkpoint loss is still high, Flux2TTR will fail closed to native attention fallback in inference mode instead of emitting low-quality garbage output.
 - During online distillation, Flux2TTR logs aggregate snapshots every 10 updates: ready layer list plus q25–q75 ranges for layer `loss`, `ema_loss`, `cosine_similarity`, and `nmse`.
