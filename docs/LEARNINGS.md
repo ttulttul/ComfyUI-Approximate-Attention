@@ -103,3 +103,4 @@
 - Flux2TTR quality is less brittle on text/reference-heavy prompts when all conditioning tokens are always treated as landmarks and the landmark budget is reserved exclusively for image tokens; VRAM reservation estimates should include both terms.
 - For Comet observability, per-layer metrics should be emitted for all tracked layers at each log tick (not just the current updated layer), and a Pareto-style score (`ready_layers * (1 - worst_ready_ema_cosine_dist)`) gives a compact readiness-vs-quality frontier signal.
 - ComfyUI run cleanup can fire after each sampled image; Phase-1 TTR Comet runs stay continuous across queued samplings only if runtime cleanup avoids calling `experiment.end()` and reuses a stable `experiment_key`.
+- Readiness gates are more stable with hysteresis: enter at `readiness_threshold`, but only exit above `readiness_threshold * 1.2`, which reduces layer-ready oscillation near the boundary.

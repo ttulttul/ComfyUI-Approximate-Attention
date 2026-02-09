@@ -36,6 +36,7 @@ _DEFAULT_TRAIN_STEPS_PER_CALL = 1
 _DEFAULT_HUBER_BETA = 0.05
 _DEFAULT_READY_THRESHOLD = 0.12
 _DEFAULT_READY_MIN_UPDATES = 24
+_READINESS_HYSTERESIS = 1.2
 _DEFAULT_ALPHA_LR_MUL = 5.0
 _DEFAULT_PHI_LR_MUL = 1.0
 _DEFAULT_GRAD_CLIP = 1.0
@@ -1580,17 +1581,27 @@ class Flux2TTRRuntime:
             self.layer_readiness_threshold[layer_key] = threshold
         if layer_key not in self.layer_readiness_min_updates:
             self.layer_readiness_min_updates[layer_key] = min_updates
-        ready = updates >= min_updates and ema <= threshold
+        prev_ready = bool(self.layer_ready.get(layer_key, False))
+        if updates < min_updates:
+            ready = False
+        elif prev_ready:
+            ready = bool(ema <= threshold * _READINESS_HYSTERESIS)
+        else:
+            ready = bool(ema <= threshold)
         prev = self.layer_ready.get(layer_key)
         self.layer_ready[layer_key] = bool(ready)
         if prev is None or bool(prev) != bool(ready):
             logger.info(
-                "Flux2TTR: layer readiness changed layer=%s ready=%s updates=%d ema=%.6g threshold=%.6g",
+                (
+                    "Flux2TTR: layer readiness changed layer=%s ready=%s updates=%d "
+                    "ema=%.6g threshold=%.6g hysteresis=%.3g"
+                ),
                 layer_key,
                 ready,
                 updates,
                 ema,
                 threshold,
+                _READINESS_HYSTERESIS,
             )
         return bool(ready)
 

@@ -697,6 +697,37 @@ def test_load_checkpoint_restores_per_layer_readiness_thresholds(tmp_path):
     assert loaded.layer_ready["single:0"] is False
 
 
+def test_layer_readiness_hysteresis_prevents_boundary_oscillation():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        readiness_threshold=0.1,
+        readiness_min_updates=0,
+    )
+    layer_key = "single:0"
+    runtime.layer_update_count[layer_key] = 10
+    runtime.layer_readiness_threshold[layer_key] = 0.1
+
+    runtime.layer_ema_loss[layer_key] = 0.095
+    assert runtime._refresh_layer_ready(layer_key) is True
+
+    # Above entry threshold but below hysteresis-adjusted exit threshold: stays ready.
+    runtime.layer_ema_loss[layer_key] = 0.11
+    assert runtime._refresh_layer_ready(layer_key) is True
+
+    # Above exit threshold (0.1 * 1.2): loses readiness.
+    runtime.layer_ema_loss[layer_key] = 0.121
+    assert runtime._refresh_layer_ready(layer_key) is False
+
+    # Re-entry still requires crossing the original readiness threshold.
+    runtime.layer_ema_loss[layer_key] = 0.11
+    assert runtime._refresh_layer_ready(layer_key) is False
+    runtime.layer_ema_loss[layer_key] = 0.099
+    assert runtime._refresh_layer_ready(layer_key) is True
+
+
 def test_load_checkpoint_old_landmark_count_falls_back_to_dynamic_defaults(tmp_path):
     runtime = flux2_ttr.Flux2TTRRuntime(
         feature_dim=256,
