@@ -197,6 +197,27 @@ def test_training_wrapper_recompute_all_false_eligible_mask_keeps_grad_path():
     assert wrapper.last_recompute_debug.get("result_requires_grad") is True
 
 
+def test_recomputed_objective_combined_inside_inference_mode_false_keeps_grad():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    wrapper = flux2_ttr_controller.TrainingControllerWrapper(controller)
+    with torch.no_grad():
+        wrapper(sigma=0.6, cfg_scale=4.0, width=64, height=64)
+
+    with torch.inference_mode():
+        objective = wrapper.sigma_weighted_log_prob_recompute(cfg_scale=4.0, width=64, height=64)
+        detached_loss = -1.0 * objective
+    assert bool(objective.requires_grad)
+    assert detached_loss.requires_grad is False
+
+    with torch.inference_mode(False):
+        with torch.enable_grad():
+            objective_attached = wrapper.sigma_weighted_log_prob_recompute(cfg_scale=4.0, width=64, height=64)
+            attached_loss = -1.0 * objective_attached
+    assert bool(objective_attached.requires_grad)
+    assert bool(attached_loss.requires_grad)
+
+
 def test_ttr_controller_checkpoint_round_trip(tmp_path):
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)

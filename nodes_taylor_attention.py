@@ -1928,13 +1928,16 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             1e-8,
                             max(float(rec["sigma"]) for rec in training_wrapper.step_records),
                         )
-                        policy_loss_t = -float(baselined_reward) * training_wrapper.sigma_weighted_log_prob_recompute(
-                            cfg_scale=float(cfg),
-                            width=int(width),
-                            height=int(height),
-                            sigma_max=sigma_max,
-                            eligible_mask=ttr_eligible_mask_cpu,
-                        )
+                        with torch.inference_mode(False):
+                            with torch.enable_grad():
+                                policy_objective_t = training_wrapper.sigma_weighted_log_prob_recompute(
+                                    cfg_scale=float(cfg),
+                                    width=int(width),
+                                    height=int(height),
+                                    sigma_max=sigma_max,
+                                    eligible_mask=ttr_eligible_mask_cpu,
+                                )
+                                policy_loss_t = -float(baselined_reward) * policy_objective_t
                         if not bool(policy_loss_t.requires_grad):
                             repaired = 0
                             with torch.inference_mode(False):
@@ -1943,13 +1946,16 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                                         p.requires_grad_(True)
                                         repaired += 1
                             if repaired > 0:
-                                policy_loss_t = -float(baselined_reward) * training_wrapper.sigma_weighted_log_prob_recompute(
-                                    cfg_scale=float(cfg),
-                                    width=int(width),
-                                    height=int(height),
-                                    sigma_max=sigma_max,
-                                    eligible_mask=ttr_eligible_mask_cpu,
-                                )
+                                with torch.inference_mode(False):
+                                    with torch.enable_grad():
+                                        policy_objective_t = training_wrapper.sigma_weighted_log_prob_recompute(
+                                            cfg_scale=float(cfg),
+                                            width=int(width),
+                                            height=int(height),
+                                            sigma_max=sigma_max,
+                                            eligible_mask=ttr_eligible_mask_cpu,
+                                        )
+                                        policy_loss_t = -float(baselined_reward) * policy_objective_t
                                 if bool(policy_loss_t.requires_grad):
                                     logger.info(
                                         "Flux2TTRControllerTrainer: restored detached sigma-aware policy loss by re-enabling requires_grad on %d controller params.",
@@ -1978,21 +1984,25 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             logger.warning(
                                 "Flux2TTRControllerTrainer: sigma-aware policy loss still detached after recompute; "
                                 "skipping optimizer step for this sample. "
-                                "diag: trainable_params=%d/%d inference_tensors=%d probe_requires_grad=%s probe_error=%s repaired_params=%d recompute_debug=%s",
+                                "diag: trainable_params=%d/%d inference_tensors=%d probe_requires_grad=%s probe_error=%s repaired_params=%d policy_objective_requires_grad=%s policy_loss_requires_grad=%s recompute_debug=%s",
                                 trainable_params,
                                 int(len(param_list)),
                                 inference_params,
                                 probe_requires_grad,
                                 probe_error or "<none>",
                                 int(repaired),
+                                bool(policy_objective_t.requires_grad),
+                                bool(policy_loss_t.requires_grad),
                                 str(getattr(training_wrapper, "last_recompute_debug", {})),
                             )
-                        trainer.optimizer.zero_grad(set_to_none=True)
-                        if bool(policy_loss_t.requires_grad):
-                            policy_loss_t.backward()
-                            if trainer.grad_clip_norm > 0:
-                                torch.nn.utils.clip_grad_norm_(trainer.controller.parameters(), trainer.grad_clip_norm)
-                            trainer.optimizer.step()
+                        with torch.inference_mode(False):
+                            with torch.enable_grad():
+                                trainer.optimizer.zero_grad(set_to_none=True)
+                                if bool(policy_loss_t.requires_grad):
+                                    policy_loss_t.backward()
+                                    if trainer.grad_clip_norm > 0:
+                                        torch.nn.utils.clip_grad_norm_(trainer.controller.parameters(), trainer.grad_clip_norm)
+                                    trainer.optimizer.step()
 
                         step_ttr = training_wrapper.per_step_ttr_ratio()
                         sigma_max_val = max((s for s, _ in step_ttr), default=1.0)
