@@ -278,13 +278,25 @@ def _maybe_reserve_memory(
 
     try:
         model_management.free_memory(mem_bytes, q.device)
-        logger.info(
-            "Flux2TTR reserved ~%.2f MB for %s (q_chunk=%d k_chunk=%d)",
-            mem_bytes / (1024 * 1024),
-            "training" if training else "inference",
-            runtime.query_chunk_size,
-            runtime.key_chunk_size,
+        mode = "training" if training else "inference"
+        reserve_signature = (
+            int(mem_bytes),
+            int(runtime.query_chunk_size),
+            int(runtime.key_chunk_size),
         )
+        reserve_log_state = getattr(runtime, "_memory_reserve_last_logged", None)
+        if not isinstance(reserve_log_state, dict):
+            reserve_log_state = {}
+            runtime._memory_reserve_last_logged = reserve_log_state
+        if reserve_log_state.get(mode) != reserve_signature:
+            logger.info(
+                "Flux2TTR reserved ~%.2f MB for %s (q_chunk=%d k_chunk=%d)",
+                mem_bytes / (1024 * 1024),
+                mode,
+                runtime.query_chunk_size,
+                runtime.key_chunk_size,
+            )
+            reserve_log_state[mode] = reserve_signature
     except Exception as exc:
         logger.warning("Flux2TTR reserve memory failed: %s", exc)
 
@@ -827,6 +839,7 @@ class Flux2TTRRuntime:
         self._controller_cache_key: Optional[Any] = None
         self._controller_cache_mask: Optional[torch.Tensor] = None
         self._controller_debug_last_step_key: Optional[Any] = None
+        self._memory_reserve_last_logged: Dict[str, tuple[int, int, int]] = {}
 
     @staticmethod
     def _layer_sort_key(layer_key: str) -> tuple[str, int]:
@@ -1001,6 +1014,7 @@ class Flux2TTRRuntime:
         self._controller_cache_key = None
         self._controller_cache_mask = None
         self._controller_debug_last_step_key = None
+        self._memory_reserve_last_logged.clear()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

@@ -1638,3 +1638,54 @@ def test_maybe_reserve_memory_dedupes(monkeypatch):
     flux2_ttr._maybe_reserve_memory(runtime, q, k, opts, training=False, dtype_accum=torch.float32)
     assert len(calls) == 1
     assert "flux2_ttr_memory_reserved" in opts
+
+
+def test_maybe_reserve_memory_logs_only_when_signature_changes(monkeypatch, caplog):
+    calls = []
+
+    class _MM:
+        @staticmethod
+        def free_memory(mem_bytes, device):
+            calls.append((int(mem_bytes), str(device)))
+
+    monkeypatch.setattr(flux2_ttr, "model_management", _MM)
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    q_small = torch.empty((1, 2, 32, 4), device="meta")
+    k_small = torch.empty((1, 2, 32, 4), device="meta")
+    q_large = torch.empty((1, 2, 64, 4), device="meta")
+    k_large = torch.empty((1, 2, 64, 4), device="meta")
+
+    caplog.set_level(logging.INFO, logger="flux2_ttr")
+
+    flux2_ttr._maybe_reserve_memory(
+        runtime,
+        q_small,
+        k_small,
+        {},
+        training=False,
+        dtype_accum=torch.float32,
+        layer_key="single:0",
+    )
+    flux2_ttr._maybe_reserve_memory(
+        runtime,
+        q_small,
+        k_small,
+        {},
+        training=False,
+        dtype_accum=torch.float32,
+        layer_key="single:1",
+    )
+    flux2_ttr._maybe_reserve_memory(
+        runtime,
+        q_large,
+        k_large,
+        {},
+        training=False,
+        dtype_accum=torch.float32,
+        layer_key="single:2",
+    )
+
+    reserve_logs = [rec.getMessage() for rec in caplog.records if "Flux2TTR reserved ~" in rec.getMessage()]
+    assert len(calls) == 3
+    assert len(reserve_logs) == 2
+    assert "inference" in reserve_logs[0]
