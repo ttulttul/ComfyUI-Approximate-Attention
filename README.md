@@ -163,7 +163,10 @@ Flux2TTR is now split into four nodes:
   - Runs dual-path sampling (`model_original` teacher vs `model_ttr` student).
   - Computes RMSE/cosine/LPIPS quality delta and updates controller with REINFORCE.
   - LPIPS evaluation now auto-synchronizes module/input device placement per step to avoid CPU/CUDA mismatch errors.
-  - Uses fixed per-run `controller_mask_override` during patched sampling.
+  - `sigma_aware_training=true` (default) now wraps the controller with a per-step training wrapper, so routing decisions are sampled at each diffusion step using that step's sigma instead of freezing one mask for the whole trajectory.
+  - Sigma-aware policy updates use a sigma-weighted trajectory log-prob objective (`wrapper.sigma_weighted_log_prob`) so late/low-sigma errors get stronger gradient signal.
+  - Logs sigma-split diagnostics (`ttr_ratio_high_sigma`, `ttr_ratio_low_sigma`, `ttr_ratio_spread`, `steps_per_trajectory`) so you can verify the controller is actually differentiating by sigma.
+  - `sigma_aware_training=false` keeps the legacy fixed-mask `controller_mask_override` path for debugging/backward compatibility.
   - Restricts TTR substitution to readiness-qualified layers from the Phase-1 checkpoint; non-ready layers are forced to full attention.
   - Efficiency targets (`target_ttr_ratio`) are enforced over readiness-qualified/controllable layers only (not clamped layers), with both `*_eligible` and `*_overall` ratios logged for interpretability.
   - Efficiency cost is routed through REINFORCE reward shaping (`lambda_eff`) rather than a direct differentiable penalty path through logits.
@@ -199,6 +202,10 @@ Implementation details:
   - `training_config` parsing
   - REINFORCE policy updates via `reinforce_step`
   - reward baseline EMA and gradient clipping
+- `TrainingControllerWrapper` now supports:
+  - per-step stochastic mask sampling under runtime controller calls
+  - trajectory-level policy-gradient aggregation helpers (`total_log_prob`, `sigma_weighted_log_prob`)
+  - sigma diagnostics and ratio/entropy summaries for controller training logging
 
 Speed tips:
 - Distill once, then run with `training=false` for normal sampling.

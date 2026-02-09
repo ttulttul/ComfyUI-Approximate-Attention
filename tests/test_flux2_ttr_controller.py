@@ -27,6 +27,98 @@ def test_ttr_controller_forward_shape():
     assert torch.isfinite(logits).all()
 
 
+def test_training_wrapper_records_steps_and_keeps_log_prob_grad_under_no_grad():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=8, hidden_dim=16)
+    wrapper = flux2_ttr_controller.TrainingControllerWrapper(controller, temperature=1.0)
+
+    with torch.no_grad():
+        wrapper(sigma=0.9, cfg_scale=4.0, width=64, height=64)
+        wrapper(sigma=0.5, cfg_scale=4.0, width=64, height=64)
+        wrapper(sigma=0.1, cfg_scale=4.0, width=64, height=64)
+
+    assert len(wrapper.step_records) == 3
+    assert bool(wrapper.step_records[0]["log_probs"].requires_grad)
+    total_log_prob = wrapper.total_log_prob()
+    assert bool(total_log_prob.requires_grad)
+
+
+def test_training_wrapper_synthetic_logits_round_trip_to_sampled_mask(monkeypatch):
+    def _fixed_sample(logits: torch.Tensor, temperature: float = 1.0, hard: bool = True) -> torch.Tensor:
+        del temperature, hard
+        return torch.tensor([1.0, 0.0, 1.0], device=logits.device, dtype=logits.dtype)
+
+    monkeypatch.setattr(
+        flux2_ttr_controller.TTRController,
+        "sample_training_mask",
+        staticmethod(_fixed_sample),
+    )
+    controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=8, hidden_dim=16)
+    wrapper = flux2_ttr_controller.TrainingControllerWrapper(controller)
+
+    synthetic_logits = wrapper(sigma=0.7, cfg_scale=3.0, width=64, height=64)
+    runtime_mask = (torch.sigmoid(synthetic_logits) > 0.5).to(dtype=torch.float32)
+
+    assert torch.equal(runtime_mask, wrapper.step_records[0]["mask"])
+
+
+def test_training_wrapper_ready_mask_clamps_non_ready_layers_to_full_attention(monkeypatch):
+    def _all_ttr_sample(logits: torch.Tensor, temperature: float = 1.0, hard: bool = True) -> torch.Tensor:
+        del temperature, hard
+        return torch.zeros_like(logits)
+
+    monkeypatch.setattr(
+        flux2_ttr_controller.TTRController,
+        "sample_training_mask",
+        staticmethod(_all_ttr_sample),
+    )
+    controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=8, hidden_dim=16)
+    ready_mask = torch.tensor([1.0, 0.0, 1.0, 0.0], dtype=torch.float32)
+    wrapper = flux2_ttr_controller.TrainingControllerWrapper(controller, ready_mask=ready_mask)
+
+    wrapper(sigma=0.5, cfg_scale=2.0, width=64, height=64)
+    mask = wrapper.step_records[0]["mask"]
+
+    assert torch.equal(mask, torch.tensor([0.0, 1.0, 0.0, 1.0], dtype=torch.float32))
+    assert wrapper.mean_full_attn_eligible() == pytest.approx(0.0)
+    assert wrapper.mean_full_attn_overall() == pytest.approx(0.5)
+
+
+def test_training_wrapper_per_step_ttr_ratio_varies_by_sigma(monkeypatch):
+    class _SigmaController(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, sigma, cfg_scale, width, height):
+            del cfg_scale, width, height
+            sigma_f = float(sigma.item()) if torch.is_tensor(sigma) else float(sigma)
+            if sigma_f >= 0.5:
+                base = torch.tensor([-6.0, -6.0, -6.0, -6.0], device=self.anchor.device)
+            else:
+                base = torch.tensor([6.0, 6.0, 6.0, 6.0], device=self.anchor.device)
+            return base + self.anchor * 0.0
+
+    def _threshold_sample(logits: torch.Tensor, temperature: float = 1.0, hard: bool = True) -> torch.Tensor:
+        del temperature, hard
+        return (logits > 0).to(dtype=logits.dtype)
+
+    monkeypatch.setattr(
+        flux2_ttr_controller.TTRController,
+        "sample_training_mask",
+        staticmethod(_threshold_sample),
+    )
+
+    wrapper = flux2_ttr_controller.TrainingControllerWrapper(_SigmaController())
+    wrapper(sigma=0.9, cfg_scale=1.0, width=64, height=64)
+    wrapper(sigma=0.1, cfg_scale=1.0, width=64, height=64)
+    per_step = wrapper.per_step_ttr_ratio()
+
+    assert len(per_step) == 2
+    assert per_step[0][1] == pytest.approx(1.0)
+    assert per_step[1][1] == pytest.approx(0.0)
+
+
 def test_ttr_controller_checkpoint_round_trip(tmp_path):
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)

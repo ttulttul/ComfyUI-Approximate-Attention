@@ -100,6 +100,209 @@ class TTRController(nn.Module):
         return (torch.sigmoid(logits.float()) > float(threshold)).to(dtype=torch.float32)
 
 
+class TrainingControllerWrapper(nn.Module):
+    """Controller wrapper for sigma-aware, per-step REINFORCE collection."""
+
+    _LOGIT_CLAMP = 20.0
+
+    def __init__(
+        self,
+        controller: TTRController,
+        *,
+        temperature: float = 1.0,
+        ready_mask: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        if not isinstance(controller, nn.Module):
+            raise TypeError("TrainingControllerWrapper: controller must be an nn.Module.")
+        self.controller = controller
+        self.temperature = float(temperature)
+        self.ready_mask = (
+            ready_mask.detach().clone().reshape(-1).to(dtype=torch.float32)
+            if torch.is_tensor(ready_mask)
+            else None
+        )
+        self.step_records: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _scalar(value: float | torch.Tensor) -> float:
+        if torch.is_tensor(value):
+            if value.numel() <= 0:
+                return 0.0
+            return float(value.reshape(-1)[0].detach().cpu().item())
+        return float(value)
+
+    def _ready_mask_for(self, ref: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.ready_mask is None:
+            return None
+        ready = self.ready_mask.to(device=ref.device, dtype=ref.dtype).reshape(-1)
+        if int(ready.numel()) != int(ref.numel()):
+            raise ValueError(
+                "TrainingControllerWrapper: ready_mask length "
+                f"{int(ready.numel())} does not match controller layer count {int(ref.numel())}."
+            )
+        return ready
+
+    def reset(self) -> None:
+        self.step_records.clear()
+
+    def forward(
+        self,
+        sigma: float | torch.Tensor,
+        cfg_scale: float | torch.Tensor,
+        width: int | float | torch.Tensor,
+        height: int | float | torch.Tensor,
+    ) -> torch.Tensor:
+        # Flux2TTRRuntime calls controllers under no_grad; force grad-enabled
+        # context here so policy log-probs remain differentiable.
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                logits = self.controller(sigma=sigma, cfg_scale=cfg_scale, width=width, height=height)
+                if logits.ndim > 1:
+                    logits = logits.reshape(-1)
+                logits = logits.float()
+
+                sampled_mask = TTRController.sample_training_mask(
+                    logits,
+                    temperature=float(self.temperature),
+                    hard=True,
+                )
+                mask = (sampled_mask > 0.5).to(dtype=logits.dtype)
+                ready = self._ready_mask_for(mask)
+                if ready is not None:
+                    # Non-ready layers are forced to full attention.
+                    mask = mask * ready + (1.0 - ready)
+
+                probs = torch.sigmoid(logits).clamp(min=1e-7, max=1.0 - 1e-7)
+                mask_det = mask.detach()
+                log_probs = mask_det * torch.log(probs) + (1.0 - mask_det) * torch.log(1.0 - probs)
+
+                self.step_records.append(
+                    {
+                        "sigma": self._scalar(sigma),
+                        "log_probs": log_probs,
+                        "mask": mask_det.detach().clone(),
+                        "probs": probs.detach().clone(),
+                    }
+                )
+
+                synthetic_logits = (mask_det * 2.0 - 1.0) * float(self._LOGIT_CLAMP)
+                return synthetic_logits.detach()
+
+    def total_log_prob(self) -> torch.Tensor:
+        if not self.step_records:
+            raise RuntimeError("TrainingControllerWrapper.total_log_prob: no step records collected.")
+        return torch.stack([rec["log_probs"].sum() for rec in self.step_records]).sum()
+
+    def sigma_weighted_log_prob(self, sigma_max: float = 1.0) -> torch.Tensor:
+        if not self.step_records:
+            raise RuntimeError("TrainingControllerWrapper.sigma_weighted_log_prob: no step records collected.")
+        sigma_norm = max(float(sigma_max), 1e-8)
+        ref = self.step_records[0]["log_probs"]
+        result = torch.zeros((), device=ref.device, dtype=ref.dtype)
+        for rec in self.step_records:
+            sigma_value = max(0.0, min(1.0, float(rec["sigma"]) / sigma_norm))
+            weight = max(0.1, 1.0 - sigma_value)
+            result = result + float(weight) * rec["log_probs"].sum()
+        return result
+
+    def per_step_ttr_ratio(self) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        for rec in self.step_records:
+            mask = rec["mask"]
+            ready = self._ready_mask_for(mask)
+            if ready is not None:
+                eligible = float(ready.sum().item())
+                if eligible > 0:
+                    ttr_fraction = float((((1.0 - mask) * ready).sum() / ready.sum()).item())
+                else:
+                    ttr_fraction = 0.0
+            else:
+                ttr_fraction = float((1.0 - mask).mean().item())
+            out.append((float(rec["sigma"]), ttr_fraction))
+        return out
+
+    def mean_entropy(self) -> float:
+        if not self.step_records:
+            return 0.0
+        total = 0.0
+        count = 0
+        for rec in self.step_records:
+            probs = rec["probs"]
+            entropy = -(
+                probs * torch.log(probs + 1e-8)
+                + (1.0 - probs) * torch.log(1.0 - probs + 1e-8)
+            )
+            total += float(entropy.sum().item())
+            count += int(entropy.numel())
+        return total / float(max(1, count))
+
+    def mean_full_attn_eligible(self) -> float:
+        if not self.step_records:
+            return 0.0
+        total = 0.0
+        for rec in self.step_records:
+            mask = rec["mask"]
+            ready = self._ready_mask_for(mask)
+            if ready is not None:
+                eligible = float(ready.sum().item())
+                if eligible > 0:
+                    total += float(((mask * ready).sum() / ready.sum()).item())
+                else:
+                    total += 1.0
+            else:
+                total += float(mask.mean().item())
+        return total / float(max(1, len(self.step_records)))
+
+    def mean_full_attn_overall(self) -> float:
+        if not self.step_records:
+            return 0.0
+        total = 0.0
+        for rec in self.step_records:
+            mask = rec["mask"]
+            ready = self._ready_mask_for(mask)
+            if ready is not None:
+                forced_full = float((1.0 - ready).sum().item())
+                full_ready = float((mask * ready).sum().item())
+                denom = max(1.0, float(mask.numel()))
+                total += (full_ready + forced_full) / denom
+            else:
+                total += float(mask.mean().item())
+        return total / float(max(1, len(self.step_records)))
+
+    def mean_expected_full_attn_eligible(self) -> float:
+        if not self.step_records:
+            return 0.0
+        total = 0.0
+        for rec in self.step_records:
+            probs = rec["probs"]
+            ready = self._ready_mask_for(probs)
+            if ready is not None:
+                eligible = float(ready.sum().item())
+                if eligible > 0:
+                    total += float(((probs * ready).sum() / ready.sum()).item())
+                else:
+                    total += 1.0
+            else:
+                total += float(probs.mean().item())
+        return total / float(max(1, len(self.step_records)))
+
+    def mean_expected_full_attn_overall(self) -> float:
+        if not self.step_records:
+            return 0.0
+        total = 0.0
+        for rec in self.step_records:
+            probs = rec["probs"]
+            ready = self._ready_mask_for(probs)
+            if ready is not None:
+                forced_full = float((1.0 - ready).sum().item())
+                full_ready = float((probs * ready).sum().item())
+                denom = max(1.0, float(probs.numel()))
+                total += (full_ready + forced_full) / denom
+            else:
+                total += float(probs.mean().item())
+        return total / float(max(1, len(self.step_records)))
+
 def controller_checkpoint_state(
     controller: TTRController,
     trainer: Optional["ControllerTrainer"] = None,

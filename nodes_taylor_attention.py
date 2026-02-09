@@ -1350,6 +1350,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 io.String.Input("checkpoint_path", default="", multiline=False),
                 io.Int.Input("training_iterations", default=100, min=1, max=100000, step=1),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=1e-3),
+                io.Boolean.Input("sigma_aware_training", default=True),
             ],
             outputs=[
                 io.Image.Output("IMAGE_ORIGINAL"),
@@ -1619,6 +1620,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         checkpoint_path: str,
         training_iterations: int,
         denoise: float,
+        sigma_aware_training: bool,
     ) -> io.NodeOutput:
         cls._require_sampling_stack()
         runtime, flux_cfg = _resolve_ttr_runtime_from_model(model_ttr)
@@ -1697,8 +1699,18 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         controller.to(device=device)
-        flux_cfg["controller"] = controller
+        sigma_aware_training = bool(sigma_aware_training)
+        training_wrapper = flux2_ttr_controller.TrainingControllerWrapper(
+            controller,
+            temperature=float(gumbel_start),
+            ready_mask=ttr_eligible_mask_cpu.to(device=device, dtype=torch.float32),
+        )
+        flux_cfg["controller"] = training_wrapper if sigma_aware_training else controller
         flux_cfg["controller_threshold"] = 0.5
+        logger.info(
+            "Flux2TTRControllerTrainer routing mode: sigma_aware_training=%s",
+            sigma_aware_training,
+        )
 
         trainer = flux2_ttr_controller.ControllerTrainer(
             controller=controller,
@@ -1755,12 +1767,14 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 "controller_num_layers": int(controller.num_layers),
                 "eligible_ttr_layers": int(len(ready_layer_indices)),
                 "forced_full_layers": int(forced_full_layer_count),
+                "sigma_aware_training": bool(sigma_aware_training),
                 "checkpoint_every": int(checkpoint_every),
                 "checkpoint_path": checkpoint_path,
                 "device": str(device),
                 "comet_experiment": _string_or(logging_cfg.get("comet_experiment"), ""),
             },
         )
+        lpips_enabled = _float_or(loss_cfg.get("lpips_weight"), 0.0) > 0
 
         global_step = 0
         last_original_images: Optional[torch.Tensor] = None
@@ -1797,32 +1811,11 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                     cls._maybe_unload_model(model_original)
                     cls._empty_cuda_cache()
 
-                    with torch.no_grad():
-                        logits = controller(
-                            sigma=sigma_value,
-                            cfg_scale=float(cfg),
-                            width=width,
-                            height=height,
-                        )
-                        sampled_mask = controller.sample_training_mask(
-                            logits,
-                            temperature=gumbel_temperature,
-                            hard=True,
-                        )
-                    sampled_mask = (sampled_mask.detach() > 0.5).to(dtype=torch.float32)
-                    effective_mask = sampled_mask.clone()
-                    ttr_eligible_mask = ttr_eligible_mask_cpu.to(device=effective_mask.device)
-                    effective_mask[~ttr_eligible_mask] = 1.0
-                    actual_full_attn_ratio_overall = float(effective_mask.mean().item())
-                    eligible_count = int(ttr_eligible_mask.sum().item())
-                    if eligible_count <= 0:
-                        raise RuntimeError(
-                            "Flux2TTRControllerTrainer: no eligible layers available for controller penalty computation."
-                        )
-                    actual_full_attn_ratio_eligible = float(effective_mask[ttr_eligible_mask].mean().item())
-                    flux_cfg["controller_mask_override"] = effective_mask.detach().cpu()
-
-                    try:
+                    if sigma_aware_training:
+                        training_wrapper.reset()
+                        training_wrapper.temperature = float(gumbel_temperature)
+                        flux_cfg.pop("controller_mask_override", None)
+                        flux_cfg["controller"] = training_wrapper
                         student_latent = cls._sample_model(
                             model=model_ttr,
                             latent=latent_item,
@@ -1835,8 +1828,55 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             scheduler=scheduler,
                             denoise=float(denoise),
                         )
-                    finally:
-                        flux_cfg.pop("controller_mask_override", None)
+                        if not training_wrapper.step_records:
+                            raise RuntimeError(
+                                "Flux2TTRControllerTrainer: no per-step controller records collected during sigma-aware sampling."
+                            )
+                        actual_full_attn_ratio_eligible = float(training_wrapper.mean_full_attn_eligible())
+                        actual_full_attn_ratio_overall = float(training_wrapper.mean_full_attn_overall())
+                        expected_full_attn_ratio_eligible = float(training_wrapper.mean_expected_full_attn_eligible())
+                        expected_full_attn_ratio_overall = float(training_wrapper.mean_expected_full_attn_overall())
+                    else:
+                        with torch.no_grad():
+                            logits = controller(
+                                sigma=sigma_value,
+                                cfg_scale=float(cfg),
+                                width=width,
+                                height=height,
+                            )
+                            sampled_mask = controller.sample_training_mask(
+                                logits,
+                                temperature=gumbel_temperature,
+                                hard=True,
+                            )
+                        sampled_mask = (sampled_mask.detach() > 0.5).to(dtype=torch.float32)
+                        effective_mask = sampled_mask.clone()
+                        ttr_eligible_mask = ttr_eligible_mask_cpu.to(device=effective_mask.device)
+                        effective_mask[~ttr_eligible_mask] = 1.0
+                        actual_full_attn_ratio_overall = float(effective_mask.mean().item())
+                        eligible_count = int(ttr_eligible_mask.sum().item())
+                        if eligible_count <= 0:
+                            raise RuntimeError(
+                                "Flux2TTRControllerTrainer: no eligible layers available for controller penalty computation."
+                            )
+                        actual_full_attn_ratio_eligible = float(effective_mask[ttr_eligible_mask].mean().item())
+                        flux_cfg["controller_mask_override"] = effective_mask.detach().cpu()
+
+                        try:
+                            student_latent = cls._sample_model(
+                                model=model_ttr,
+                                latent=latent_item,
+                                positive=positive,
+                                negative=negative,
+                                seed=sample_seed,
+                                steps=int(steps),
+                                cfg=float(cfg),
+                                sampler_name=sampler_name,
+                                scheduler=scheduler,
+                                denoise=float(denoise),
+                            )
+                        finally:
+                            flux_cfg.pop("controller_mask_override", None)
 
                     student_image = cls._decode_vae(vae, student_latent)
                     teacher_rgb = cls._to_lpips_bchw(teacher_image)
@@ -1845,41 +1885,114 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         teacher_latent=teacher_latent["samples"],
                         student_latent=student_latent["samples"],
                         actual_full_attn_ratio=actual_full_attn_ratio_eligible,
-                        teacher_rgb=teacher_rgb if _float_or(loss_cfg.get("lpips_weight"), 0.0) > 0 else None,
-                        student_rgb=student_rgb if _float_or(loss_cfg.get("lpips_weight"), 0.0) > 0 else None,
+                        teacher_rgb=teacher_rgb if lpips_enabled else None,
+                        student_rgb=student_rgb if lpips_enabled else None,
                         include_efficiency_penalty=False,
                     )
                     reward = -float(quality_loss.detach().item())
-                    reinforce_metrics = trainer.reinforce_step(
-                        sigma=sigma_value,
-                        cfg_scale=float(cfg),
-                        width=width,
-                        height=height,
-                        sampled_mask=effective_mask,
-                        reward=reward,
-                        actual_full_attn_ratio=actual_full_attn_ratio_eligible,
-                        eligible_layer_mask=ttr_eligible_mask,
-                        actual_full_attn_ratio_overall=actual_full_attn_ratio_overall,
-                    )
+
+                    if sigma_aware_training:
+                        entropy_value = float(training_wrapper.mean_entropy())
+                        target_ttr_ratio = float(trainer.target_ttr_ratio)
+                        target_full_attn_ratio = float(
+                            trainer._target_full_attn_ratio_from_ttr_ratio(target_ttr_ratio)
+                        )
+                        efficiency_penalty = max(0.0, actual_full_attn_ratio_eligible - target_full_attn_ratio)
+                        efficiency_penalty_weighted = float(trainer.lambda_eff * efficiency_penalty)
+                        entropy_bonus = float(trainer.lambda_entropy * entropy_value)
+                        reward_value = float(reward - efficiency_penalty_weighted + entropy_bonus)
+                        baselined_reward = float(reward_value - trainer.reward_baseline)
+                        trainer._update_reward_baseline(reward_value)
+
+                        sigma_max = max(
+                            1e-8,
+                            max(float(rec["sigma"]) for rec in training_wrapper.step_records),
+                        )
+                        policy_loss_t = -float(baselined_reward) * training_wrapper.sigma_weighted_log_prob(
+                            sigma_max=sigma_max
+                        )
+                        if not bool(policy_loss_t.requires_grad):
+                            raise RuntimeError(
+                                "Flux2TTRControllerTrainer: sigma-aware policy loss is not connected to controller gradients."
+                            )
+                        trainer.optimizer.zero_grad(set_to_none=True)
+                        policy_loss_t.backward()
+                        if trainer.grad_clip_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(trainer.controller.parameters(), trainer.grad_clip_norm)
+                        trainer.optimizer.step()
+
+                        step_ttr = training_wrapper.per_step_ttr_ratio()
+                        sigma_max_val = max((s for s, _ in step_ttr), default=1.0)
+                        high_ttrs = [f for s, f in step_ttr if s > 0.5 * sigma_max_val]
+                        low_ttrs = [f for s, f in step_ttr if s < 0.2 * sigma_max_val]
+                        ttr_ratio_high = float(sum(high_ttrs) / max(1, len(high_ttrs)))
+                        ttr_ratio_low = float(sum(low_ttrs) / max(1, len(low_ttrs)))
+                        ttr_ratio_spread = float(ttr_ratio_high - ttr_ratio_low)
+                        trajectory_sigma = (
+                            float(sum(s for s, _ in step_ttr) / max(1, len(step_ttr)))
+                            if step_ttr
+                            else float(sigma_value)
+                        )
+
+                        reinforce_metrics = {
+                            "policy_loss": float(policy_loss_t.detach().item()),
+                            "total_loss": float(policy_loss_t.detach().item()),
+                            "efficiency_penalty": float(efficiency_penalty),
+                            "efficiency_penalty_weighted": float(efficiency_penalty_weighted),
+                            "reward": float(reward_value),
+                            "reward_quality": float(reward),
+                            "reward_baseline": float(trainer.reward_baseline),
+                            "baselined_reward": float(baselined_reward),
+                            "entropy": float(entropy_value),
+                            "entropy_bonus": float(entropy_bonus),
+                            "lambda_eff": float(trainer.lambda_eff),
+                            "lambda_entropy": float(trainer.lambda_entropy),
+                            "target_ttr_ratio": float(target_ttr_ratio),
+                            "target_full_attn_ratio": float(target_full_attn_ratio),
+                            "actual_full_attn_ratio": float(actual_full_attn_ratio_eligible),
+                            "actual_full_attn_ratio_overall": float(actual_full_attn_ratio_overall),
+                            "expected_full_attn_ratio": float(expected_full_attn_ratio_eligible),
+                            "expected_full_attn_ratio_overall": float(expected_full_attn_ratio_overall),
+                            "ttr_ratio_high_sigma": float(ttr_ratio_high),
+                            "ttr_ratio_low_sigma": float(ttr_ratio_low),
+                            "ttr_ratio_spread": float(ttr_ratio_spread),
+                            "steps_per_trajectory": float(len(step_ttr)),
+                            "sigma": float(trajectory_sigma),
+                        }
+                    else:
+                        reinforce_metrics = trainer.reinforce_step(
+                            sigma=sigma_value,
+                            cfg_scale=float(cfg),
+                            width=width,
+                            height=height,
+                            sampled_mask=effective_mask,
+                            reward=reward,
+                            actual_full_attn_ratio=actual_full_attn_ratio_eligible,
+                            eligible_layer_mask=ttr_eligible_mask,
+                            actual_full_attn_ratio_overall=actual_full_attn_ratio_overall,
+                        )
+                        expected_full_attn_ratio_eligible = float(
+                            reinforce_metrics.get("expected_full_attn_ratio", actual_full_attn_ratio_eligible)
+                        )
+                        expected_full_attn_ratio_overall = float(
+                            reinforce_metrics.get(
+                                "expected_full_attn_ratio_overall",
+                                actual_full_attn_ratio_overall,
+                            )
+                        )
+                        target_ttr_ratio = float(reinforce_metrics.get("target_ttr_ratio", trainer.target_ttr_ratio))
+                        target_full_attn_ratio = float(
+                            reinforce_metrics.get(
+                                "target_full_attn_ratio",
+                                trainer._target_full_attn_ratio_from_ttr_ratio(target_ttr_ratio),
+                            )
+                        )
 
                     full_attn_ratio_eligible = float(
                         reinforce_metrics.get("actual_full_attn_ratio", actual_full_attn_ratio_eligible)
                     )
                     full_attn_ratio_overall = float(
                         reinforce_metrics.get("actual_full_attn_ratio_overall", actual_full_attn_ratio_overall)
-                    )
-                    expected_full_attn_ratio_eligible = float(
-                        reinforce_metrics.get("expected_full_attn_ratio", full_attn_ratio_eligible)
-                    )
-                    expected_full_attn_ratio_overall = float(
-                        reinforce_metrics.get("expected_full_attn_ratio_overall", full_attn_ratio_overall)
-                    )
-                    target_ttr_ratio = float(reinforce_metrics.get("target_ttr_ratio", 0.0))
-                    target_full_attn_ratio = float(
-                        reinforce_metrics.get(
-                            "target_full_attn_ratio",
-                            max(0.0, min(1.0, 1.0 - target_ttr_ratio)),
-                        )
                     )
                     metrics = {
                         "loss": float(quality_loss.detach().item()),
@@ -1919,7 +2032,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         "target_ttr_ratio": target_ttr_ratio,
                         "target_full_attn_ratio": target_full_attn_ratio,
                         "gumbel_temperature": float(gumbel_temperature),
-                        "sigma": float(sigma_value),
+                        "sigma": float(reinforce_metrics.get("sigma", sigma_value)),
                         "iteration": float(iteration + 1),
                         "latent_index": float(latent_idx),
                         "width": float(width),
@@ -1927,7 +2040,13 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         "step": float(global_step + 1),
                         "eligible_ttr_layers": float(len(ready_layer_indices)),
                         "forced_full_layers": float(forced_full_layer_count),
+                        "sigma_aware_training": float(1.0 if sigma_aware_training else 0.0),
                     }
+                    if sigma_aware_training:
+                        metrics["ttr_ratio_high_sigma"] = float(reinforce_metrics.get("ttr_ratio_high_sigma", 0.0))
+                        metrics["ttr_ratio_low_sigma"] = float(reinforce_metrics.get("ttr_ratio_low_sigma", 0.0))
+                        metrics["ttr_ratio_spread"] = float(reinforce_metrics.get("ttr_ratio_spread", 0.0))
+                        metrics["steps_per_trajectory"] = float(reinforce_metrics.get("steps_per_trajectory", 0.0))
 
                     global_step += 1
                     if (
@@ -1953,28 +2072,56 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         )
 
                     if global_step % log_every == 0 or global_step == total_steps:
-                        logger.info(
-                            (
-                                "Flux2TTRControllerTrainer step=%d/%d iter=%d loss=%.6g rmse=%.6g cosine=%.6g "
-                                "lpips=%.6g full_attn_eligible=%.4g full_attn_overall=%.4g "
-                                "target_full=%.4g eff_penalty=%.6g entropy=%.6g "
-                                "entropy_bonus=%.6g reward_baseline=%.6g"
-                            ),
-                            global_step,
-                            total_steps,
-                            iteration + 1,
-                            metrics["loss"],
-                            metrics["rmse"],
-                            metrics["cosine_distance"],
-                            metrics["lpips"],
-                            metrics["full_attn_eligible"],
-                            metrics["full_attn_overall"],
-                            metrics["target_full_attn_ratio"],
-                            metrics["efficiency_penalty"],
-                            metrics["entropy"],
-                            metrics["entropy_bonus"],
-                            metrics["reward_baseline"],
-                        )
+                        if sigma_aware_training:
+                            logger.info(
+                                (
+                                    "Flux2TTRControllerTrainer step=%d/%d iter=%d loss=%.6g rmse=%.6g cosine=%.6g "
+                                    "lpips=%.6g full_attn_eligible=%.4g full_attn_overall=%.4g "
+                                    "target_full=%.4g eff_penalty=%.6g entropy=%.6g entropy_bonus=%.6g "
+                                    "spread=%.4g high_ttr=%.4g low_ttr=%.4g traj_steps=%d reward_baseline=%.6g"
+                                ),
+                                global_step,
+                                total_steps,
+                                iteration + 1,
+                                metrics["loss"],
+                                metrics["rmse"],
+                                metrics["cosine_distance"],
+                                metrics["lpips"],
+                                metrics["full_attn_eligible"],
+                                metrics["full_attn_overall"],
+                                metrics["target_full_attn_ratio"],
+                                metrics["efficiency_penalty"],
+                                metrics["entropy"],
+                                metrics["entropy_bonus"],
+                                metrics.get("ttr_ratio_spread", 0.0),
+                                metrics.get("ttr_ratio_high_sigma", 0.0),
+                                metrics.get("ttr_ratio_low_sigma", 0.0),
+                                int(metrics.get("steps_per_trajectory", 0.0)),
+                                metrics["reward_baseline"],
+                            )
+                        else:
+                            logger.info(
+                                (
+                                    "Flux2TTRControllerTrainer step=%d/%d iter=%d loss=%.6g rmse=%.6g cosine=%.6g "
+                                    "lpips=%.6g full_attn_eligible=%.4g full_attn_overall=%.4g "
+                                    "target_full=%.4g eff_penalty=%.6g entropy=%.6g "
+                                    "entropy_bonus=%.6g reward_baseline=%.6g"
+                                ),
+                                global_step,
+                                total_steps,
+                                iteration + 1,
+                                metrics["loss"],
+                                metrics["rmse"],
+                                metrics["cosine_distance"],
+                                metrics["lpips"],
+                                metrics["full_attn_eligible"],
+                                metrics["full_attn_overall"],
+                                metrics["target_full_attn_ratio"],
+                                metrics["efficiency_penalty"],
+                                metrics["entropy"],
+                                metrics["entropy_bonus"],
+                                metrics["reward_baseline"],
+                            )
 
                     iter_original_images.append(teacher_image.detach().cpu())
                     iter_patched_images.append(student_image.detach().cpu())
@@ -1985,9 +2132,10 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                     del student_image
                     del teacher_rgb
                     del student_rgb
-                    del sampled_mask
-                    del effective_mask
-                    del ttr_eligible_mask
+                    if not sigma_aware_training:
+                        del sampled_mask
+                        del effective_mask
+                        del ttr_eligible_mask
                     cls._empty_cuda_cache()
 
                 if iter_original_images:
