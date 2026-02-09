@@ -809,6 +809,9 @@ class Flux2TTRRuntime:
         self.layer_last_loss: Dict[str, float] = {}
         self.layer_readiness_threshold: Dict[str, float] = {}
         self.layer_readiness_min_updates: Dict[str, int] = {}
+        self._run_ema_accum_loss: Dict[str, list[float]] = {}
+        self._run_ema_accum_cosine_dist: Dict[str, list[float]] = {}
+        self._run_last_sigma: Optional[float] = None
 
         self.capture_remaining = 0
 
@@ -989,6 +992,9 @@ class Flux2TTRRuntime:
         self._layer_metric_latest.clear()
         self._layer_metric_running.clear()
         self._layer_metric_count.clear()
+        self._run_ema_accum_loss.clear()
+        self._run_ema_accum_cosine_dist.clear()
+        self._run_last_sigma = None
         self._current_step_swap_set = None
         self._current_step_id = None
         self._current_step_eligible_count = 0
@@ -1576,14 +1582,61 @@ class Flux2TTRRuntime:
             self._comet_disabled = True
             return None
 
+    def flush_run_emas(self) -> None:
+        """Flush accumulated per-run EMA samples into single EMA updates.
+
+        Called at run boundaries (when sigma jumps up, indicating a new image).
+        Each layer gets at most one EMA update per sampling run, preventing
+        within-run sample correlation from destabilizing readiness flags.
+        """
+        refreshed_layers: list[str] = []
+
+        for layer_key, samples in self._run_ema_accum_loss.items():
+            if not samples:
+                continue
+            mean_loss = sum(samples) / len(samples)
+            prev = self.layer_ema_loss.get(layer_key, mean_loss)
+            self.layer_ema_loss[layer_key] = _EMA_DECAY * prev + (1.0 - _EMA_DECAY) * mean_loss
+            if layer_key not in refreshed_layers:
+                refreshed_layers.append(layer_key)
+        self._run_ema_accum_loss.clear()
+
+        for layer_key, samples in self._run_ema_accum_cosine_dist.items():
+            if not samples:
+                continue
+            mean_dist = sum(samples) / len(samples)
+            prev = self.layer_ema_cosine_dist.get(layer_key, mean_dist)
+            self.layer_ema_cosine_dist[layer_key] = _EMA_DECAY * prev + (1.0 - _EMA_DECAY) * mean_dist
+            if layer_key not in refreshed_layers:
+                refreshed_layers.append(layer_key)
+        self._run_ema_accum_cosine_dist.clear()
+
+        for layer_key in refreshed_layers:
+            self._refresh_layer_ready(layer_key)
+
+    def _detect_run_boundary(self, sigma: Optional[float]) -> None:
+        """Detect when a new sampling run starts and flush accumulated EMAs.
+
+        Within a diffusion sampling run, sigma monotonically decreases.
+        When sigma jumps significantly higher than the last seen value,
+        a new run (new image/prompt) has started.
+        """
+        if sigma is None or not math.isfinite(sigma):
+            return
+        prev = self._run_last_sigma
+        self._run_last_sigma = sigma
+        if prev is not None and sigma > prev * 1.5:
+            self.flush_run_emas()
+
     def _record_training_metrics(self, layer_key: str, metrics: Dict[str, float]) -> None:
         payload_metrics = dict(metrics)
         cosine_similarity = payload_metrics.get("cosine_similarity")
         if cosine_similarity is not None and math.isfinite(float(cosine_similarity)):
             cosine_dist = self._cosine_distance_from_similarity(float(cosine_similarity))
-            prev = self.layer_ema_cosine_dist.get(layer_key, cosine_dist)
-            ema_cosine_dist = _EMA_DECAY * float(prev) + (1.0 - _EMA_DECAY) * float(cosine_dist)
-            self.layer_ema_cosine_dist[layer_key] = float(ema_cosine_dist)
+            self._run_ema_accum_cosine_dist.setdefault(layer_key, []).append(cosine_dist)
+            # Report last-flushed EMA value (stable within run); falls back to
+            # instantaneous distance if no flush has happened yet.
+            ema_cosine_dist = self.layer_ema_cosine_dist.get(layer_key, cosine_dist)
             payload_metrics["ema_cosine_dist"] = float(ema_cosine_dist)
 
         self._layer_metric_latest[layer_key] = payload_metrics
@@ -2010,9 +2063,7 @@ class Flux2TTRRuntime:
             self.last_loss = loss_value
             self.layer_last_loss[layer_key] = loss_value
 
-            prev_ema = self.layer_ema_loss.get(layer_key, loss_value)
-            ema = _EMA_DECAY * prev_ema + (1.0 - _EMA_DECAY) * loss_value
-            self.layer_ema_loss[layer_key] = float(ema)
+            self._run_ema_accum_loss.setdefault(layer_key, []).append(loss_value)
             self.layer_update_count[layer_key] = int(self.layer_update_count.get(layer_key, 0)) + 1
             self._refresh_layer_ready(layer_key)
 
@@ -2041,6 +2092,7 @@ class Flux2TTRRuntime:
                 self._log_training_snapshot()
 
             if self.steps_remaining <= 0:
+                self.flush_run_emas()
                 self.training_enabled = False
                 logger.info("Flux2TTR: online distillation reached configured steps.")
                 break
@@ -2094,6 +2146,7 @@ class Flux2TTRRuntime:
             teacher_out = self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
 
         if self.training_mode:
+            self._detect_run_boundary(sigma)
             eligible_layers: list[str] = []
             swap_set: set[str] = set()
             if self.training_enabled and self.steps_remaining > 0:
@@ -2386,6 +2439,7 @@ class Flux2TTRRuntime:
         return float(self.last_loss)
 
     def checkpoint_state(self) -> Dict[str, Any]:
+        self.flush_run_emas()
         experiment = self._ensure_comet_experiment()
         if experiment is not None:
             last_sigma = float("nan")

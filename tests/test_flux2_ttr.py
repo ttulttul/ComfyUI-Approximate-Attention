@@ -945,6 +945,77 @@ def test_layer_readiness_hysteresis_prevents_boundary_oscillation():
     assert runtime._refresh_layer_ready(layer_key) is True
 
 
+def test_flush_run_emas_updates_from_run_means_and_refreshes_readiness():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        readiness_threshold=0.5,
+        readiness_min_updates=0,
+    )
+    layer_key = "single:0"
+    runtime.layer_update_count[layer_key] = 2
+    runtime._run_ema_accum_loss[layer_key] = [0.2, 0.4]
+    runtime._run_ema_accum_cosine_dist[layer_key] = [0.1, 0.3]
+
+    runtime.flush_run_emas()
+
+    assert runtime.layer_ema_loss[layer_key] == pytest.approx(0.3)
+    assert runtime.layer_ema_cosine_dist[layer_key] == pytest.approx(0.2)
+    assert runtime.layer_ready[layer_key] is True
+    assert runtime._run_ema_accum_loss == {}
+    assert runtime._run_ema_accum_cosine_dist == {}
+
+
+def test_detect_run_boundary_flushes_only_on_large_sigma_jump():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        readiness_min_updates=0,
+        readiness_threshold=1.0,
+    )
+    layer_key = "single:0"
+    runtime.layer_update_count[layer_key] = 1
+    runtime._run_ema_accum_loss[layer_key] = [0.2, 0.4]
+
+    runtime._detect_run_boundary(1.0)
+    assert runtime._run_ema_accum_loss[layer_key] == [0.2, 0.4]
+
+    runtime._detect_run_boundary(0.7)
+    assert runtime._run_ema_accum_loss[layer_key] == [0.2, 0.4]
+
+    runtime._detect_run_boundary(1.2)
+    assert runtime._run_ema_accum_loss == {}
+    assert runtime.layer_ema_loss[layer_key] == pytest.approx(0.3)
+
+
+def test_checkpoint_state_flushes_pending_run_ema_accumulators():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        readiness_min_updates=0,
+        readiness_threshold=1.0,
+    )
+    layer_key = "single:0"
+    runtime.layer_update_count[layer_key] = 1
+    runtime._run_ema_accum_loss[layer_key] = [0.2, 0.4]
+    runtime._run_ema_accum_cosine_dist[layer_key] = [0.1, 0.3]
+
+    payload = runtime.checkpoint_state()
+
+    assert runtime._run_ema_accum_loss == {}
+    assert runtime._run_ema_accum_cosine_dist == {}
+    assert runtime.layer_ema_loss[layer_key] == pytest.approx(0.3)
+    assert runtime.layer_ema_cosine_dist[layer_key] == pytest.approx(0.2)
+    assert payload["layer_ema_loss"][layer_key] == pytest.approx(0.3)
+    assert payload["layer_ema_cosine_dist"][layer_key] == pytest.approx(0.2)
+
+
 def test_load_checkpoint_old_landmark_count_falls_back_to_dynamic_defaults(tmp_path):
     runtime = flux2_ttr.Flux2TTRRuntime(
         feature_dim=256,
@@ -1194,6 +1265,17 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     assert payload["flux2ttr/global/pareto_frontier"] == pytest.approx(0.8)
 
 
+def test_record_training_metrics_accumulates_cosine_distance_per_run():
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
+    runtime.layer_ema_cosine_dist["single:0"] = 0.4
+
+    runtime._record_training_metrics("single:0", {"loss": 0.5, "cosine_similarity": 0.8})
+
+    assert runtime.layer_ema_cosine_dist["single:0"] == pytest.approx(0.4)
+    assert runtime._run_ema_accum_cosine_dist["single:0"][0] == pytest.approx(0.2)
+    assert runtime._layer_metric_latest["single:0"]["ema_cosine_dist"] == pytest.approx(0.4)
+
+
 def test_record_training_metrics_logs_pareto_frontier_edge_cases(monkeypatch):
     metric_calls = []
 
@@ -1360,6 +1442,19 @@ def test_comet_experiment_persists_across_runtime_release(monkeypatch):
     runtime_b.comet_persist_experiment = False
     runtime_b.release_resources()
     assert end_calls == [True]
+
+
+def test_release_resources_clears_run_ema_accumulator_state():
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
+    runtime._run_ema_accum_loss["single:0"] = [0.1]
+    runtime._run_ema_accum_cosine_dist["single:0"] = [0.2]
+    runtime._run_last_sigma = 0.4
+
+    runtime.release_resources()
+
+    assert runtime._run_ema_accum_loss == {}
+    assert runtime._run_ema_accum_cosine_dist == {}
+    assert runtime._run_last_sigma is None
 
 
 def test_memory_reserve_estimate_scales_with_training():

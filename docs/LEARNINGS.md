@@ -107,3 +107,4 @@
 - Controller inference behavior is easiest to verify with one routing log per step that includes extracted sigma, threshold, and the student-routed layer set; per-layer creation logs alone are not sufficient.
 - Sigma-aware controller training is stochastic per diffusion step, so pure deterministic thresholding at inference can collapse to a fixed swap set across all sigmas; exposing stochastic per-step policy sampling in inference better matches the trained policy semantics.
 - Deepening the HKR phi MLP from 2 to 3 linear layers and setting `hidden = max(head_dim, 2 * feature_dim)` (with split Q/K by default) increases kernel-map capacity at the cost of one extra hidden-by-hidden projection per network.
+- Per-step EMA updates are too sensitive to within-image correlation; accumulating losses/cosine distances across a sampling run and flushing one EMA update on sigma run boundaries stabilizes layer readiness across prompts.
