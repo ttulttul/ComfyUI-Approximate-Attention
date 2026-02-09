@@ -91,3 +91,4 @@
 - Flux2TTR landmark selection should scale with actual image token count (`landmark_fraction` with `landmark_min/max` clamps) instead of a fixed landmark count, so low resolutions avoid over-provisioning while high resolutions keep enough softmax anchors.
 - Controller training is safer for long runs when `checkpoint_path` is set and checkpoints are written periodically (every 10 controller steps) instead of only at the end.
 - Controller sawtooth regressions across runs are reduced by checkpointing/restoring trainer state (reward baseline/count and Adam optimizer state), not just controller weights.
+- `docs/flux2ttr_v2_paper.tex` uses an inline `thebibliography`, so a reliable build script only needs multi-pass LaTeX (`latexmk` or two `pdflatex` passes) and no `bibtex` stage.

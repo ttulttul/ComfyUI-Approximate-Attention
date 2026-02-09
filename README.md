@@ -92,6 +92,22 @@ uv sync --extra test
 uv run pytest
 ```
 
+## Build Paper
+
+Build `docs/flux2ttr_v2_paper.tex` into `docs/flux2ttr_v2_paper.pdf`:
+
+```bash
+scripts/build_paper.sh
+```
+
+Helpful options:
+
+```bash
+scripts/build_paper.sh --dry-run
+scripts/build_paper.sh --engine latexmk
+scripts/build_paper.sh --engine pdflatex --clean
+```
+
 ## Benchmarks
 
 Microbenchmark (resolution-dependent via token count):
