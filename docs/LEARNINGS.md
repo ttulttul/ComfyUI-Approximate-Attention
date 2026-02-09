@@ -108,3 +108,4 @@
 - Sigma-aware controller training is stochastic per diffusion step, so pure deterministic thresholding at inference can collapse to a fixed swap set across all sigmas; exposing stochastic per-step policy sampling in inference better matches the trained policy semantics.
 - Deepening the HKR phi MLP from 2 to 3 linear layers and setting `hidden = max(head_dim, 2 * feature_dim)` (with split Q/K by default) increases kernel-map capacity at the cost of one extra hidden-by-hidden projection per network.
 - Per-step EMA updates are too sensitive to within-image correlation; accumulating losses/cosine distances across a sampling run and flushing one EMA update on sigma run boundaries stabilizes layer readiness across prompts.
+- Sigma-boundary detection is a useful run delimiter but not guaranteed on every training path; a periodic flush trigger (every ~20 accumulated loss updates) prevents EMA/readiness from stalling when sigma transitions are absent.

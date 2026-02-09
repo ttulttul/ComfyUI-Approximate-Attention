@@ -2,6 +2,7 @@ import logging
 import math
 import sys
 import types
+from collections import deque
 
 import pytest
 import torch
@@ -275,6 +276,42 @@ def test_runtime_replay_stores_sigma_and_cfg():
     assert sample.sigma == pytest.approx(0.42)
     assert sample.cfg_scale == pytest.approx(4.0)
     assert sample.conditioning_token_count == 5
+
+
+def test_train_from_replay_periodic_flushes_without_sigma_boundary():
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=2,
+        train_steps_per_call=1,
+    )
+    layer_key = "single:0"
+    runtime.replay_buffers[layer_key] = deque(
+        [
+            flux2_ttr.ReplaySample(
+                q_sub=torch.randn(1, 2, 4, 4),
+                k_full=torch.randn(1, 2, 4, 4),
+                v_full=torch.randn(1, 2, 4, 4),
+                teacher_sub=torch.randn(1, 2, 4, 4),
+                key_mask=torch.ones(1, 4, dtype=torch.bool),
+                text_token_count=4,
+                conditioning_token_count=4,
+                sigma=0.5,
+                cfg_scale=1.0,
+            )
+        ]
+    )
+    runtime._run_ema_accum_loss["single:99"] = [0.2] * 19
+
+    runtime._train_from_replay(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
+
+    assert runtime.steps_remaining == 1
+    assert runtime.training_enabled is True
+    assert runtime._run_ema_accum_loss == {}
+    assert "single:99" in runtime.layer_ema_loss
+    assert layer_key in runtime.layer_ema_loss
 
 
 def test_runtime_training_preview_uses_student_when_layer_ready():

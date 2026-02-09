@@ -53,6 +53,7 @@ _DEFAULT_MAX_SWAP_LAYERS = -1
 _DEFAULT_COMET_LOG_EVERY = 50
 _DEFAULT_CONTROLLER_POLICY = "threshold"
 _DEFAULT_CONTROLLER_TEMPERATURE = 1.0
+_RUN_EMA_PERIODIC_FLUSH_UPDATES = 20
 _CONTROLLER_POLICY_THRESHOLD = "threshold"
 _CONTROLLER_POLICY_STOCHASTIC = "stochastic"
 _COMET_AGG_METRICS = (
@@ -2095,6 +2096,9 @@ class Flux2TTRRuntime:
                 layers_total=float(self._current_step_eligible_count),
             )
             self._record_training_metrics(layer_key, metrics)
+            total_accum = sum(len(v) for v in self._run_ema_accum_loss.values())
+            if total_accum >= _RUN_EMA_PERIODIC_FLUSH_UPDATES:
+                self.flush_run_emas()
 
             if (
                 self.training_log_every > 0
