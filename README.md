@@ -40,6 +40,7 @@ Inference:
 - `Flux2TTRController` exposes `quality_speed` to trade quality and speed through controller thresholding.
 - Flux2TTR landmark selection always includes all conditioning tokens as landmarks; the dynamic landmark budget is now applied only to image/spatial tokens.
 - Runtime accepts conditioning token hints through `transformer_options` keys: `conditioning_token_count`, `cond_token_count`, or `prefix_token_count`.
+- Comet logging now emits latest per-layer metrics for all tracked layers at each log tick, plus `flux2ttr/global/pareto_frontier` for ready-layer quality/coverage tracking.
 
 ## Utility Nodes
 

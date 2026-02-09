@@ -53,6 +53,7 @@ _COMET_AGG_METRICS = (
     "mse",
     "nmse",
     "cosine_similarity",
+    "ema_cosine_dist",
     "ema_loss",
     "sigma",
     "cfg_scale",
@@ -788,6 +789,7 @@ class Flux2TTRRuntime:
         self.layer_specs: Dict[str, FluxLayerSpec] = {}
         self.replay_buffers: Dict[str, Deque[ReplaySample]] = {}
         self.layer_ema_loss: Dict[str, float] = {}
+        self.layer_ema_cosine_dist: Dict[str, float] = {}
         self.layer_update_count: Dict[str, int] = {}
         self.layer_ready: Dict[str, bool] = {}
         self.layer_last_loss: Dict[str, float] = {}
@@ -848,6 +850,34 @@ class Flux2TTRRuntime:
             "p75": float(q[2].item()),
             "max": float(t.max().item()),
         }
+
+    @staticmethod
+    def _cosine_distance_from_similarity(cosine_similarity: float) -> float:
+        cosine_dist = 1.0 - float(cosine_similarity)
+        if not math.isfinite(cosine_dist):
+            return float("nan")
+        return max(0.0, min(1.0, cosine_dist))
+
+    def _pareto_frontier_score(self, tracked_layers: list[str]) -> tuple[float, int, float]:
+        ready_layers = [lk for lk in tracked_layers if bool(self.layer_ready.get(lk, False))]
+        ready_count = len(ready_layers)
+        if ready_count <= 0:
+            return 0.0, 0, float("nan")
+
+        ema_dists: list[float] = []
+        for layer_key in ready_layers:
+            dist = self.layer_ema_cosine_dist.get(layer_key)
+            if dist is None:
+                cosine_similarity = self._layer_metric_latest.get(layer_key, {}).get("cosine_similarity")
+                if cosine_similarity is not None and math.isfinite(float(cosine_similarity)):
+                    dist = self._cosine_distance_from_similarity(float(cosine_similarity))
+            if dist is None or not math.isfinite(float(dist)):
+                dist = 1.0
+            ema_dists.append(max(0.0, min(1.0, float(dist))))
+
+        worst = max(ema_dists) if ema_dists else 1.0
+        score = float(ready_count) * max(0.0, 1.0 - float(worst))
+        return float(score), int(ready_count), float(worst)
 
     @staticmethod
     def _format_layer_list(layer_keys: list[str], limit: int = 12) -> str:
@@ -1371,12 +1401,21 @@ class Flux2TTRRuntime:
             return None
 
     def _record_training_metrics(self, layer_key: str, metrics: Dict[str, float]) -> None:
-        self._layer_metric_latest[layer_key] = dict(metrics)
+        payload_metrics = dict(metrics)
+        cosine_similarity = payload_metrics.get("cosine_similarity")
+        if cosine_similarity is not None and math.isfinite(float(cosine_similarity)):
+            cosine_dist = self._cosine_distance_from_similarity(float(cosine_similarity))
+            prev = self.layer_ema_cosine_dist.get(layer_key, cosine_dist)
+            ema_cosine_dist = _EMA_DECAY * float(prev) + (1.0 - _EMA_DECAY) * float(cosine_dist)
+            self.layer_ema_cosine_dist[layer_key] = float(ema_cosine_dist)
+            payload_metrics["ema_cosine_dist"] = float(ema_cosine_dist)
+
+        self._layer_metric_latest[layer_key] = payload_metrics
 
         count = int(self._layer_metric_count.get(layer_key, 0)) + 1
         self._layer_metric_count[layer_key] = count
         running = self._layer_metric_running.setdefault(layer_key, {})
-        for key, value in metrics.items():
+        for key, value in payload_metrics.items():
             if not math.isfinite(float(value)):
                 continue
             prev = running.get(key, float(value))
@@ -1390,18 +1429,20 @@ class Flux2TTRRuntime:
         if not should_log:
             return
 
+        tracked_layers = list(self._layer_metric_latest.keys())
         payload = {}
-        for key, value in metrics.items():
-            if not math.isfinite(float(value)):
-                continue
-            payload[f"flux2ttr/{layer_key}/{key}"] = float(value)
+        for tracked_layer in tracked_layers:
+            latest = self._layer_metric_latest.get(tracked_layer, {})
+            for key, value in latest.items():
+                if not math.isfinite(float(value)):
+                    continue
+                payload[f"flux2ttr/{tracked_layer}/{key}"] = float(value)
         for key, value in running.items():
             payload[f"flux2ttr/{layer_key}/avg_{key}"] = float(value)
         payload["flux2ttr/global/steps_remaining"] = float(self.steps_remaining)
         payload["flux2ttr/global/updates_done"] = float(self.training_updates_done)
 
         # Cross-layer aggregate distributions (latest values per layer).
-        tracked_layers = list(self._layer_metric_latest.keys())
         if tracked_layers:
             ready_count = sum(1 for lk in tracked_layers if bool(self.layer_ready.get(lk, False)))
             payload["flux2ttr/global/layers_tracked"] = float(len(tracked_layers))
@@ -1412,6 +1453,9 @@ class Flux2TTRRuntime:
                 summary = self._quantile_summary(values)
                 for stat_name, stat_value in summary.items():
                     payload[f"flux2ttr/global/{metric_name}_{stat_name}"] = float(stat_value)
+            pareto_frontier, _, worst_ema_cosine_dist = self._pareto_frontier_score(tracked_layers)
+            payload["flux2ttr/global/pareto_frontier"] = float(pareto_frontier)
+            payload["flux2ttr/global/pareto_worst_ema_cosine_dist"] = float(worst_ema_cosine_dist)
         try:
             experiment.log_metrics(payload, step=int(self.training_updates_done))
         except Exception as exc:
@@ -2152,6 +2196,7 @@ class Flux2TTRRuntime:
         readiness_keys = set(layer_states.keys())
         readiness_keys.update(self.layer_specs.keys())
         readiness_keys.update(self.layer_ema_loss.keys())
+        readiness_keys.update(self.layer_ema_cosine_dist.keys())
         readiness_keys.update(self.layer_update_count.keys())
         readiness_keys.update(self.layer_ready.keys())
         layer_readiness = {}
@@ -2160,6 +2205,7 @@ class Flux2TTRRuntime:
                 "readiness_threshold": float(self.layer_readiness_threshold.get(layer_key, self.readiness_threshold)),
                 "readiness_min_updates": int(self.layer_readiness_min_updates.get(layer_key, self.readiness_min_updates)),
                 "ema_loss": float(self.layer_ema_loss.get(layer_key, float("inf"))),
+                "ema_cosine_dist": float(self.layer_ema_cosine_dist.get(layer_key, float("nan"))),
                 "update_count": int(self.layer_update_count.get(layer_key, 0)),
                 "ready": bool(self.layer_ready.get(layer_key, False)),
             }
@@ -2207,6 +2253,7 @@ class Flux2TTRRuntime:
                 for key, spec in self.layer_specs.items()
             },
             "layer_ema_loss": dict(self.layer_ema_loss),
+            "layer_ema_cosine_dist": dict(self.layer_ema_cosine_dist),
             "layer_update_count": dict(self.layer_update_count),
             "layer_ready": dict(self.layer_ready),
             "layer_last_loss": dict(self.layer_last_loss),
@@ -2307,6 +2354,7 @@ class Flux2TTRRuntime:
                 logger.warning("Flux2TTR: invalid layer spec in checkpoint for %s; skipping.", layer_key)
 
         self.layer_ema_loss = {str(k): float(v) for k, v in payload.get("layer_ema_loss", {}).items()}
+        self.layer_ema_cosine_dist = {str(k): float(v) for k, v in payload.get("layer_ema_cosine_dist", {}).items()}
         self.layer_update_count = {str(k): int(v) for k, v in payload.get("layer_update_count", {}).items()}
         self.layer_ready = {str(k): bool(v) for k, v in payload.get("layer_ready", {}).items()}
         self.layer_last_loss = {str(k): float(v) for k, v in payload.get("layer_last_loss", {}).items()}
@@ -2320,6 +2368,8 @@ class Flux2TTRRuntime:
             self.layer_readiness_min_updates[key] = int(meta.get("readiness_min_updates", self.readiness_min_updates))
             if key not in self.layer_ema_loss and "ema_loss" in meta:
                 self.layer_ema_loss[key] = float(meta.get("ema_loss", float("inf")))
+            if key not in self.layer_ema_cosine_dist and "ema_cosine_dist" in meta:
+                self.layer_ema_cosine_dist[key] = float(meta.get("ema_cosine_dist", float("nan")))
             if key not in self.layer_update_count and "update_count" in meta:
                 self.layer_update_count[key] = int(meta.get("update_count", 0))
             if key not in self.layer_ready and "ready" in meta:
