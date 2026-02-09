@@ -41,6 +41,7 @@ Inference:
 - Flux2TTR landmark selection always includes all conditioning tokens as landmarks; the dynamic landmark budget is now applied only to image/spatial tokens.
 - Runtime accepts conditioning token hints through `transformer_options` keys: `conditioning_token_count`, `cond_token_count`, or `prefix_token_count`.
 - Comet logging now emits latest per-layer metrics for all tracked layers at each log tick, plus `flux2ttr/global/pareto_frontier` for ready-layer quality/coverage tracking.
+- Phase-1 TTR Comet logging now supports persistent experiments across ComfyUI sampling runs when `comet_experiment` is set, reusing the same Comet run key instead of ending at each cleanup.
 
 ## Utility Nodes
 

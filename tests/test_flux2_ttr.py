@@ -600,6 +600,8 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
         cfg_scale=3.5,
         min_swap_layers=2,
         max_swap_layers=5,
+        comet_experiment="exp_persist_123",
+        comet_persist_experiment=True,
     )
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
 
@@ -632,6 +634,8 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
     assert runtime_loaded.cfg_scale == pytest.approx(3.5)
     assert runtime_loaded.min_swap_layers == 2
     assert runtime_loaded.max_swap_layers == 5
+    assert runtime_loaded.comet_experiment == "exp_persist_123"
+    assert runtime_loaded.comet_persist_experiment is True
 
 
 def test_checkpoint_state_includes_per_layer_readiness_criteria():
@@ -893,8 +897,8 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
         def end(self):
             return None
 
-    def _fake_start(api_key, project_name, workspace):
-        start_calls.append((api_key, project_name, workspace))
+    def _fake_start(api_key=None, project_name=None, workspace=None, experiment_key=None):
+        start_calls.append((api_key, project_name, workspace, experiment_key))
         return _FakeExperiment()
 
     fake_comet = types.ModuleType("comet_ml")
@@ -918,7 +922,7 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     runtime._record_training_metrics("single:11", {"loss": 0.5, "mse": 1.0, "nmse": 0.9, "cosine_similarity": 0.8, "ema_loss": 0.7})
     runtime._record_training_metrics("single:10", {"loss": 1.0, "mse": 2.0})
 
-    assert start_calls == [("test-key", "proj", "ws")]
+    assert start_calls == [("test-key", "proj", "ws", None)]
     assert len(params_calls) == 1
     assert metric_calls
     payload, step = metric_calls[-1]
@@ -955,8 +959,8 @@ def test_record_training_metrics_logs_pareto_frontier_edge_cases(monkeypatch):
         def end(self):
             return None
 
-    def _fake_start(api_key, project_name, workspace):
-        del api_key, project_name, workspace
+    def _fake_start(api_key=None, project_name=None, workspace=None, experiment_key=None):
+        del api_key, project_name, workspace, experiment_key
         return _FakeExperiment()
 
     fake_comet = types.ModuleType("comet_ml")
@@ -1008,8 +1012,8 @@ def test_record_training_metrics_throttles_comet_logging(monkeypatch):
         def end(self):
             return None
 
-    def _fake_start(api_key, project_name, workspace):
-        del api_key, project_name, workspace
+    def _fake_start(api_key=None, project_name=None, workspace=None, experiment_key=None):
+        del api_key, project_name, workspace, experiment_key
         return _FakeExperiment()
 
     fake_comet = types.ModuleType("comet_ml")
@@ -1046,6 +1050,68 @@ def test_record_training_metrics_throttles_comet_logging(monkeypatch):
     assert len(metric_calls) == 2
     _, step = metric_calls[-1]
     assert step == 51
+
+
+def test_comet_experiment_persists_across_runtime_release(monkeypatch):
+    start_calls = []
+    end_calls = []
+
+    class _FakeExperiment:
+        def log_parameters(self, params):
+            return None
+
+        def log_metrics(self, metrics, step=None):
+            del metrics, step
+            return None
+
+        def end(self):
+            end_calls.append(True)
+
+    def _fake_start(api_key=None, project_name=None, workspace=None, experiment_key=None):
+        start_calls.append((api_key, project_name, workspace, experiment_key))
+        return _FakeExperiment()
+
+    fake_comet = types.ModuleType("comet_ml")
+    fake_comet.start = _fake_start
+    monkeypatch.setitem(sys.modules, "comet_ml", fake_comet)
+    flux2_ttr._TTR_COMET_EXPERIMENTS.clear()
+    flux2_ttr._TTR_COMET_LOGGED_PARAM_KEYS.clear()
+
+    runtime_a = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        comet_enabled=True,
+        comet_api_key="test-key",
+        comet_project_name="proj",
+        comet_workspace="ws",
+        comet_experiment="exp_keep_open",
+        comet_persist_experiment=True,
+    )
+    exp_a = runtime_a._ensure_comet_experiment()
+    assert exp_a is not None
+    runtime_a.release_resources()
+    assert end_calls == []
+
+    runtime_b = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        comet_enabled=True,
+        comet_api_key="test-key",
+        comet_project_name="proj",
+        comet_workspace="ws",
+        comet_experiment="exp_keep_open",
+        comet_persist_experiment=True,
+    )
+    exp_b = runtime_b._ensure_comet_experiment()
+    assert exp_b is exp_a
+    assert len(start_calls) == 1
+    runtime_b.comet_persist_experiment = False
+    runtime_b.release_resources()
+    assert end_calls == [True]
 
 
 def test_memory_reserve_estimate_scales_with_training():

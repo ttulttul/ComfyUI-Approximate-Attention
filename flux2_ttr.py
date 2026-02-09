@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
 _PATCH_DEPTH = 0
 _RUNTIME_REGISTRY: Dict[str, "Flux2TTRRuntime"] = {}
+_TTR_COMET_EXPERIMENTS: Dict[str, Any] = {}
+_TTR_COMET_LOGGED_PARAM_KEYS: set[str] = set()
 _MEMORY_RESERVE_FACTOR = 1.1
 _EMPIRICAL_TRAINING_FLOOR_BYTES = 3 * 1024 * 1024 * 1024
 _DISTILL_METRIC_EPS = 1e-8
@@ -722,6 +724,8 @@ class Flux2TTRRuntime:
         comet_api_key: str = "",
         comet_project_name: str = "ttr-distillation",
         comet_workspace: str = "comet-workspace",
+        comet_experiment: str = "",
+        comet_persist_experiment: bool = True,
         comet_log_every: int = _DEFAULT_COMET_LOG_EVERY,
     ):
         self.feature_dim = validate_feature_dim(feature_dim)
@@ -778,6 +782,8 @@ class Flux2TTRRuntime:
         self.comet_api_key = str(comet_api_key or "")
         self.comet_project_name = str(comet_project_name or "ttr-distillation")
         self.comet_workspace = str(comet_workspace or "comet-workspace")
+        self.comet_experiment = str(comet_experiment or "").strip()
+        self.comet_persist_experiment = bool(comet_persist_experiment) and bool(self.comet_experiment)
         self.comet_log_every = max(1, int(comet_log_every))
 
         self.max_safe_inference_loss = float(_MAX_SAFE_INFERENCE_LOSS)
@@ -939,10 +945,17 @@ class Flux2TTRRuntime:
 
     def release_resources(self) -> None:
         if self._comet_experiment is not None:
-            try:
-                self._comet_experiment.end()
-            except Exception as exc:
-                logger.warning("Flux2TTR: failed to end Comet experiment cleanly: %s", exc)
+            keep_open = bool(self.comet_enabled and self.comet_persist_experiment and self.comet_experiment)
+            if not keep_open:
+                try:
+                    self._comet_experiment.end()
+                except Exception as exc:
+                    logger.warning("Flux2TTR: failed to end Comet experiment cleanly: %s", exc)
+                if self.comet_experiment:
+                    cached = _TTR_COMET_EXPERIMENTS.get(self.comet_experiment)
+                    if cached is self._comet_experiment:
+                        _TTR_COMET_EXPERIMENTS.pop(self.comet_experiment, None)
+                        _TTR_COMET_LOGGED_PARAM_KEYS.discard(self.comet_experiment)
             self._comet_experiment = None
 
         # Avoid explicit CPU transfers here; cleanup can be called near the end of
@@ -1349,6 +1362,13 @@ class Flux2TTRRuntime:
         if self._comet_experiment is not None:
             return self._comet_experiment
 
+        experiment_key = self.comet_experiment.strip()
+        if self.comet_persist_experiment and experiment_key:
+            cached = _TTR_COMET_EXPERIMENTS.get(experiment_key)
+            if cached is not None:
+                self._comet_experiment = cached
+                return cached
+
         api_key = self.comet_api_key.strip() or os.getenv("COMET_API_KEY", "").strip()
         if not api_key:
             logger.warning("Flux2TTR: Comet logging enabled but no API key configured; disabling Comet logging.")
@@ -1362,37 +1382,50 @@ class Flux2TTRRuntime:
             return None
 
         try:
-            experiment = start(
+            kwargs = dict(
                 api_key=api_key,
                 project_name=self.comet_project_name,
                 workspace=self.comet_workspace,
             )
-            experiment.log_parameters(
-                {
-                    "learning_rate": float(self.learning_rate),
-                    "feature_dim": int(self.feature_dim),
-                    "query_chunk_size": int(self.query_chunk_size),
-                    "key_chunk_size": int(self.key_chunk_size),
-                    "landmark_fraction": float(self.landmark_fraction),
-                    "landmark_min": int(self.landmark_min),
-                    "landmark_max": int(self.landmark_max),
-                    "training_query_token_cap": int(self.training_query_token_cap),
-                    "replay_buffer_size": int(self.replay_buffer_size),
-                    "train_steps_per_call": int(self.train_steps_per_call),
-                    "huber_beta": float(self.huber_beta),
-                    "readiness_threshold": float(self.readiness_threshold),
-                    "readiness_min_updates": int(self.readiness_min_updates),
-                    "cfg_scale": float(self.cfg_scale),
-                    "min_swap_layers": int(self.min_swap_layers),
-                    "max_swap_layers": int(self.max_swap_layers),
-                    "comet_log_every": int(self.comet_log_every),
-                }
-            )
+            if experiment_key:
+                kwargs["experiment_key"] = experiment_key
+
+            experiment = start(**kwargs)
+
+            param_key = experiment_key if experiment_key else f"runtime:{id(experiment)}"
+            if param_key not in _TTR_COMET_LOGGED_PARAM_KEYS:
+                experiment.log_parameters(
+                    {
+                        "learning_rate": float(self.learning_rate),
+                        "feature_dim": int(self.feature_dim),
+                        "query_chunk_size": int(self.query_chunk_size),
+                        "key_chunk_size": int(self.key_chunk_size),
+                        "landmark_fraction": float(self.landmark_fraction),
+                        "landmark_min": int(self.landmark_min),
+                        "landmark_max": int(self.landmark_max),
+                        "training_query_token_cap": int(self.training_query_token_cap),
+                        "replay_buffer_size": int(self.replay_buffer_size),
+                        "train_steps_per_call": int(self.train_steps_per_call),
+                        "huber_beta": float(self.huber_beta),
+                        "readiness_threshold": float(self.readiness_threshold),
+                        "readiness_min_updates": int(self.readiness_min_updates),
+                        "cfg_scale": float(self.cfg_scale),
+                        "min_swap_layers": int(self.min_swap_layers),
+                        "max_swap_layers": int(self.max_swap_layers),
+                        "comet_log_every": int(self.comet_log_every),
+                        "comet_experiment": experiment_key,
+                    }
+                )
+                _TTR_COMET_LOGGED_PARAM_KEYS.add(param_key)
             self._comet_experiment = experiment
+            if self.comet_persist_experiment and experiment_key:
+                _TTR_COMET_EXPERIMENTS[experiment_key] = experiment
             logger.info(
-                "Flux2TTR: Comet logging enabled (project=%s workspace=%s).",
+                "Flux2TTR: Comet logging enabled (project=%s workspace=%s experiment=%s persist=%s).",
                 self.comet_project_name,
                 self.comet_workspace,
+                experiment_key or "<none>",
+                bool(self.comet_persist_experiment and experiment_key),
             )
             return experiment
         except Exception as exc:
@@ -2219,6 +2252,8 @@ class Flux2TTRRuntime:
             "comet_enabled": self.comet_enabled,
             "comet_project_name": self.comet_project_name,
             "comet_workspace": self.comet_workspace,
+            "comet_experiment": self.comet_experiment,
+            "comet_persist_experiment": self.comet_persist_experiment,
             "last_loss": self.last_loss,
             "query_chunk_size": self.query_chunk_size,
             "key_chunk_size": self.key_chunk_size,
@@ -2291,6 +2326,9 @@ class Flux2TTRRuntime:
         self.comet_enabled = bool(payload.get("comet_enabled", self.comet_enabled))
         self.comet_project_name = str(payload.get("comet_project_name", self.comet_project_name))
         self.comet_workspace = str(payload.get("comet_workspace", self.comet_workspace))
+        self.comet_experiment = str(payload.get("comet_experiment", self.comet_experiment)).strip()
+        self.comet_persist_experiment = bool(payload.get("comet_persist_experiment", self.comet_persist_experiment))
+        self.comet_persist_experiment = bool(self.comet_persist_experiment and self.comet_experiment)
         self.comet_log_every = max(1, int(payload.get("comet_log_every", self.comet_log_every)))
         self.last_loss = float(payload.get("last_loss", self.last_loss))
 
@@ -2451,6 +2489,8 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         comet_enabled=bool(cfg.get("comet_enabled", False)),
         comet_project_name=str(cfg.get("comet_project_name", "ttr-distillation")),
         comet_workspace=str(cfg.get("comet_workspace", "comet-workspace")),
+        comet_experiment=str(cfg.get("comet_experiment", "")),
+        comet_persist_experiment=bool(cfg.get("comet_persist_experiment", True)),
         comet_log_every=int(cfg.get("comet_log_every", _DEFAULT_COMET_LOG_EVERY)),
     )
 
@@ -2463,6 +2503,9 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
     runtime.cfg_scale = float(cfg.get("cfg_scale", runtime.cfg_scale))
     runtime.min_swap_layers = max(0, int(cfg.get("min_swap_layers", runtime.min_swap_layers)))
     runtime.max_swap_layers = int(cfg.get("max_swap_layers", runtime.max_swap_layers))
+    runtime.comet_experiment = str(cfg.get("comet_experiment", runtime.comet_experiment)).strip()
+    runtime.comet_persist_experiment = bool(cfg.get("comet_persist_experiment", runtime.comet_persist_experiment))
+    runtime.comet_persist_experiment = bool(runtime.comet_persist_experiment and runtime.comet_experiment)
     runtime.comet_log_every = max(1, int(cfg.get("comet_log_every", runtime.comet_log_every)))
 
     checkpoint_path = (cfg.get("checkpoint_path") or "").strip()
@@ -2473,6 +2516,9 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         runtime.comet_enabled = bool(cfg.get("comet_enabled", runtime.comet_enabled))
         runtime.comet_project_name = str(cfg.get("comet_project_name", runtime.comet_project_name))
         runtime.comet_workspace = str(cfg.get("comet_workspace", runtime.comet_workspace))
+        runtime.comet_experiment = str(cfg.get("comet_experiment", runtime.comet_experiment)).strip()
+        runtime.comet_persist_experiment = bool(cfg.get("comet_persist_experiment", runtime.comet_persist_experiment))
+        runtime.comet_persist_experiment = bool(runtime.comet_persist_experiment and runtime.comet_experiment)
         runtime.cfg_scale = float(cfg.get("cfg_scale", runtime.cfg_scale))
         runtime.min_swap_layers = max(0, int(cfg.get("min_swap_layers", runtime.min_swap_layers)))
         runtime.max_swap_layers = int(cfg.get("max_swap_layers", runtime.max_swap_layers))

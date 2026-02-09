@@ -705,6 +705,8 @@ class Flux2TTRTrainer(io.ComfyNode):
             comet_enabled=bool(comet_enabled),
             comet_project_name=str(comet_project_name or "ttr-distillation"),
             comet_workspace=str(comet_workspace or "comet-workspace"),
+            comet_experiment=str(comet_experiment or ""),
+            comet_persist_experiment=bool(comet_experiment),
             comet_api_key=str(comet_api_key or ""),
             comet_log_every=int(comet_log_every),
         )
@@ -753,6 +755,8 @@ class Flux2TTRTrainer(io.ComfyNode):
             "comet_enabled": runtime.comet_enabled,
             "comet_project_name": runtime.comet_project_name,
             "comet_workspace": runtime.comet_workspace,
+            "comet_experiment": runtime.comet_experiment,
+            "comet_persist_experiment": runtime.comet_persist_experiment,
             "comet_log_every": int(runtime.comet_log_every),
             "training_steps_total": int(runtime.training_steps_total),
             "training_steps_remaining": int(runtime.steps_remaining),
