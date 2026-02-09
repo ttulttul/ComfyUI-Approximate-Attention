@@ -1793,6 +1793,8 @@ class Flux2TTRController(io.ComfyNode):
                 io.String.Input("ttr_checkpoint_path", default="", multiline=False),
                 io.String.Input("controller_checkpoint_path", default="", multiline=False),
                 io.Float.Input("quality_speed", default=0.5, min=0.0, max=1.0, step=1e-3),
+                io.Combo.Input("policy_mode", options=["stochastic", "threshold"], default="stochastic"),
+                io.Float.Input("policy_temperature", default=1.0, min=1e-3, max=10.0, step=1e-3),
             ],
             outputs=[io.Model.Output()],
             is_experimental=True,
@@ -1805,6 +1807,8 @@ class Flux2TTRController(io.ComfyNode):
         ttr_checkpoint_path: str,
         controller_checkpoint_path: str,
         quality_speed: float,
+        policy_mode: str,
+        policy_temperature: float,
     ) -> io.NodeOutput:
         ttr_checkpoint_path = (ttr_checkpoint_path or "").strip()
         controller_checkpoint_path = (controller_checkpoint_path or "").strip()
@@ -1912,6 +1916,20 @@ class Flux2TTRController(io.ComfyNode):
         controller = flux2_ttr_controller.load_controller_checkpoint(controller_checkpoint_path, map_location="cpu")
         quality_speed = min(1.0, max(0.0, float(quality_speed)))
         threshold = 0.1 + 0.8 * quality_speed
+        policy_mode_norm = str(policy_mode or "stochastic").strip().lower()
+        if policy_mode_norm not in {"stochastic", "threshold"}:
+            logger.warning("Flux2TTRController: unknown policy_mode=%r; defaulting to 'stochastic'.", policy_mode)
+            policy_mode_norm = "stochastic"
+        try:
+            policy_temperature_value = float(policy_temperature)
+        except Exception:
+            policy_temperature_value = 1.0
+        if not math.isfinite(policy_temperature_value) or policy_temperature_value <= 0:
+            logger.warning(
+                "Flux2TTRController: invalid policy_temperature=%r; defaulting to 1.0.",
+                policy_temperature,
+            )
+            policy_temperature_value = 1.0
 
         runtime_id = flux2_ttr.register_runtime(runtime)
         transformer_options["flux2_ttr"] = {
@@ -1921,6 +1939,8 @@ class Flux2TTRController(io.ComfyNode):
             "runtime_id": runtime_id,
             "controller": controller,
             "controller_threshold": float(threshold),
+            "controller_policy": str(policy_mode_norm),
+            "controller_temperature": float(policy_temperature_value),
             "checkpoint_path": ttr_checkpoint_path,
             "controller_checkpoint_path": controller_checkpoint_path,
             "feature_dim": int(feature_dim),
@@ -1967,11 +1987,16 @@ class Flux2TTRController(io.ComfyNode):
         )
 
         logger.info(
-            "Flux2TTRController configured: ttr_ckpt=%s controller_ckpt=%s quality_speed=%.4g threshold=%.4g",
+            (
+                "Flux2TTRController configured: ttr_ckpt=%s controller_ckpt=%s "
+                "quality_speed=%.4g threshold=%.4g policy_mode=%s policy_temperature=%.4g"
+            ),
             ttr_checkpoint_path,
             controller_checkpoint_path,
             quality_speed,
             threshold,
+            policy_mode_norm,
+            policy_temperature_value,
         )
         return io.NodeOutput(m)
 

@@ -498,6 +498,7 @@ def test_runtime_inference_controller_logs_routing_once_per_step(monkeypatch, ca
     assert len(routing_logs) == 2
     assert "step_id=('step', 0)" in routing_logs[0]
     assert "extracted_sigma=0.9" in routing_logs[0]
+    assert "controller_policy=threshold" in routing_logs[0]
     assert "controller_threshold=0.5" in routing_logs[0]
     assert "[single:1,single:2]" in routing_logs[0]
     assert "step_id=('step', 1)" in routing_logs[1]
@@ -609,6 +610,114 @@ def test_runtime_inference_controller_threshold_is_configurable(monkeypatch):
     )
     assert torch.all(out_student == 24.0)
     assert torch.allclose(out_teacher, teacher)
+
+
+def test_runtime_inference_controller_stochastic_policy_samples_once_per_step(monkeypatch, caplog):
+    class _Controller(torch.nn.Module):
+        def forward(self, sigma, cfg_scale, width, height):
+            del sigma, cfg_scale, width, height
+            # Base probability is 0.5 for both layers; stochastic policy drives per-step variation.
+            return torch.zeros(2, dtype=torch.float32)
+
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime.register_layer_specs(
+        [
+            flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4),
+            flux2_ttr.FluxLayerSpec(layer_key="single:1", num_heads=2, head_dim=4),
+        ]
+    )
+    runtime.layer_update_count["single:0"] = 99
+    runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ready["single:0"] = True
+    runtime.layer_update_count["single:1"] = 99
+    runtime.layer_ema_loss["single:1"] = 0.0
+    runtime.layer_ready["single:1"] = True
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
+
+    def fake_student(**kwargs):
+        q_eff = kwargs["q_eff"]
+        v_arg = kwargs["v"]
+        return torch.full((q_eff.shape[0], q_eff.shape[2], q_eff.shape[1] * q_eff.shape[3]), 31.0, dtype=v_arg.dtype)
+
+    monkeypatch.setattr(runtime, "_student_from_runtime", fake_student)
+    controller = _Controller()
+
+    draws = iter(
+        (
+            torch.tensor([0.2, 0.8], dtype=torch.float32),  # step 0 -> full [1,0], student [0,1]
+            torch.tensor([0.8, 0.2], dtype=torch.float32),  # step 1 -> full [0,1], student [1,0]
+        )
+    )
+    draw_calls = {"count": 0}
+
+    def fake_rand_like(ref, *args, **kwargs):
+        del args, kwargs
+        draw_calls["count"] += 1
+        return next(draws).to(device=ref.device, dtype=ref.dtype)
+
+    monkeypatch.setattr(torch, "rand_like", fake_rand_like)
+    caplog.set_level(logging.INFO, logger="flux2_ttr")
+
+    opts_step0_l0 = {
+        "block_type": "single",
+        "block_index": 0,
+        "step": 0,
+        "sigmas": torch.tensor([0.9]),
+        "flux2_ttr": {
+            "controller": controller,
+            "controller_policy": "stochastic",
+            "controller_threshold": 0.5,
+            "controller_temperature": 1.0,
+        },
+    }
+    opts_step0_l1 = {
+        "block_type": "single",
+        "block_index": 1,
+        "step": 0,
+        "sigmas": torch.tensor([0.9]),
+        "flux2_ttr": {
+            "controller": controller,
+            "controller_policy": "stochastic",
+            "controller_threshold": 0.5,
+            "controller_temperature": 1.0,
+        },
+    }
+    opts_step1_l0 = {
+        "block_type": "single",
+        "block_index": 0,
+        "step": 1,
+        "sigmas": torch.tensor([0.5]),
+        "flux2_ttr": {
+            "controller": controller,
+            "controller_policy": "stochastic",
+            "controller_threshold": 0.5,
+            "controller_temperature": 1.0,
+        },
+    }
+
+    teacher = fallback(q, k, v, None)
+    out0 = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step0_l0, fallback_attention=fallback)
+    out1 = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step0_l1, fallback_attention=fallback)
+    out2 = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step1_l0, fallback_attention=fallback)
+
+    assert torch.allclose(out0, teacher)
+    assert torch.all(out1 == 31.0)
+    assert torch.all(out2 == 31.0)
+    assert int(draw_calls["count"]) == 2
+
+    routing_logs = [rec.getMessage() for rec in caplog.records if "Flux2TTR controller step routing:" in rec.getMessage()]
+    assert len(routing_logs) == 2
+    assert "controller_policy=stochastic" in routing_logs[0]
+    assert "decision_threshold=0.5" in routing_logs[0]
+    assert "[single:1]" in routing_logs[0]
+    assert "[single:0]" in routing_logs[1]
 
 
 def test_runtime_unsupported_mask_falls_back_to_teacher():

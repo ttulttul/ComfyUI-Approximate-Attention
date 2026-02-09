@@ -51,6 +51,10 @@ _DEFAULT_CFG_SCALE = 1.0
 _DEFAULT_MIN_SWAP_LAYERS = 1
 _DEFAULT_MAX_SWAP_LAYERS = -1
 _DEFAULT_COMET_LOG_EVERY = 50
+_DEFAULT_CONTROLLER_POLICY = "threshold"
+_DEFAULT_CONTROLLER_TEMPERATURE = 1.0
+_CONTROLLER_POLICY_THRESHOLD = "threshold"
+_CONTROLLER_POLICY_STOCHASTIC = "stochastic"
 _COMET_AGG_METRICS = (
     "loss",
     "mse",
@@ -1140,6 +1144,33 @@ class Flux2TTRRuntime:
                         return cfg_scale
         return float(self.cfg_scale)
 
+    @staticmethod
+    def _normalize_controller_policy(value: Any) -> str:
+        policy = str(value or _DEFAULT_CONTROLLER_POLICY).strip().lower()
+        if policy in {"sample", "sampling", "stochastic", "bernoulli", "gumbel"}:
+            return _CONTROLLER_POLICY_STOCHASTIC
+        return _CONTROLLER_POLICY_THRESHOLD
+
+    @staticmethod
+    def _sanitize_controller_threshold(value: Any, default: float = 0.5) -> float:
+        try:
+            threshold = float(value)
+        except Exception:
+            threshold = float(default)
+        if not math.isfinite(threshold):
+            threshold = float(default)
+        return max(1e-4, min(1.0 - 1e-4, threshold))
+
+    @staticmethod
+    def _sanitize_controller_temperature(value: Any, default: float = _DEFAULT_CONTROLLER_TEMPERATURE) -> float:
+        try:
+            temperature = float(value)
+        except Exception:
+            temperature = float(default)
+        if not math.isfinite(temperature):
+            temperature = float(default)
+        return max(1e-3, temperature)
+
     def _extract_step_id(self, transformer_options: Optional[dict]) -> Any:
         if isinstance(transformer_options, dict):
             for key in ("step", "current_step", "sample_step", "timestep", "sigma_idx", "denoise_step"):
@@ -1223,9 +1254,27 @@ class Flux2TTRRuntime:
         cfg_scale: float,
         width: int,
         height: int,
+        *,
+        controller_threshold: float,
+        controller_policy: str,
+        controller_temperature: float,
     ) -> torch.Tensor:
         sigma_key = None if sigma is None else round(float(sigma), 10)
-        step_id = (sigma_key, round(float(cfg_scale), 6), int(width), int(height))
+        policy = self._normalize_controller_policy(controller_policy)
+        threshold = self._sanitize_controller_threshold(controller_threshold, default=0.5)
+        temperature = self._sanitize_controller_temperature(
+            controller_temperature,
+            default=_DEFAULT_CONTROLLER_TEMPERATURE,
+        )
+        step_id = (
+            sigma_key,
+            round(float(cfg_scale), 6),
+            int(width),
+            int(height),
+            policy,
+            round(float(threshold), 6),
+            round(float(temperature), 6),
+        )
         if step_id == self._controller_cache_key and self._controller_cache_mask is not None:
             return self._controller_cache_mask
 
@@ -1233,7 +1282,15 @@ class Flux2TTRRuntime:
             logits = controller(sigma if sigma is not None else 0.0, cfg_scale, width, height)
             if logits.ndim > 1:
                 logits = logits.reshape(-1)
-            mask = torch.sigmoid(logits.float())
+            probs = torch.sigmoid(logits.float())
+            if policy == _CONTROLLER_POLICY_STOCHASTIC:
+                probs = probs.clamp(min=1e-6, max=1.0 - 1e-6)
+                threshold_logit = math.log(threshold / (1.0 - threshold))
+                adjusted = torch.sigmoid((torch.logit(probs) - threshold_logit) / temperature)
+                draws = torch.rand_like(adjusted)
+                mask = (draws < adjusted).to(dtype=torch.float32)
+            else:
+                mask = probs
         self._controller_cache_key = step_id
         self._controller_cache_mask = mask
         return mask
@@ -1266,6 +1323,9 @@ class Flux2TTRRuntime:
         transformer_options: Optional[dict],
         controller_mask: torch.Tensor,
         controller_threshold: float,
+        controller_policy: str,
+        controller_temperature: float,
+        decision_threshold: float,
         sigma: Optional[float],
         cfg_scale: float,
         width: int,
@@ -1280,6 +1340,9 @@ class Flux2TTRRuntime:
             sigma_key,
             round(float(cfg_scale), 6),
             round(float(controller_threshold), 6),
+            str(controller_policy),
+            round(float(controller_temperature), 6),
+            round(float(decision_threshold), 6),
             int(width),
             int(height),
         )
@@ -1289,7 +1352,7 @@ class Flux2TTRRuntime:
 
         student_layers, total_layers = self._controller_student_layer_set(
             controller_mask=controller_mask,
-            controller_threshold=controller_threshold,
+            controller_threshold=decision_threshold,
             transformer_options=transformer_options,
             current_layer_key=current_layer_key,
         )
@@ -1297,11 +1360,15 @@ class Flux2TTRRuntime:
         logger.info(
             (
                 "Flux2TTR controller step routing: step_id=%r extracted_sigma=%s "
-                "controller_threshold=%.4g cfg_scale=%.4g student_layers=%d/%d [%s]"
+                "controller_policy=%s controller_threshold=%.4g decision_threshold=%.4g "
+                "controller_temperature=%.4g cfg_scale=%.4g student_layers=%d/%d [%s]"
             ),
             step_id,
             sigma_text,
+            str(controller_policy),
             float(controller_threshold),
+            float(decision_threshold),
+            float(controller_temperature),
             float(cfg_scale),
             len(student_layers),
             int(total_layers),
@@ -2124,6 +2191,8 @@ class Flux2TTRRuntime:
         controller = None
         controller_mask_override = None
         controller_threshold = 0.5
+        controller_policy = _DEFAULT_CONTROLLER_POLICY
+        controller_temperature = _DEFAULT_CONTROLLER_TEMPERATURE
         if isinstance(transformer_options, dict):
             cfg = transformer_options.get("flux2_ttr")
             if isinstance(cfg, dict):
@@ -2135,11 +2204,21 @@ class Flux2TTRRuntime:
                         controller_threshold = threshold_value
                 except Exception:
                     controller_threshold = 0.5
+                controller_policy = self._normalize_controller_policy(cfg.get("controller_policy", _DEFAULT_CONTROLLER_POLICY))
+                controller_temperature = self._sanitize_controller_temperature(
+                    cfg.get("controller_temperature", _DEFAULT_CONTROLLER_TEMPERATURE),
+                    default=_DEFAULT_CONTROLLER_TEMPERATURE,
+                )
         if controller_mask_override is not None or controller is not None:
             width, height = self._extract_resolution(
                 transformer_options,
                 n_key=int(k.shape[2]),
                 text_token_count=conditioning_token_count if conditioning_token_count is not None else text_token_count,
+            )
+            decision_threshold = (
+                0.5
+                if controller_mask_override is None and controller_policy == _CONTROLLER_POLICY_STOCHASTIC
+                else float(controller_threshold)
             )
             try:
                 if controller_mask_override is not None:
@@ -2149,11 +2228,23 @@ class Flux2TTRRuntime:
                         dtype=torch.float32,
                     ).reshape(-1)
                 else:
-                    controller_mask = self._get_controller_mask(controller, sigma, cfg_scale, width, height)
+                    controller_mask = self._get_controller_mask(
+                        controller,
+                        sigma,
+                        cfg_scale,
+                        width,
+                        height,
+                        controller_threshold=controller_threshold,
+                        controller_policy=controller_policy,
+                        controller_temperature=controller_temperature,
+                    )
                 self._maybe_log_controller_step_routing(
                     transformer_options=transformer_options,
                     controller_mask=controller_mask,
                     controller_threshold=controller_threshold,
+                    controller_policy=controller_policy,
+                    controller_temperature=controller_temperature,
+                    decision_threshold=decision_threshold,
                     sigma=sigma,
                     cfg_scale=cfg_scale,
                     width=width,
@@ -2177,7 +2268,7 @@ class Flux2TTRRuntime:
                         mask,
                         transformer_options,
                     )
-                use_full_attention = bool(float(controller_mask[layer_idx].item()) > float(controller_threshold))
+                use_full_attention = bool(float(controller_mask[layer_idx].item()) > float(decision_threshold))
             except Exception as exc:
                 logger.warning("Flux2TTR: controller evaluation failed on %s (%s); using teacher fallback.", layer_key, exc)
                 return teacher_out if teacher_out is not None else self._teacher_from_fallback(

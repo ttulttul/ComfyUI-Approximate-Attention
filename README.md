@@ -44,6 +44,7 @@ Inference:
 - Phase-1 TTR Comet logging now supports persistent experiments across ComfyUI sampling runs when `comet_experiment` is set, reusing the same Comet run key instead of ending at each cleanup.
 - Layer readiness now uses hysteresis (`exit = readiness_threshold * 1.2`) so layers do not flap at the readiness boundary.
 - Controller inference now logs per-step routing summaries (extracted sigma, controller threshold, and student-routed layer set) once per step.
+- `Flux2TTRController` supports `policy_mode` (`stochastic` or `threshold`). The default `stochastic` mode samples one controller mask per diffusion step (cached for all layer calls in that step) to match sigma-aware policy training behavior.
 
 ## Utility Nodes
 

@@ -105,3 +105,4 @@
 - ComfyUI run cleanup can fire after each sampled image; Phase-1 TTR Comet runs stay continuous across queued samplings only if runtime cleanup avoids calling `experiment.end()` and reuses a stable `experiment_key`.
 - Readiness gates are more stable with hysteresis: enter at `readiness_threshold`, but only exit above `readiness_threshold * 1.2`, which reduces layer-ready oscillation near the boundary.
 - Controller inference behavior is easiest to verify with one routing log per step that includes extracted sigma, threshold, and the student-routed layer set; per-layer creation logs alone are not sufficient.
+- Sigma-aware controller training is stochastic per diffusion step, so pure deterministic thresholding at inference can collapse to a fixed swap set across all sigmas; exposing stochastic per-step policy sampling in inference better matches the trained policy semantics.
