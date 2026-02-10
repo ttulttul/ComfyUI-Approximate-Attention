@@ -1432,6 +1432,8 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     runtime.steps_remaining = 7
     runtime.log_var_huber.data.fill_(0.23)
     runtime.log_var_cosine.data.fill_(-0.17)
+    runtime.layers["single:11"] = flux2_ttr.Flux2HKRAttnLayer(head_dim=4, feature_dim=runtime.feature_dim)
+    runtime.layers["single:11"].alpha.data.fill_(0.0)
     runtime.layer_ready["single:11"] = True
     runtime._record_training_metrics("single:11", {"loss": 0.5, "mse": 1.0, "nmse": 0.9, "cosine_similarity": 0.8, "ema_loss": 0.7})
     runtime._record_training_metrics("single:10", {"loss": 1.0, "mse": 2.0})
@@ -1443,6 +1445,7 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     assert step == 3
     assert payload["flux2ttr/single:11/loss"] == 0.5
     assert payload["flux2ttr/single:11/ema_cosine_dist"] == pytest.approx(0.2)
+    assert payload["flux2ttr/single:11/alpha_sigmoid"] == pytest.approx(0.5)
     assert payload["flux2ttr/single:10/loss"] == 1.0
     assert payload["flux2ttr/single:10/mse"] == 2.0
     assert payload["flux2ttr/single:10/avg_loss"] == 1.0

@@ -63,6 +63,7 @@ _COMET_AGG_METRICS = (
     "cosine_similarity",
     "ema_cosine_dist",
     "ema_loss",
+    "alpha_sigmoid",
     "sigma",
     "cfg_scale",
     "layers_swapped",
@@ -1731,6 +1732,13 @@ class Flux2TTRRuntime:
 
     def _record_training_metrics(self, layer_key: str, metrics: Dict[str, float]) -> None:
         payload_metrics = dict(metrics)
+        layer = self.layers.get(layer_key)
+        if layer is not None and hasattr(layer, "alpha"):
+            try:
+                payload_metrics["alpha_sigmoid"] = float(torch.sigmoid(layer.alpha.detach()).item())
+            except Exception:
+                pass
+
         cosine_similarity = payload_metrics.get("cosine_similarity")
         if cosine_similarity is not None and math.isfinite(float(cosine_similarity)):
             cosine_dist = self._cosine_distance_from_similarity(float(cosine_similarity))

@@ -47,6 +47,7 @@ Inference:
 - Phase-1 EMA accumulation also has a periodic fallback flush every 20 training updates so readiness/EMA progress continues even if sigma boundary detection does not fire.
 - Phase-1 replay training now uses learned uncertainty weighting across Smooth L1 and cosine-alignment tasks (`log_var_huber`, `log_var_cosine`) so neither objective dominates and the balance adapts during training.
 - Phase-1 Comet logging now emits learned loss-balance parameters as `flux2ttr/global/log_var_huber` and `flux2ttr/global/log_var_cosine` at each log tick.
+- Phase-1 Comet logging now emits per-layer `flux2ttr/<layer>/alpha_sigmoid` and cross-layer aggregates for adaptive alpha monitoring.
 - Loss-balance parameters are now rebuilt as normal trainable tensors if created under `torch.inference_mode()`, preventing Adam in-place update failures in ComfyUI runtime contexts.
 - Layer blend `alpha` is now stored in logit-space and interpreted through `sigmoid`; forward pass supports error-driven adaptive per-token alpha gating, and old raw-alpha checkpoints are auto-migrated on load.
 - Controller inference now logs per-step routing summaries (extracted sigma, controller threshold, and student-routed layer set) once per step.
