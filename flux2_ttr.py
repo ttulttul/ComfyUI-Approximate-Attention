@@ -1127,7 +1127,9 @@ class Flux2TTRRuntime:
     @staticmethod
     def _clone_state_to_cpu(value: Any) -> Any:
         if torch.is_tensor(value):
-            return value.detach().cpu()
+            # clone() strips inference-tensor metadata so restored states are
+            # safe for optimizer in-place updates outside inference mode.
+            return value.detach().clone().cpu()
         if isinstance(value, dict):
             return {k: Flux2TTRRuntime._clone_state_to_cpu(v) for k, v in value.items()}
         if isinstance(value, list):
@@ -1135,6 +1137,15 @@ class Flux2TTRRuntime:
         if isinstance(value, tuple):
             return tuple(Flux2TTRRuntime._clone_state_to_cpu(v) for v in value)
         return value
+
+    @staticmethod
+    def _is_inference_tensor(value: Any) -> bool:
+        if not torch.is_tensor(value):
+            return False
+        try:
+            return bool(value.is_inference())
+        except Exception:
+            return False
 
     @staticmethod
     def _extract_layer_index(layer_key: str) -> Optional[int]:
@@ -1532,6 +1543,8 @@ class Flux2TTRRuntime:
             for key, value in state.items():
                 if not torch.is_tensor(value):
                     continue
+                if self._is_inference_tensor(value):
+                    value = value.detach().clone()
                 if torch.is_floating_point(value):
                     state[key] = value.to(device=device, dtype=torch.float32)
                 else:
@@ -1546,18 +1559,49 @@ class Flux2TTRRuntime:
 
     def _ensure_layer(self, layer_key: str, head_dim: int, device: torch.device) -> Flux2HKRAttnLayer:
         layer = self.layers.get(layer_key)
+        if layer is not None:
+            has_inference_params = any(self._is_inference_tensor(p) for p in layer.parameters())
+            if has_inference_params:
+                logger.warning(
+                    "Flux2TTR: detected inference tensors in layer %s; rebuilding trainable layer/optimizer.",
+                    layer_key,
+                )
+                try:
+                    self.pending_state[layer_key] = {
+                        k: v.detach().clone().cpu()
+                        for k, v in layer.state_dict().items()
+                    }
+                except Exception as exc:
+                    logger.warning("Flux2TTR: failed to snapshot layer %s before rebuild (%s).", layer_key, exc)
+
+                stale_optimizer = self.optimizers.get(layer_key)
+                if stale_optimizer is not None:
+                    try:
+                        self.pending_optimizer_states[layer_key] = self._clone_state_to_cpu(stale_optimizer.state_dict())
+                    except Exception as exc:
+                        logger.warning("Flux2TTR: failed to snapshot optimizer state for %s (%s).", layer_key, exc)
+                    try:
+                        stale_optimizer.state.clear()
+                    except Exception:
+                        pass
+
+                self.layers.pop(layer_key, None)
+                self.optimizers.pop(layer_key, None)
+                layer = None
+
         if layer is None:
-            layer = Flux2HKRAttnLayer(
-                head_dim=head_dim,
-                feature_dim=self.feature_dim,
-                query_chunk_size=self.query_chunk_size,
-                key_chunk_size=self.key_chunk_size,
-                landmark_fraction=self.landmark_fraction,
-                landmark_min=self.landmark_min,
-                landmark_max=self.landmark_max,
-                text_tokens_guess=self.text_tokens_guess,
-                alpha_init=self.alpha_init,
-            ).to(device=device, dtype=torch.float32)
+            with torch.inference_mode(False):
+                layer = Flux2HKRAttnLayer(
+                    head_dim=head_dim,
+                    feature_dim=self.feature_dim,
+                    query_chunk_size=self.query_chunk_size,
+                    key_chunk_size=self.key_chunk_size,
+                    landmark_fraction=self.landmark_fraction,
+                    landmark_min=self.landmark_min,
+                    landmark_max=self.landmark_max,
+                    text_tokens_guess=self.text_tokens_guess,
+                    alpha_init=self.alpha_init,
+                ).to(device=device, dtype=torch.float32)
             self._sync_layer_landmark_config(layer)
             optimizer = self._ensure_optimizer(layer)
             pending = self.pending_state.get(layer_key)
@@ -1576,6 +1620,16 @@ class Flux2TTRRuntime:
                     optimizer.load_state_dict(pending_optimizer_state)
                 except Exception as exc:
                     logger.warning("Flux2TTR: failed to restore optimizer state for %s (%s).", layer_key, exc)
+            for state in optimizer.state.values():
+                for key, value in state.items():
+                    if not torch.is_tensor(value):
+                        continue
+                    if self._is_inference_tensor(value):
+                        value = value.detach().clone()
+                    if torch.is_floating_point(value):
+                        state[key] = value.to(device=device, dtype=torch.float32)
+                    else:
+                        state[key] = value.to(device=device)
             self.layers[layer_key] = layer
             self.optimizers[layer_key] = optimizer
             self.replay_buffers.setdefault(layer_key, deque())
@@ -1601,6 +1655,8 @@ class Flux2TTRRuntime:
             for state in optimizer.state.values():
                 for key, value in state.items():
                     if torch.is_tensor(value):
+                        if self._is_inference_tensor(value):
+                            value = value.detach().clone()
                         state[key] = value.to(device=device)
         return layer
 
@@ -1617,6 +1673,8 @@ class Flux2TTRRuntime:
             for key, value in state.items():
                 if not torch.is_tensor(value):
                     continue
+                if self._is_inference_tensor(value):
+                    value = value.detach().clone()
                 if torch.is_floating_point(value):
                     state[key] = value.to(device=device, dtype=target_dtype)
                 else:

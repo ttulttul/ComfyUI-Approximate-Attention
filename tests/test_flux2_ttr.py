@@ -28,6 +28,10 @@ def _optimizer_steps(optimizer: torch.optim.Optimizer) -> list[float]:
     return steps
 
 
+def _has_inference_params(module: torch.nn.Module) -> bool:
+    return any(bool(p.is_inference()) for p in module.parameters())
+
+
 class _DummyBlock:
     def __init__(self, num_heads: int, hidden_size: int):
         self.num_heads = num_heads
@@ -483,6 +487,59 @@ def test_loss_weight_optimizer_recovers_from_inference_tensors():
     loss = runtime.log_var_huber + runtime.log_var_cosine
     loss.backward()
     opt.step()
+
+
+def test_ensure_layer_constructs_trainable_layer_inside_inference_mode():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+    )
+    layer_key = "single:0"
+    with torch.inference_mode():
+        layer = runtime._ensure_layer(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
+
+    assert _has_inference_params(layer) is False
+
+
+def test_train_from_replay_rebuilds_stale_inference_layer():
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        train_steps_per_call=1,
+    )
+    layer_key = "single:0"
+
+    with torch.inference_mode():
+        stale_layer = flux2_ttr.Flux2HKRAttnLayer(head_dim=4, feature_dim=256).to(device="cpu", dtype=torch.float32)
+    assert _has_inference_params(stale_layer) is True
+
+    runtime.layers[layer_key] = stale_layer
+    runtime.optimizers[layer_key] = runtime._ensure_optimizer(stale_layer)
+    runtime.replay_buffers[layer_key] = deque(
+        [
+            flux2_ttr.ReplaySample(
+                q_sub=torch.randn(1, 2, 4, 4),
+                k_full=torch.randn(1, 2, 4, 4),
+                v_full=torch.randn(1, 2, 4, 4),
+                teacher_sub=torch.randn(1, 2, 4, 4),
+                key_mask=torch.ones(1, 4, dtype=torch.bool),
+                text_token_count=4,
+                conditioning_token_count=4,
+                sigma=0.5,
+                cfg_scale=1.0,
+            )
+        ]
+    )
+
+    runtime._train_from_replay(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
+
+    assert runtime.training_updates_done == 1
+    assert _has_inference_params(runtime.layers[layer_key]) is False
 
 
 def test_runtime_training_preview_uses_student_when_layer_ready():
