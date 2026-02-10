@@ -118,3 +118,4 @@
 - Including `log_var_huber`/`log_var_cosine` in periodic distill snapshot logs helps explain shifts in loss scale and readiness progression without opening Comet.
 - Cosine alignment in replay distillation and metric tracking should be computed per token/head over the feature axis (`dim=-1`), not on a fully flattened `[B, H*Nq*D]` vector, otherwise large-magnitude/easy regions can mask hard-token directional errors.
 - In multi-run ComfyUI execution, restoring only model weights is not enough for stable continuation; persisting/restoring AdamW optimizer states (layer optimizers and loss-weight optimizer) avoids per-run warmup regressions in learned loss-balance parameters.
+- With Kendall loss-weighting, initializing `log_var_cosine` lower than `log_var_huber` (e.g., `-1.0` vs `0.0`) gives cosine alignment stronger early influence before adaptive weighting equilibrates, which helps counter its sparser per-token directional gradient signal.

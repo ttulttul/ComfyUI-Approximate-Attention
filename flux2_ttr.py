@@ -34,6 +34,8 @@ _DEFAULT_TRAIN_QUERY_CAP = 128
 _DEFAULT_REPLAY_BUFFER = 8
 _DEFAULT_TRAIN_STEPS_PER_CALL = 1
 _DEFAULT_HUBER_BETA = 0.05
+_DEFAULT_LOSS_LOG_VAR_HUBER = 0.0
+_DEFAULT_LOSS_LOG_VAR_COSINE = -1.0
 _DEFAULT_READY_THRESHOLD = 0.12
 _DEFAULT_READY_MIN_UPDATES = 24
 _READINESS_HYSTERESIS = 1.2
@@ -834,8 +836,12 @@ class Flux2TTRRuntime:
         self.max_safe_inference_loss = float(_MAX_SAFE_INFERENCE_LOSS)
         self.last_loss = float("nan")
         with torch.inference_mode(False):
-            self.log_var_huber = nn.Parameter(torch.zeros(1, dtype=torch.float32))
-            self.log_var_cosine = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+            self.log_var_huber = nn.Parameter(
+                torch.full((1,), float(_DEFAULT_LOSS_LOG_VAR_HUBER), dtype=torch.float32)
+            )
+            self.log_var_cosine = nn.Parameter(
+                torch.full((1,), float(_DEFAULT_LOSS_LOG_VAR_COSINE), dtype=torch.float32)
+            )
         self.loss_weight_optimizer: Optional[torch.optim.Optimizer] = None
         self.pending_loss_weight_optimizer_state: Optional[Dict[str, Any]] = None
 
@@ -2762,15 +2768,15 @@ class Flux2TTRRuntime:
         self.comet_persist_experiment = bool(self.comet_persist_experiment and self.comet_experiment)
         self.comet_log_every = max(1, int(payload.get("comet_log_every", self.comet_log_every)))
         self.last_loss = float(payload.get("last_loss", self.last_loss))
-        log_var_huber = float(payload.get("loss_log_var_huber", 0.0))
+        log_var_huber = float(payload.get("loss_log_var_huber", _DEFAULT_LOSS_LOG_VAR_HUBER))
         if not math.isfinite(log_var_huber):
-            log_var_huber = 0.0
+            log_var_huber = _DEFAULT_LOSS_LOG_VAR_HUBER
         self.log_var_huber.data.fill_(float(log_var_huber))
         if self.log_var_huber.grad is not None:
             self.log_var_huber.grad.zero_()
-        log_var_cosine = float(payload.get("loss_log_var_cosine", 0.0))
+        log_var_cosine = float(payload.get("loss_log_var_cosine", _DEFAULT_LOSS_LOG_VAR_COSINE))
         if not math.isfinite(log_var_cosine):
-            log_var_cosine = 0.0
+            log_var_cosine = _DEFAULT_LOSS_LOG_VAR_COSINE
         self.log_var_cosine.data.fill_(float(log_var_cosine))
         if self.log_var_cosine.grad is not None:
             self.log_var_cosine.grad.zero_()

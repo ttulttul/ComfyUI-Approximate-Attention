@@ -426,9 +426,16 @@ def test_train_from_replay_loss_combines_huber_and_cosine(monkeypatch):
 
     assert seen_dims == [-1]
     assert seen_eps == [1e-8]
-    # With log-vars initialized at 0, each task is weighted by 1/2.
-    assert runtime.last_loss == pytest.approx(0.225)
-    assert runtime.layer_last_loss[layer_key] == pytest.approx(0.225)
+    log_var_h_init = 0.0
+    log_var_c_init = -1.0
+    expected = (
+        0.25 / (2.0 * math.exp(log_var_h_init))
+        + log_var_h_init / 2.0
+        + 0.2 / (2.0 * math.exp(log_var_c_init))
+        + log_var_c_init / 2.0
+    )
+    assert runtime.last_loss == pytest.approx(expected)
+    assert runtime.layer_last_loss[layer_key] == pytest.approx(expected)
     assert float(runtime.log_var_huber.item()) != pytest.approx(0.0)
     assert float(runtime.log_var_cosine.item()) != pytest.approx(0.0)
 
@@ -448,6 +455,12 @@ def test_compute_distill_metrics_uses_per_token_cosine_similarity():
 
     # Per-token cosine should average (1 + -1) / 2 = 0; flattening would be ~0.98.
     assert metrics["cosine_similarity"] == pytest.approx(0.0)
+
+
+def test_loss_log_var_initialization_biases_cosine_weight_higher():
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
+    assert float(runtime.log_var_huber.item()) == pytest.approx(0.0)
+    assert float(runtime.log_var_cosine.item()) == pytest.approx(-1.0)
 
 
 def test_loss_weight_optimizer_recovers_from_inference_tensors():
@@ -1320,6 +1333,31 @@ def test_load_checkpoint_old_landmark_count_falls_back_to_dynamic_defaults(tmp_p
     assert loaded.landmark_fraction == pytest.approx(0.08)
     assert loaded.landmark_min == 64
     assert loaded.landmark_max == 512
+
+
+def test_load_checkpoint_missing_loss_log_vars_uses_default_bias(tmp_path):
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+    )
+    payload = runtime.checkpoint_state()
+    payload.pop("loss_log_var_huber", None)
+    payload.pop("loss_log_var_cosine", None)
+
+    ckpt = tmp_path / "flux2_ttr_missing_loss_log_vars.pt"
+    torch.save(payload, ckpt)
+
+    loaded = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+    )
+    loaded.load_checkpoint(str(ckpt))
+    assert float(loaded.log_var_huber.item()) == pytest.approx(0.0)
+    assert float(loaded.log_var_cosine.item()) == pytest.approx(-1.0)
 
 
 def test_load_checkpoint_migrates_raw_alpha_to_logit_space(tmp_path):
