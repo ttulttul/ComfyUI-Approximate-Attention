@@ -1406,6 +1406,7 @@ def test_training_progress_logs_every_10_updates(caplog):
     assert "Flux2TTR distill snapshot: updates=10/10" in caplog.text
     assert "q25-q75 loss=" in caplog.text
     assert "ready_layers=" in caplog.text
+    assert "log_vars=(h=" in caplog.text
 
 
 def test_record_training_metrics_logs_to_comet(monkeypatch):

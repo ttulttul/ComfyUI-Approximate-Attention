@@ -951,14 +951,21 @@ class Flux2TTRRuntime:
 
     def _log_training_snapshot(self) -> None:
         latest = self._layer_metric_latest
+        log_var_h = float(self.log_var_huber.detach().cpu().item())
+        log_var_c = float(self.log_var_cosine.detach().cpu().item())
         if not latest:
             logger.info(
-                "Flux2TTR distill snapshot: updates=%d/%d remaining=%d tracked_layers=0 ready_layers=0 replay=%.1f/%.1fMB",
+                (
+                    "Flux2TTR distill snapshot: updates=%d/%d remaining=%d tracked_layers=0 "
+                    "ready_layers=0 replay=%.1f/%.1fMB log_vars=(h=%.6g c=%.6g)"
+                ),
                 self.training_updates_done,
                 max(self.training_steps_total, self.training_updates_done),
                 self.steps_remaining,
                 self.replay_total_bytes / (1024.0 * 1024.0),
                 self.replay_max_bytes / (1024.0 * 1024.0),
+                log_var_h,
+                log_var_c,
             )
             return
 
@@ -977,6 +984,7 @@ class Flux2TTRRuntime:
             (
                 "Flux2TTR distill snapshot: updates=%d/%d remaining=%d tracked_layers=%d "
                 "ready_layers=%d ready=[%s] replay=%.1f/%.1fMB "
+                "log_vars=(h=%.6g c=%.6g) "
                 "q25-q75 loss=%.6g..%.6g ema=%.6g..%.6g cosine=%.6g..%.6g nmse=%.6g..%.6g"
             ),
             self.training_updates_done,
@@ -987,6 +995,8 @@ class Flux2TTRRuntime:
             self._format_layer_list(ready_layers),
             self.replay_total_bytes / (1024.0 * 1024.0),
             self.replay_max_bytes / (1024.0 * 1024.0),
+            log_var_h,
+            log_var_c,
             loss_q25,
             loss_q75,
             ema_q25,
