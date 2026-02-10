@@ -105,6 +105,7 @@
 - ComfyUI run cleanup can fire after each sampled image; Phase-1 TTR Comet runs stay continuous across queued samplings only if runtime cleanup avoids calling `experiment.end()` and reuses a stable `experiment_key`.
 - Readiness gates are more stable with hysteresis: enter at `readiness_threshold`, but only exit above `readiness_threshold * 1.2`, which reduces layer-ready oscillation near the boundary.
 - With Kendall-weighted training loss, readiness should use `layer_ema_cosine_dist` instead of `layer_ema_loss`; cosine distance remains interpretable and aligned with quality gating.
+- Logging per-layer EMA values at each `flush_run_emas()` event gives direct visibility into readiness-gate inputs at run boundaries.
 - Controller inference behavior is easiest to verify with one routing log per step that includes extracted sigma, threshold, and the student-routed layer set; per-layer creation logs alone are not sufficient.
 - Sigma-aware controller training is stochastic per diffusion step, so pure deterministic thresholding at inference can collapse to a fixed swap set across all sigmas; exposing stochastic per-step policy sampling in inference better matches the trained policy semantics.
 - Deepening the HKR phi MLP from 2 to 3 linear layers and setting `hidden = max(head_dim, 2 * feature_dim)` (with split Q/K by default) increases kernel-map capacity at the cost of one extra hidden-by-hidden projection per network.

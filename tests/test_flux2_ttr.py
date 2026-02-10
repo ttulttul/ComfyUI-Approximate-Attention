@@ -1122,7 +1122,7 @@ def test_layer_readiness_hysteresis_prevents_boundary_oscillation():
     assert runtime._refresh_layer_ready(layer_key) is True
 
 
-def test_flush_run_emas_updates_from_run_means_and_refreshes_readiness():
+def test_flush_run_emas_updates_from_run_means_and_refreshes_readiness(caplog):
     runtime = flux2_ttr.Flux2TTRRuntime(
         feature_dim=256,
         learning_rate=1e-3,
@@ -1135,6 +1135,7 @@ def test_flush_run_emas_updates_from_run_means_and_refreshes_readiness():
     runtime.layer_update_count[layer_key] = 2
     runtime._run_ema_accum_loss[layer_key] = [0.2, 0.4]
     runtime._run_ema_accum_cosine_dist[layer_key] = [0.1, 0.3]
+    caplog.set_level(logging.INFO, logger="flux2_ttr")
 
     runtime.flush_run_emas()
 
@@ -1143,6 +1144,7 @@ def test_flush_run_emas_updates_from_run_means_and_refreshes_readiness():
     assert runtime.layer_ready[layer_key] is True
     assert runtime._run_ema_accum_loss == {}
     assert runtime._run_ema_accum_cosine_dist == {}
+    assert "Flux2TTR: flushed run EMAs layer=single:0" in caplog.text
 
 
 def test_detect_run_boundary_flushes_only_on_large_sigma_jump():

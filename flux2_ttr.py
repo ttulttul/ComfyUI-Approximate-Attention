@@ -1725,6 +1725,12 @@ class Flux2TTRRuntime:
 
         for layer_key in refreshed_layers:
             self._refresh_layer_ready(layer_key)
+            logger.info(
+                "Flux2TTR: flushed run EMAs layer=%s ema_loss=%.6g ema_cosine_dist=%.6g",
+                layer_key,
+                float(self.layer_ema_loss.get(layer_key, float("nan"))),
+                float(self.layer_ema_cosine_dist.get(layer_key, float("nan"))),
+            )
 
     def _detect_run_boundary(self, sigma: Optional[float]) -> None:
         """Detect when a new sampling run starts and flush accumulated EMAs.

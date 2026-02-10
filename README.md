@@ -45,6 +45,7 @@ Inference:
 - Layer readiness now gates on `layer_ema_cosine_dist` with hysteresis (`exit = readiness_threshold * 1.2`) so layers do not flap at the readiness boundary.
 - Phase-1 EMA updates for `ema_loss` and `ema_cosine_dist` are now flushed once per sampling run (run-mean on sigma boundary) instead of every train step, reducing prompt-to-prompt readiness oscillation.
 - Phase-1 EMA accumulation also has a periodic fallback flush every 20 training updates so readiness/EMA progress continues even if sigma boundary detection does not fire.
+- Each run-EMA flush now logs per-layer post-flush values (`ema_loss`, `ema_cosine_dist`) to the console for easier readiness debugging.
 - Phase-1 replay training now uses learned uncertainty weighting across Smooth L1 and cosine-alignment tasks (`log_var_huber`, `log_var_cosine`) so neither objective dominates and the balance adapts during training.
 - Phase-1 Comet logging now emits learned loss-balance parameters as `flux2ttr/global/log_var_huber` and `flux2ttr/global/log_var_cosine` at each log tick.
 - Phase-1 Comet logging now emits per-layer `flux2ttr/<layer>/alpha_sigmoid` and cross-layer aggregates for adaptive alpha monitoring.
