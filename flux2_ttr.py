@@ -809,6 +809,9 @@ class Flux2TTRRuntime:
 
         self.max_safe_inference_loss = float(_MAX_SAFE_INFERENCE_LOSS)
         self.last_loss = float("nan")
+        self.log_var_huber = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.log_var_cosine = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.loss_weight_optimizer: Optional[torch.optim.Optimizer] = None
 
         self.layers: Dict[str, Flux2HKRAttnLayer] = {}
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
@@ -999,6 +1002,17 @@ class Flux2TTRRuntime:
             except Exception:
                 pass
         self.optimizers.clear()
+        if self.loss_weight_optimizer is not None:
+            try:
+                self.loss_weight_optimizer.state.clear()
+            except Exception:
+                pass
+            self.loss_weight_optimizer = None
+        for param in (self.log_var_huber, self.log_var_cosine):
+            if param.device.type != "cpu":
+                param.data = param.data.to(device="cpu", dtype=torch.float32)
+            if param.grad is not None and param.grad.device.type != "cpu":
+                param.grad.data = param.grad.data.to(device="cpu", dtype=torch.float32)
 
         self.replay_buffers.clear()
         self.replay_total_bytes = 0
@@ -1412,6 +1426,32 @@ class Flux2TTRRuntime:
         if not groups:
             raise RuntimeError("Flux2TTR: no parameters available for optimizer.")
         return torch.optim.AdamW(groups)
+
+    def _ensure_loss_weight_optimizer(self, device: torch.device) -> torch.optim.Optimizer:
+        for param in (self.log_var_huber, self.log_var_cosine):
+            if param.device != device or param.dtype != torch.float32:
+                param.data = param.data.to(device=device, dtype=torch.float32)
+            if param.grad is not None and (param.grad.device != device or param.grad.dtype != torch.float32):
+                param.grad.data = param.grad.data.to(device=device, dtype=torch.float32)
+
+        if self.loss_weight_optimizer is None:
+            self.loss_weight_optimizer = torch.optim.AdamW(
+                [self.log_var_huber, self.log_var_cosine],
+                lr=self.learning_rate,
+            )
+            return self.loss_weight_optimizer
+
+        for group in self.loss_weight_optimizer.param_groups:
+            group["lr"] = float(self.learning_rate)
+        for state in self.loss_weight_optimizer.state.values():
+            for key, value in state.items():
+                if not torch.is_tensor(value):
+                    continue
+                if torch.is_floating_point(value):
+                    state[key] = value.to(device=device, dtype=torch.float32)
+                else:
+                    state[key] = value.to(device=device)
+        return self.loss_weight_optimizer
 
     def _sync_layer_landmark_config(self, layer: Flux2HKRAttnLayer) -> None:
         layer.landmark_fraction = max(0.0, min(1.0, float(self.landmark_fraction)))
@@ -2041,6 +2081,7 @@ class Flux2TTRRuntime:
         layer = self._ensure_layer(layer_key, head_dim, device)
         self._ensure_layer_device(layer, device)
         optimizer = self.optimizers[layer_key]
+        loss_weight_optimizer = self._ensure_loss_weight_optimizer(device)
         self._set_layer_dtype(layer_key, layer, torch.float32)
         self._ensure_layer_device(layer, device)
         layer.train()
@@ -2070,13 +2111,21 @@ class Flux2TTRRuntime:
             student_flat = student_sub.reshape(student_sub.shape[0], -1)
             teacher_flat = teacher_sub.reshape(teacher_sub.shape[0], -1)
             cosine_sim = F.cosine_similarity(student_flat, teacher_flat, dim=1, eps=1e-8).mean()
-            loss = huber + (1.0 - cosine_sim)
+            cosine_term = 1.0 - cosine_sim
+            loss = (
+                huber / (2.0 * self.log_var_huber.exp())
+                + self.log_var_huber / 2.0
+                + cosine_term / (2.0 * self.log_var_cosine.exp())
+                + self.log_var_cosine / 2.0
+            )
 
             optimizer.zero_grad(set_to_none=True)
+            loss_weight_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if self.grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(layer.parameters(), self.grad_clip_norm)
             optimizer.step()
+            loss_weight_optimizer.step()
 
             loss_value = float(loss.item())
             self.last_loss = loss_value
@@ -2518,6 +2567,8 @@ class Flux2TTRRuntime:
             "comet_experiment": self.comet_experiment,
             "comet_persist_experiment": self.comet_persist_experiment,
             "last_loss": self.last_loss,
+            "loss_log_var_huber": float(self.log_var_huber.detach().cpu().item()),
+            "loss_log_var_cosine": float(self.log_var_cosine.detach().cpu().item()),
             "query_chunk_size": self.query_chunk_size,
             "key_chunk_size": self.key_chunk_size,
             "landmark_fraction": self.landmark_fraction,
@@ -2594,6 +2645,24 @@ class Flux2TTRRuntime:
         self.comet_persist_experiment = bool(self.comet_persist_experiment and self.comet_experiment)
         self.comet_log_every = max(1, int(payload.get("comet_log_every", self.comet_log_every)))
         self.last_loss = float(payload.get("last_loss", self.last_loss))
+        log_var_huber = float(payload.get("loss_log_var_huber", 0.0))
+        if not math.isfinite(log_var_huber):
+            log_var_huber = 0.0
+        self.log_var_huber.data.fill_(float(log_var_huber))
+        if self.log_var_huber.grad is not None:
+            self.log_var_huber.grad.zero_()
+        log_var_cosine = float(payload.get("loss_log_var_cosine", 0.0))
+        if not math.isfinite(log_var_cosine):
+            log_var_cosine = 0.0
+        self.log_var_cosine.data.fill_(float(log_var_cosine))
+        if self.log_var_cosine.grad is not None:
+            self.log_var_cosine.grad.zero_()
+        if self.loss_weight_optimizer is not None:
+            try:
+                self.loss_weight_optimizer.state.clear()
+            except Exception:
+                pass
+            self.loss_weight_optimizer = None
 
         self.query_chunk_size = max(1, int(payload.get("query_chunk_size", self.query_chunk_size)))
         self.key_chunk_size = max(1, int(payload.get("key_chunk_size", self.key_chunk_size)))

@@ -45,7 +45,7 @@ Inference:
 - Layer readiness now uses hysteresis (`exit = readiness_threshold * 1.2`) so layers do not flap at the readiness boundary.
 - Phase-1 EMA updates for `ema_loss` and `ema_cosine_dist` are now flushed once per sampling run (run-mean on sigma boundary) instead of every train step, reducing prompt-to-prompt readiness oscillation.
 - Phase-1 EMA accumulation also has a periodic fallback flush every 20 training updates so readiness/EMA progress continues even if sigma boundary detection does not fire.
-- Phase-1 replay training now optimizes a composite objective `smooth_l1 + (1 - cosine_similarity)` so the student is trained directly on both magnitude and directional alignment.
+- Phase-1 replay training now uses learned uncertainty weighting across Smooth L1 and cosine-alignment tasks (`log_var_huber`, `log_var_cosine`) so neither objective dominates and the balance adapts during training.
 - Controller inference now logs per-step routing summaries (extracted sigma, controller threshold, and student-routed layer set) once per step.
 - `Flux2TTRController` supports `policy_mode` (`stochastic` or `threshold`). The default `stochastic` mode samples one controller mask per diffusion step (cached for all layer calls in that step) to match sigma-aware policy training behavior.
 - The HKR phi feature map MLP now uses split Q/K networks by default and a 3-layer shape (`head_dim -> hidden -> hidden -> feature_dim`) with two SiLU activations, where `hidden = max(head_dim, 2 * feature_dim)`, increasing kernel expressivity versus the previous 2-layer mapping.

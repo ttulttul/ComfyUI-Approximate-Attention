@@ -359,8 +359,11 @@ def test_train_from_replay_loss_combines_huber_and_cosine(monkeypatch):
     runtime._train_from_replay(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
 
     assert seen_eps == [1e-8]
-    assert runtime.last_loss == pytest.approx(0.45)
-    assert runtime.layer_last_loss[layer_key] == pytest.approx(0.45)
+    # With log-vars initialized at 0, each task is weighted by 1/2.
+    assert runtime.last_loss == pytest.approx(0.225)
+    assert runtime.layer_last_loss[layer_key] == pytest.approx(0.225)
+    assert float(runtime.log_var_huber.item()) != pytest.approx(0.0)
+    assert float(runtime.log_var_cosine.item()) != pytest.approx(0.0)
 
 
 def test_runtime_training_preview_uses_student_when_layer_ready():
@@ -918,6 +921,8 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
         return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
 
     runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    runtime.log_var_huber.data.fill_(0.23)
+    runtime.log_var_cosine.data.fill_(-0.17)
 
     ckpt = tmp_path / "flux2_ttr_v2.pt"
     runtime.save_checkpoint(str(ckpt))
@@ -939,6 +944,8 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
     assert runtime_loaded.max_swap_layers == 5
     assert runtime_loaded.comet_experiment == "exp_persist_123"
     assert runtime_loaded.comet_persist_experiment is True
+    assert float(runtime_loaded.log_var_huber.item()) == pytest.approx(0.23)
+    assert float(runtime_loaded.log_var_cosine.item()) == pytest.approx(-0.17)
 
 
 def test_checkpoint_state_includes_per_layer_readiness_criteria():
