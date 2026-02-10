@@ -837,10 +837,12 @@ class Flux2TTRRuntime:
             self.log_var_huber = nn.Parameter(torch.zeros(1, dtype=torch.float32))
             self.log_var_cosine = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self.loss_weight_optimizer: Optional[torch.optim.Optimizer] = None
+        self.pending_loss_weight_optimizer_state: Optional[Dict[str, Any]] = None
 
         self.layers: Dict[str, Flux2HKRAttnLayer] = {}
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
         self.pending_state: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.pending_optimizer_states: Dict[str, Dict[str, Any]] = {}
         self.layer_specs: Dict[str, FluxLayerSpec] = {}
         self.replay_buffers: Dict[str, Deque[ReplaySample]] = {}
         self.layer_ema_loss: Dict[str, float] = {}
@@ -1043,6 +1045,8 @@ class Flux2TTRRuntime:
             except Exception:
                 pass
             self.loss_weight_optimizer = None
+        self.pending_optimizer_states.clear()
+        self.pending_loss_weight_optimizer_state = None
         for param in (self.log_var_huber, self.log_var_cosine):
             if param.device.type != "cpu":
                 param.data = param.data.to(device="cpu", dtype=torch.float32)
@@ -1113,6 +1117,18 @@ class Flux2TTRRuntime:
                 return None
             return Flux2TTRRuntime._as_float(value[0])
         return None
+
+    @staticmethod
+    def _clone_state_to_cpu(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {k: Flux2TTRRuntime._clone_state_to_cpu(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [Flux2TTRRuntime._clone_state_to_cpu(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(Flux2TTRRuntime._clone_state_to_cpu(v) for v in value)
+        return value
 
     @staticmethod
     def _extract_layer_index(layer_key: str) -> Optional[int]:
@@ -1496,7 +1512,13 @@ class Flux2TTRRuntime:
                 [self.log_var_huber, self.log_var_cosine],
                 lr=self.learning_rate,
             )
-            return self.loss_weight_optimizer
+        pending_state = self.pending_loss_weight_optimizer_state
+        if isinstance(pending_state, dict):
+            try:
+                self.loss_weight_optimizer.load_state_dict(pending_state)
+            except Exception as exc:
+                logger.warning("Flux2TTR: failed to restore loss-weight optimizer state (%s).", exc)
+            self.pending_loss_weight_optimizer_state = None
 
         for group in self.loss_weight_optimizer.param_groups:
             group["lr"] = float(self.learning_rate)
@@ -1542,6 +1564,12 @@ class Flux2TTRRuntime:
                         missing,
                         unexpected,
                     )
+            pending_optimizer_state = self.pending_optimizer_states.pop(layer_key, None)
+            if isinstance(pending_optimizer_state, dict):
+                try:
+                    optimizer.load_state_dict(pending_optimizer_state)
+                except Exception as exc:
+                    logger.warning("Flux2TTR: failed to restore optimizer state for %s (%s).", layer_key, exc)
             self.layers[layer_key] = layer
             self.optimizers[layer_key] = optimizer
             self.replay_buffers.setdefault(layer_key, deque())
@@ -2606,6 +2634,25 @@ class Flux2TTRRuntime:
             if layer_key not in layer_states:
                 layer_states[layer_key] = state
 
+        optimizer_states: Dict[str, Dict[str, Any]] = {}
+        for layer_key, state in self.pending_optimizer_states.items():
+            if isinstance(state, dict):
+                optimizer_states[layer_key] = self._clone_state_to_cpu(state)
+        for layer_key, optimizer in self.optimizers.items():
+            try:
+                optimizer_states[layer_key] = self._clone_state_to_cpu(optimizer.state_dict())
+            except Exception as exc:
+                logger.warning("Flux2TTR: failed to serialize optimizer state for %s (%s).", layer_key, exc)
+
+        loss_weight_optimizer_state: Optional[Dict[str, Any]] = None
+        if isinstance(self.pending_loss_weight_optimizer_state, dict):
+            loss_weight_optimizer_state = self._clone_state_to_cpu(self.pending_loss_weight_optimizer_state)
+        if self.loss_weight_optimizer is not None:
+            try:
+                loss_weight_optimizer_state = self._clone_state_to_cpu(self.loss_weight_optimizer.state_dict())
+            except Exception as exc:
+                logger.warning("Flux2TTR: failed to serialize loss-weight optimizer state (%s).", exc)
+
         readiness_keys = set(layer_states.keys())
         readiness_keys.update(self.layer_specs.keys())
         readiness_keys.update(self.layer_ema_loss.keys())
@@ -2676,6 +2723,8 @@ class Flux2TTRRuntime:
             "layer_last_loss": dict(self.layer_last_loss),
             "layer_readiness": layer_readiness,
             "layers": layer_states,
+            "optimizer_states": optimizer_states,
+            "loss_weight_optimizer_state": loss_weight_optimizer_state,
         }
 
     def save_checkpoint(self, checkpoint_path: str) -> None:
@@ -2731,6 +2780,11 @@ class Flux2TTRRuntime:
             except Exception:
                 pass
             self.loss_weight_optimizer = None
+        pending_loss_weight_optimizer_state = payload.get("loss_weight_optimizer_state")
+        if isinstance(pending_loss_weight_optimizer_state, dict):
+            self.pending_loss_weight_optimizer_state = pending_loss_weight_optimizer_state
+        else:
+            self.pending_loss_weight_optimizer_state = None
 
         self.query_chunk_size = max(1, int(payload.get("query_chunk_size", self.query_chunk_size)))
         self.key_chunk_size = max(1, int(payload.get("key_chunk_size", self.key_chunk_size)))
@@ -2796,6 +2850,12 @@ class Flux2TTRRuntime:
         self.layer_update_count = {str(k): int(v) for k, v in payload.get("layer_update_count", {}).items()}
         self.layer_ready = {str(k): bool(v) for k, v in payload.get("layer_ready", {}).items()}
         self.layer_last_loss = {str(k): float(v) for k, v in payload.get("layer_last_loss", {}).items()}
+        self.pending_optimizer_states = {}
+        raw_optimizer_states = payload.get("optimizer_states", {})
+        if isinstance(raw_optimizer_states, dict):
+            for layer_key, state in raw_optimizer_states.items():
+                if isinstance(state, dict):
+                    self.pending_optimizer_states[str(layer_key)] = state
         self.layer_readiness_threshold = {}
         self.layer_readiness_min_updates = {}
         for layer_key, meta in payload.get("layer_readiness", {}).items():
@@ -2844,6 +2904,14 @@ class Flux2TTRRuntime:
             pending = self.pending_state.get(layer_key)
             if pending:
                 layer.load_state_dict(pending, strict=False)
+            pending_optimizer_state = self.pending_optimizer_states.pop(layer_key, None)
+            if isinstance(pending_optimizer_state, dict):
+                optimizer = self.optimizers.get(layer_key)
+                if optimizer is not None:
+                    try:
+                        optimizer.load_state_dict(pending_optimizer_state)
+                    except Exception as exc:
+                        logger.warning("Flux2TTR: failed to restore optimizer state for %s (%s).", layer_key, exc)
 
         for layer_key in set(list(self.layer_update_count.keys()) + list(self.layer_ema_loss.keys())):
             self._refresh_layer_ready(layer_key)

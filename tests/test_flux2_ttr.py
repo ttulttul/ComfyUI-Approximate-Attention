@@ -15,6 +15,19 @@ def _baseline_flat(q, k, v, mask=None):
     return flux2_ttr._flatten_heads(flux2_ttr._softmax_attention(q.float(), k.float(), v.float(), mask=mask).to(dtype=v.dtype))
 
 
+def _optimizer_steps(optimizer: torch.optim.Optimizer) -> list[float]:
+    steps: list[float] = []
+    for state in optimizer.state.values():
+        step = state.get("step")
+        if torch.is_tensor(step):
+            steps.append(float(step.item()))
+            continue
+        if step is not None:
+            steps.append(float(step))
+    steps.sort()
+    return steps
+
+
 class _DummyBlock:
     def __init__(self, num_heads: int, hidden_size: int):
         self.num_heads = num_heads
@@ -1038,6 +1051,7 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
     assert runtime_loaded.pending_state
     assert "single:0" in runtime_loaded.pending_state
     assert "single:0" in runtime_loaded.layer_update_count
+    assert runtime_loaded.layer_update_count["single:0"] == runtime.layer_update_count["single:0"]
     assert "single:0" in runtime_loaded.layer_ema_loss
     assert "single:0" in runtime_loaded.layer_ema_cosine_dist
     assert runtime_loaded.landmark_fraction == pytest.approx(0.12)
@@ -1050,6 +1064,63 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
     assert runtime_loaded.comet_persist_experiment is True
     assert float(runtime_loaded.log_var_huber.item()) == pytest.approx(0.23)
     assert float(runtime_loaded.log_var_cosine.item()) == pytest.approx(-0.17)
+
+
+def test_checkpoint_round_trip_restores_optimizer_states(tmp_path):
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        train_steps_per_call=1,
+    )
+    layer_key = "single:0"
+    runtime.replay_buffers[layer_key] = deque(
+        [
+            flux2_ttr.ReplaySample(
+                q_sub=torch.randn(1, 2, 4, 4),
+                k_full=torch.randn(1, 2, 4, 4),
+                v_full=torch.randn(1, 2, 4, 4),
+                teacher_sub=torch.randn(1, 2, 4, 4),
+                key_mask=torch.ones(1, 4, dtype=torch.bool),
+                text_token_count=4,
+                conditioning_token_count=4,
+                sigma=0.5,
+                cfg_scale=1.0,
+            )
+        ]
+    )
+
+    runtime._train_from_replay(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
+    assert runtime.loss_weight_optimizer is not None
+
+    layer_steps_before = _optimizer_steps(runtime.optimizers[layer_key])
+    loss_steps_before = _optimizer_steps(runtime.loss_weight_optimizer)
+    assert layer_steps_before
+    assert loss_steps_before
+
+    ckpt = tmp_path / "flux2_ttr_optimizer_state.pt"
+    runtime.save_checkpoint(str(ckpt))
+
+    payload = torch.load(ckpt, map_location="cpu")
+    assert layer_key in payload["optimizer_states"]
+    assert isinstance(payload["loss_weight_optimizer_state"], dict)
+
+    loaded = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    loaded.load_checkpoint(str(ckpt))
+    assert layer_key in loaded.pending_optimizer_states
+    assert isinstance(loaded.pending_loss_weight_optimizer_state, dict)
+
+    loaded._ensure_layer(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
+    loss_weight_opt = loaded._ensure_loss_weight_optimizer(torch.device("cpu"))
+
+    layer_steps_after = _optimizer_steps(loaded.optimizers[layer_key])
+    loss_steps_after = _optimizer_steps(loss_weight_opt)
+    assert layer_steps_after == pytest.approx(layer_steps_before)
+    assert loss_steps_after == pytest.approx(loss_steps_before)
+    assert layer_key not in loaded.pending_optimizer_states
+    assert loaded.pending_loss_weight_optimizer_state is None
 
 
 def test_checkpoint_state_includes_per_layer_readiness_criteria():

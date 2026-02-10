@@ -117,3 +117,4 @@
 - For adaptive-alpha observability, logging `alpha_sigmoid` per layer to Comet (plus global quantiles) makes it easier to detect saturation/collapse trends during long distillation runs.
 - Including `log_var_huber`/`log_var_cosine` in periodic distill snapshot logs helps explain shifts in loss scale and readiness progression without opening Comet.
 - Cosine alignment in replay distillation and metric tracking should be computed per token/head over the feature axis (`dim=-1`), not on a fully flattened `[B, H*Nq*D]` vector, otherwise large-magnitude/easy regions can mask hard-token directional errors.
+- In multi-run ComfyUI execution, restoring only model weights is not enough for stable continuation; persisting/restoring AdamW optimizer states (layer optimizers and loss-weight optimizer) avoids per-run warmup regressions in learned loss-balance parameters.
