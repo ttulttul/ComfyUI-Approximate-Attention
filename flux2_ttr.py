@@ -1880,7 +1880,7 @@ class Flux2TTRRuntime:
 
     def _refresh_layer_ready(self, layer_key: str) -> bool:
         updates = int(self.layer_update_count.get(layer_key, 0))
-        ema = float(self.layer_ema_loss.get(layer_key, float("inf")))
+        ema = float(self.layer_ema_cosine_dist.get(layer_key, float("inf")))
         threshold = float(self.layer_readiness_threshold.get(layer_key, self.readiness_threshold))
         min_updates = int(self.layer_readiness_min_updates.get(layer_key, self.readiness_min_updates))
         if layer_key not in self.layer_readiness_threshold:

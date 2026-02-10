@@ -484,6 +484,7 @@ def test_runtime_inference_propagates_conditioning_token_count_to_layer():
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
     runtime.layer_update_count["single:0"] = 1
     runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ema_cosine_dist["single:0"] = 0.0
 
     q = torch.randn(1, 2, 7, 4)
     k = torch.randn(1, 2, 12, 4)
@@ -584,9 +585,11 @@ def test_runtime_inference_controller_mask_routes_teacher_vs_student(monkeypatch
     )
     runtime.layer_update_count["single:0"] = 99
     runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ema_cosine_dist["single:0"] = 0.0
     runtime.layer_ready["single:0"] = True
     runtime.layer_update_count["single:1"] = 99
     runtime.layer_ema_loss["single:1"] = 0.0
+    runtime.layer_ema_cosine_dist["single:1"] = 0.0
     runtime.layer_ready["single:1"] = True
 
     q = torch.randn(1, 2, 6, 4)
@@ -637,6 +640,7 @@ def test_runtime_inference_controller_logs_routing_once_per_step(monkeypatch, ca
     for key in ("single:0", "single:1", "single:2"):
         runtime.layer_update_count[key] = 99
         runtime.layer_ema_loss[key] = 0.0
+        runtime.layer_ema_cosine_dist[key] = 0.0
         runtime.layer_ready[key] = True
 
     q = torch.randn(1, 2, 6, 4)
@@ -710,9 +714,11 @@ def test_runtime_inference_controller_mask_override_routes_without_controller_ca
     )
     runtime.layer_update_count["single:0"] = 99
     runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ema_cosine_dist["single:0"] = 0.0
     runtime.layer_ready["single:0"] = True
     runtime.layer_update_count["single:1"] = 99
     runtime.layer_ema_loss["single:1"] = 0.0
+    runtime.layer_ema_cosine_dist["single:1"] = 0.0
     runtime.layer_ready["single:1"] = True
 
     q = torch.randn(1, 2, 6, 4)
@@ -761,6 +767,7 @@ def test_runtime_inference_controller_threshold_is_configurable(monkeypatch):
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
     runtime.layer_update_count["single:0"] = 99
     runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ema_cosine_dist["single:0"] = 0.0
     runtime.layer_ready["single:0"] = True
 
     q = torch.randn(1, 2, 6, 4)
@@ -817,9 +824,11 @@ def test_runtime_inference_controller_stochastic_policy_samples_once_per_step(mo
     )
     runtime.layer_update_count["single:0"] = 99
     runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ema_cosine_dist["single:0"] = 0.0
     runtime.layer_ready["single:0"] = True
     runtime.layer_update_count["single:1"] = 99
     runtime.layer_ema_loss["single:1"] = 0.0
+    runtime.layer_ema_cosine_dist["single:1"] = 0.0
     runtime.layer_ready["single:1"] = True
 
     q = torch.randn(1, 2, 6, 4)
@@ -915,6 +924,7 @@ def test_runtime_unsupported_mask_falls_back_to_teacher():
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
     runtime.layer_update_count["single:0"] = 999
     runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ema_cosine_dist["single:0"] = 0.0
     runtime.layer_ready["single:0"] = True
 
     q = torch.randn(1, 2, 6, 4)
@@ -943,6 +953,7 @@ def test_high_loss_inference_falls_back_to_teacher():
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
     runtime.layer_update_count["single:0"] = 999
     runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ema_cosine_dist["single:0"] = 0.0
     runtime.layer_ready["single:0"] = True
     runtime.last_loss = 10.0
     runtime.max_safe_inference_loss = 0.5
@@ -1031,6 +1042,7 @@ def test_checkpoint_state_includes_per_layer_readiness_criteria():
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
     runtime.layer_update_count["single:0"] = 5
     runtime.layer_ema_loss["single:0"] = 0.1
+    runtime.layer_ema_cosine_dist["single:0"] = 0.1
     runtime.layer_readiness_threshold["single:0"] = 0.2
     runtime.layer_readiness_min_updates["single:0"] = 4
     runtime._refresh_layer_ready("single:0")
@@ -1056,6 +1068,7 @@ def test_load_checkpoint_restores_per_layer_readiness_thresholds(tmp_path):
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
     runtime.layer_update_count["single:0"] = 5
     runtime.layer_ema_loss["single:0"] = 0.1
+    runtime.layer_ema_cosine_dist["single:0"] = 0.1
     runtime.layer_readiness_threshold["single:0"] = 0.05
     runtime.layer_readiness_min_updates["single:0"] = 3
     runtime._refresh_layer_ready("single:0")
@@ -1091,21 +1104,21 @@ def test_layer_readiness_hysteresis_prevents_boundary_oscillation():
     runtime.layer_update_count[layer_key] = 10
     runtime.layer_readiness_threshold[layer_key] = 0.1
 
-    runtime.layer_ema_loss[layer_key] = 0.095
+    runtime.layer_ema_cosine_dist[layer_key] = 0.095
     assert runtime._refresh_layer_ready(layer_key) is True
 
     # Above entry threshold but below hysteresis-adjusted exit threshold: stays ready.
-    runtime.layer_ema_loss[layer_key] = 0.11
+    runtime.layer_ema_cosine_dist[layer_key] = 0.11
     assert runtime._refresh_layer_ready(layer_key) is True
 
     # Above exit threshold (0.1 * 1.2): loses readiness.
-    runtime.layer_ema_loss[layer_key] = 0.121
+    runtime.layer_ema_cosine_dist[layer_key] = 0.121
     assert runtime._refresh_layer_ready(layer_key) is False
 
     # Re-entry still requires crossing the original readiness threshold.
-    runtime.layer_ema_loss[layer_key] = 0.11
+    runtime.layer_ema_cosine_dist[layer_key] = 0.11
     assert runtime._refresh_layer_ready(layer_key) is False
-    runtime.layer_ema_loss[layer_key] = 0.099
+    runtime.layer_ema_cosine_dist[layer_key] = 0.099
     assert runtime._refresh_layer_ready(layer_key) is True
 
 
@@ -1298,6 +1311,7 @@ def test_recover_runtime_from_config_inference_overrides_checkpoint_mode(tmp_pat
     )
     runtime_train.layer_update_count["single:0"] = 48
     runtime_train.layer_ema_loss["single:0"] = 0.03
+    runtime_train.layer_ema_cosine_dist["single:0"] = 0.03
     runtime_train.layer_ready["single:0"] = True
 
     ckpt = tmp_path / "flux2_ttr_recover_mode.pt"

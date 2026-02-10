@@ -42,7 +42,7 @@ Inference:
 - Runtime accepts conditioning token hints through `transformer_options` keys: `conditioning_token_count`, `cond_token_count`, or `prefix_token_count`.
 - Comet logging now emits latest per-layer metrics for all tracked layers at each log tick, plus `flux2ttr/global/pareto_frontier` for ready-layer quality/coverage tracking.
 - Phase-1 TTR Comet logging now supports persistent experiments across ComfyUI sampling runs when `comet_experiment` is set, reusing the same Comet run key instead of ending at each cleanup.
-- Layer readiness now uses hysteresis (`exit = readiness_threshold * 1.2`) so layers do not flap at the readiness boundary.
+- Layer readiness now gates on `layer_ema_cosine_dist` with hysteresis (`exit = readiness_threshold * 1.2`) so layers do not flap at the readiness boundary.
 - Phase-1 EMA updates for `ema_loss` and `ema_cosine_dist` are now flushed once per sampling run (run-mean on sigma boundary) instead of every train step, reducing prompt-to-prompt readiness oscillation.
 - Phase-1 EMA accumulation also has a periodic fallback flush every 20 training updates so readiness/EMA progress continues even if sigma boundary detection does not fire.
 - Phase-1 replay training now uses learned uncertainty weighting across Smooth L1 and cosine-alignment tasks (`log_var_huber`, `log_var_cosine`) so neither objective dominates and the balance adapts during training.
