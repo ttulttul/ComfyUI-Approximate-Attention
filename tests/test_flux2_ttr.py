@@ -366,6 +366,28 @@ def test_train_from_replay_loss_combines_huber_and_cosine(monkeypatch):
     assert float(runtime.log_var_cosine.item()) != pytest.approx(0.0)
 
 
+def test_loss_weight_optimizer_recovers_from_inference_tensors():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+    )
+
+    with torch.inference_mode():
+        runtime.log_var_huber = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        runtime.log_var_cosine = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+    opt = runtime._ensure_loss_weight_optimizer(torch.device("cpu"))
+    assert not runtime.log_var_huber.is_inference()
+    assert not runtime.log_var_cosine.is_inference()
+
+    opt.zero_grad(set_to_none=True)
+    loss = runtime.log_var_huber + runtime.log_var_cosine
+    loss.backward()
+    opt.step()
+
+
 def test_runtime_training_preview_uses_student_when_layer_ready():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(
@@ -1330,6 +1352,8 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     )
     runtime.training_updates_done = 3
     runtime.steps_remaining = 7
+    runtime.log_var_huber.data.fill_(0.23)
+    runtime.log_var_cosine.data.fill_(-0.17)
     runtime.layer_ready["single:11"] = True
     runtime._record_training_metrics("single:11", {"loss": 0.5, "mse": 1.0, "nmse": 0.9, "cosine_similarity": 0.8, "ema_loss": 0.7})
     runtime._record_training_metrics("single:10", {"loss": 1.0, "mse": 2.0})
@@ -1347,6 +1371,8 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     assert payload["flux2ttr/single:10/avg_mse"] == 2.0
     assert payload["flux2ttr/global/steps_remaining"] == 7.0
     assert payload["flux2ttr/global/updates_done"] == 3.0
+    assert payload["flux2ttr/global/log_var_huber"] == pytest.approx(0.23)
+    assert payload["flux2ttr/global/log_var_cosine"] == pytest.approx(-0.17)
     assert payload["flux2ttr/global/layers_tracked"] == 2.0
     assert payload["flux2ttr/global/layers_ready"] == 1.0
     assert payload["flux2ttr/global/layers_ready_ratio"] == 0.5

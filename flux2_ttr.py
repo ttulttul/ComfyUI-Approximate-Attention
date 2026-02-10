@@ -809,8 +809,9 @@ class Flux2TTRRuntime:
 
         self.max_safe_inference_loss = float(_MAX_SAFE_INFERENCE_LOSS)
         self.last_loss = float("nan")
-        self.log_var_huber = nn.Parameter(torch.zeros(1, dtype=torch.float32))
-        self.log_var_cosine = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        with torch.inference_mode(False):
+            self.log_var_huber = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+            self.log_var_cosine = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self.loss_weight_optimizer: Optional[torch.optim.Optimizer] = None
 
         self.layers: Dict[str, Flux2HKRAttnLayer] = {}
@@ -1428,11 +1429,33 @@ class Flux2TTRRuntime:
         return torch.optim.AdamW(groups)
 
     def _ensure_loss_weight_optimizer(self, device: torch.device) -> torch.optim.Optimizer:
-        for param in (self.log_var_huber, self.log_var_cosine):
+        rebuilt = False
+        for attr_name in ("log_var_huber", "log_var_cosine"):
+            param = getattr(self, attr_name)
+            is_inference = False
+            try:
+                is_inference = bool(param.is_inference())
+            except Exception:
+                is_inference = False
+            if is_inference:
+                with torch.inference_mode(False):
+                    new_param = nn.Parameter(param.detach().clone().to(device=device, dtype=torch.float32))
+                if param.grad is not None:
+                    new_param.grad = param.grad.detach().clone().to(device=device, dtype=torch.float32)
+                setattr(self, attr_name, new_param)
+                rebuilt = True
+                continue
             if param.device != device or param.dtype != torch.float32:
                 param.data = param.data.to(device=device, dtype=torch.float32)
             if param.grad is not None and (param.grad.device != device or param.grad.dtype != torch.float32):
                 param.grad.data = param.grad.data.to(device=device, dtype=torch.float32)
+
+        if rebuilt and self.loss_weight_optimizer is not None:
+            try:
+                self.loss_weight_optimizer.state.clear()
+            except Exception:
+                pass
+            self.loss_weight_optimizer = None
 
         if self.loss_weight_optimizer is None:
             self.loss_weight_optimizer = torch.optim.AdamW(
@@ -1725,6 +1748,8 @@ class Flux2TTRRuntime:
             payload[f"flux2ttr/{layer_key}/avg_{key}"] = float(value)
         payload["flux2ttr/global/steps_remaining"] = float(self.steps_remaining)
         payload["flux2ttr/global/updates_done"] = float(self.training_updates_done)
+        payload["flux2ttr/global/log_var_huber"] = float(self.log_var_huber.detach().cpu().item())
+        payload["flux2ttr/global/log_var_cosine"] = float(self.log_var_cosine.detach().cpu().item())
 
         # Cross-layer aggregate distributions (latest values per layer).
         if tracked_layers:
