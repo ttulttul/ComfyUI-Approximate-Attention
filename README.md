@@ -47,6 +47,7 @@ Inference:
 - Phase-1 EMA accumulation also has a periodic fallback flush every 20 training updates so readiness/EMA progress continues even if sigma boundary detection does not fire.
 - Each run-EMA flush now logs per-layer post-flush values (`ema_loss`, `ema_cosine_dist`) to the console for easier readiness debugging.
 - Phase-1 replay training now uses learned uncertainty weighting across Smooth L1 and cosine-alignment tasks (`log_var_huber`, `log_var_cosine`) so neither objective dominates and the balance adapts during training.
+- Phase-1 cosine alignment now computes per-token/per-head similarity over head dimension (`dim=-1`) for both loss and logged metrics, preventing high-dimensional flattening from hiding hard-token directional errors.
 - Phase-1 Comet logging now emits learned loss-balance parameters as `flux2ttr/global/log_var_huber` and `flux2ttr/global/log_var_cosine` at each log tick.
 - Phase-1 Comet logging now emits per-layer `flux2ttr/<layer>/alpha_sigmoid` and cross-layer aggregates for adaptive alpha monitoring.
 - Distill snapshot logs now include the current learned scalar loss-weight parameters (`log_var_huber`, `log_var_cosine`) for quick console-side monitoring.

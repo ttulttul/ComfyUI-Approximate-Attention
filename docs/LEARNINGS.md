@@ -116,3 +116,4 @@
 - Scalar alpha blending can be too rigid for mixed-attention errors; storing alpha in logit-space and modulating per-token alpha by kernel-vs-landmark disagreement improves correction where branches diverge while retaining backward-compatible initialization and checkpoint migration.
 - For adaptive-alpha observability, logging `alpha_sigmoid` per layer to Comet (plus global quantiles) makes it easier to detect saturation/collapse trends during long distillation runs.
 - Including `log_var_huber`/`log_var_cosine` in periodic distill snapshot logs helps explain shifts in loss scale and readiness progression without opening Comet.
+- Cosine alignment in replay distillation and metric tracking should be computed per token/head over the feature axis (`dim=-1`), not on a fully flattened `[B, H*Nq*D]` vector, otherwise large-magnitude/easy regions can mask hard-token directional errors.

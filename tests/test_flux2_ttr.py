@@ -389,6 +389,7 @@ def test_train_from_replay_loss_combines_huber_and_cosine(monkeypatch):
         ]
     )
 
+    seen_dims = []
     seen_eps = []
 
     def fake_smooth_l1_loss(student, teacher, beta):
@@ -397,9 +398,12 @@ def test_train_from_replay_loss_combines_huber_and_cosine(monkeypatch):
         return student.sum() * 0 + 0.25
 
     def fake_cosine_similarity(student, teacher, dim=1, eps=1e-8):
-        del teacher, dim
+        del teacher
+        seen_dims.append(int(dim))
         seen_eps.append(float(eps))
-        return student.sum(dim=1) * 0 + 0.8
+        out_shape = list(student.shape)
+        out_shape.pop(dim)
+        return student.new_full(out_shape, 0.8)
 
     monkeypatch.setattr(flux2_ttr.F, "smooth_l1_loss", fake_smooth_l1_loss)
     monkeypatch.setattr(flux2_ttr.F, "cosine_similarity", fake_cosine_similarity)
@@ -407,12 +411,30 @@ def test_train_from_replay_loss_combines_huber_and_cosine(monkeypatch):
 
     runtime._train_from_replay(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
 
+    assert seen_dims == [-1]
     assert seen_eps == [1e-8]
     # With log-vars initialized at 0, each task is weighted by 1/2.
     assert runtime.last_loss == pytest.approx(0.225)
     assert runtime.layer_last_loss[layer_key] == pytest.approx(0.225)
     assert float(runtime.log_var_huber.item()) != pytest.approx(0.0)
     assert float(runtime.log_var_cosine.item()) != pytest.approx(0.0)
+
+
+def test_compute_distill_metrics_uses_per_token_cosine_similarity():
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
+    layer_key = "single:0"
+    teacher = torch.tensor([[[[10.0, 0.0], [1.0, 0.0]]]], dtype=torch.float32)
+    student = torch.tensor([[[[10.0, 0.0], [-1.0, 0.0]]]], dtype=torch.float32)
+
+    metrics = runtime._compute_distill_metrics(
+        student=student,
+        teacher=teacher,
+        loss_value=0.5,
+        layer_key=layer_key,
+    )
+
+    # Per-token cosine should average (1 + -1) / 2 = 0; flattening would be ~0.98.
+    assert metrics["cosine_similarity"] == pytest.approx(0.0)
 
 
 def test_loss_weight_optimizer_recovers_from_inference_tensors():

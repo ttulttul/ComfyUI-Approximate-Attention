@@ -1872,9 +1872,7 @@ class Flux2TTRRuntime:
         teacher_power = float(torch.mean(teacher_f.square()).item())
         nmse = mse / (teacher_power + _DISTILL_METRIC_EPS)
 
-        student_flat = student_f.reshape(student_f.shape[0], -1)
-        teacher_flat = teacher_f.reshape(teacher_f.shape[0], -1)
-        cosine = torch.nn.functional.cosine_similarity(student_flat, teacher_flat, dim=1, eps=_DISTILL_METRIC_EPS).mean()
+        cosine = torch.nn.functional.cosine_similarity(student_f, teacher_f, dim=-1, eps=_DISTILL_METRIC_EPS).mean()
 
         ema = self.layer_ema_loss.get(layer_key, float(loss_value))
         updates = self.layer_update_count.get(layer_key, 0)
@@ -2180,9 +2178,7 @@ class Flux2TTRRuntime:
                 cfg_scale=sample.cfg_scale,
             )
             huber = F.smooth_l1_loss(student_sub, teacher_sub, beta=self.huber_beta)
-            student_flat = student_sub.reshape(student_sub.shape[0], -1)
-            teacher_flat = teacher_sub.reshape(teacher_sub.shape[0], -1)
-            cosine_sim = F.cosine_similarity(student_flat, teacher_flat, dim=1, eps=1e-8).mean()
+            cosine_sim = F.cosine_similarity(student_sub, teacher_sub, dim=-1, eps=1e-8).mean()
             cosine_term = 1.0 - cosine_sim
             loss = (
                 huber / (2.0 * self.log_var_huber.exp())
