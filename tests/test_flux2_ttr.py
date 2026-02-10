@@ -314,6 +314,55 @@ def test_train_from_replay_periodic_flushes_without_sigma_boundary():
     assert layer_key in runtime.layer_ema_loss
 
 
+def test_train_from_replay_loss_combines_huber_and_cosine(monkeypatch):
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        train_steps_per_call=1,
+    )
+    layer_key = "single:0"
+    runtime.replay_buffers[layer_key] = deque(
+        [
+            flux2_ttr.ReplaySample(
+                q_sub=torch.randn(1, 2, 4, 4),
+                k_full=torch.randn(1, 2, 4, 4),
+                v_full=torch.randn(1, 2, 4, 4),
+                teacher_sub=torch.randn(1, 2, 4, 4),
+                key_mask=torch.ones(1, 4, dtype=torch.bool),
+                text_token_count=4,
+                conditioning_token_count=4,
+                sigma=0.5,
+                cfg_scale=1.0,
+            )
+        ]
+    )
+
+    seen_eps = []
+
+    def fake_smooth_l1_loss(student, teacher, beta):
+        del teacher, beta
+        # Keep gradient connectivity while returning a controlled scalar.
+        return student.sum() * 0 + 0.25
+
+    def fake_cosine_similarity(student, teacher, dim=1, eps=1e-8):
+        del teacher, dim
+        seen_eps.append(float(eps))
+        return student.sum(dim=1) * 0 + 0.8
+
+    monkeypatch.setattr(flux2_ttr.F, "smooth_l1_loss", fake_smooth_l1_loss)
+    monkeypatch.setattr(flux2_ttr.F, "cosine_similarity", fake_cosine_similarity)
+    monkeypatch.setattr(runtime, "_compute_distill_metrics", lambda **kwargs: {"loss": float(kwargs["loss_value"])})
+
+    runtime._train_from_replay(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
+
+    assert seen_eps == [1e-8]
+    assert runtime.last_loss == pytest.approx(0.45)
+    assert runtime.layer_last_loss[layer_key] == pytest.approx(0.45)
+
+
 def test_runtime_training_preview_uses_student_when_layer_ready():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(

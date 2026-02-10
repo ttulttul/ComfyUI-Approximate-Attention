@@ -109,3 +109,4 @@
 - Deepening the HKR phi MLP from 2 to 3 linear layers and setting `hidden = max(head_dim, 2 * feature_dim)` (with split Q/K by default) increases kernel-map capacity at the cost of one extra hidden-by-hidden projection per network.
 - Per-step EMA updates are too sensitive to within-image correlation; accumulating losses/cosine distances across a sampling run and flushing one EMA update on sigma run boundaries stabilizes layer readiness across prompts.
 - Sigma-boundary detection is a useful run delimiter but not guaranteed on every training path; a periodic flush trigger (every ~20 accumulated loss updates) prevents EMA/readiness from stalling when sigma transitions are absent.
+- In replay distillation, adding a cosine-alignment term (`1 - cosine_similarity`) to Smooth L1 gives direct pressure on directional agreement with teacher outputs and keeps optimization aligned with tracked cosine metrics.

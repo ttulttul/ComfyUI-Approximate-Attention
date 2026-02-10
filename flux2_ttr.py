@@ -2066,7 +2066,11 @@ class Flux2TTRRuntime:
                 sigma=sample.sigma,
                 cfg_scale=sample.cfg_scale,
             )
-            loss = F.smooth_l1_loss(student_sub, teacher_sub, beta=self.huber_beta)
+            huber = F.smooth_l1_loss(student_sub, teacher_sub, beta=self.huber_beta)
+            student_flat = student_sub.reshape(student_sub.shape[0], -1)
+            teacher_flat = teacher_sub.reshape(teacher_sub.shape[0], -1)
+            cosine_sim = F.cosine_similarity(student_flat, teacher_flat, dim=1, eps=1e-8).mean()
+            loss = huber + (1.0 - cosine_sim)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
