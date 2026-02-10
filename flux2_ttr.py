@@ -514,6 +514,7 @@ class Flux2HKRAttnLayer(nn.Module):
         self.landmark_max = max(self.landmark_min, int(landmark_max))
         self.text_tokens_guess = max(0, int(text_tokens_guess))
         self.landmark_qk_norm = bool(landmark_qk_norm)
+        self.adaptive_alpha = True
 
         self.kernel = KernelRegressorAttention(
             head_dim=self.head_dim,
@@ -522,7 +523,16 @@ class Flux2HKRAttnLayer(nn.Module):
             split_qk=self.split_qk,
             qk_norm=qk_norm,
         )
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init), dtype=torch.float32))
+        # Store alpha in logit-space: sigmoid(self.alpha) gives base blending weight.
+        # logit(0.1) ≈ -2.197 for backward-compatible default.
+        _alpha_raw = float(alpha_init)
+        if _alpha_raw <= 0.0:
+            _alpha_logit = -5.0
+        elif _alpha_raw >= 1.0:
+            _alpha_logit = 5.0
+        else:
+            _alpha_logit = math.log(_alpha_raw / (1.0 - _alpha_raw))
+        self.alpha = nn.Parameter(torch.tensor(_alpha_logit, dtype=torch.float32))
         self.conditioner = SigmaCFGConditioner(embed_dim=32, hidden_dim=128)
 
         self.last_landmark_count = 0
@@ -699,8 +709,21 @@ class Flux2HKRAttnLayer(nn.Module):
             out_land = out_land * (1.0 + scale_l.view(1, 1, 1, 1)) + bias_l.view(1, 1, 1, 1)
 
         self.last_den_min = float(self.kernel.last_den_min)
-        alpha = self.alpha.to(dtype=v.dtype)
-        return out_kernel + alpha.view(1, 1, 1, 1) * out_land
+
+        base_alpha = torch.sigmoid(self.alpha)
+
+        if self.adaptive_alpha:
+            with torch.no_grad():
+                diff = out_kernel.float() - out_land.float()
+                disagreement = diff.norm(dim=-1)                          # [B, H, N]
+                d_mean = disagreement.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+                d_norm = (disagreement / d_mean).clamp(max=3.0) / 3.0    # [B, H, N] in [0, 1]
+
+            alpha_per_token = (base_alpha * (0.5 + d_norm)).unsqueeze(-1).to(dtype=v.dtype)  # [B, H, N, 1]
+            return out_kernel + alpha_per_token * out_land
+        else:
+            alpha = base_alpha.to(dtype=v.dtype)
+            return out_kernel + alpha.view(1, 1, 1, 1) * out_land
 
 
 # Backward-compat alias for downstream imports.
@@ -2770,7 +2793,33 @@ class Flux2TTRRuntime:
             if key not in self.layer_ready and "ready" in meta:
                 self.layer_ready[key] = bool(meta.get("ready", False))
 
-        self.pending_state = payload.get("layers", {})
+        # Migrate old raw-space alpha to logit-space for sigmoid interpretation.
+        _raw_layers = payload.get("layers", {})
+        if not isinstance(_raw_layers, dict):
+            _raw_layers = {}
+        for _lk, _lstate in _raw_layers.items():
+            if not isinstance(_lstate, dict):
+                continue
+            if "alpha" not in _lstate:
+                continue
+            _alpha_tensor = _lstate["alpha"]
+            if not torch.is_tensor(_alpha_tensor):
+                continue
+            _alpha_val = float(_alpha_tensor.reshape(-1)[0].item())
+            # Old checkpoints stored raw alpha (typically 0.01–0.5).
+            # New code interprets self.alpha through sigmoid, so convert:
+            # if the stored value looks like raw-space (0 < val < 1 and small),
+            # convert to logit. Values outside (0,1) or already large-magnitude
+            # are assumed to already be in logit-space.
+            if 0.0 < _alpha_val < 1.0 and abs(_alpha_val) < 2.0:
+                _logit_val = math.log(_alpha_val / (1.0 - _alpha_val))
+                _lstate["alpha"] = torch.tensor(_logit_val, dtype=torch.float32)
+                logger.info(
+                    "Flux2TTR: migrated alpha for %s from raw %.6g to logit %.6g",
+                    _lk, _alpha_val, _logit_val,
+                )
+
+        self.pending_state = _raw_layers
         for layer_key, layer in self.layers.items():
             pending = self.pending_state.get(layer_key)
             if pending:

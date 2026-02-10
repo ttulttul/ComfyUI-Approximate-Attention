@@ -189,6 +189,55 @@ def test_flux2_hkr_sigma_cfg_conditioning_identity_by_default():
     assert torch.allclose(out_base, out_cond, atol=1e-6, rtol=1e-6)
 
 
+def test_flux2_hkr_alpha_init_uses_logit_space_with_adaptive_enabled():
+    layer = flux2_ttr.Flux2HKRAttnLayer(head_dim=8, feature_dim=256, alpha_init=0.1)
+    assert layer.adaptive_alpha is True
+    assert float(torch.sigmoid(layer.alpha).item()) == pytest.approx(0.1, rel=1e-4, abs=1e-4)
+
+
+def test_flux2_hkr_adaptive_alpha_gating_modulates_blend_per_token(monkeypatch):
+    layer = flux2_ttr.Flux2HKRAttnLayer(head_dim=2, feature_dim=256, alpha_init=0.1)
+    q = torch.zeros(1, 1, 2, 2)
+    k = torch.zeros(1, 1, 2, 2)
+    v = torch.zeros(1, 1, 2, 2)
+
+    out_kernel = torch.tensor([[[[0.0, 0.0], [0.0, 0.0]]]], dtype=torch.float32)
+    out_land = torch.tensor([[[[1.0, 0.0], [2.0, 0.0]]]], dtype=torch.float32)
+
+    monkeypatch.setattr(layer.kernel, "forward", lambda *args, **kwargs: out_kernel.clone())
+    monkeypatch.setattr(layer, "_landmark_attention", lambda *args, **kwargs: out_land.clone())
+
+    out = layer(q, k, v)
+
+    base_alpha = torch.sigmoid(layer.alpha.detach())
+    diff = out_kernel.float() - out_land.float()
+    disagreement = diff.norm(dim=-1)
+    d_mean = disagreement.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+    d_norm = (disagreement / d_mean).clamp(max=3.0) / 3.0
+    expected = out_kernel + (base_alpha * (0.5 + d_norm)).unsqueeze(-1) * out_land
+    assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_flux2_hkr_non_adaptive_alpha_uses_scalar_blend(monkeypatch):
+    layer = flux2_ttr.Flux2HKRAttnLayer(head_dim=2, feature_dim=256, alpha_init=0.1)
+    layer.adaptive_alpha = False
+    q = torch.zeros(1, 1, 2, 2)
+    k = torch.zeros(1, 1, 2, 2)
+    v = torch.zeros(1, 1, 2, 2)
+
+    out_kernel = torch.tensor([[[[0.0, 0.0], [0.0, 0.0]]]], dtype=torch.float32)
+    out_land = torch.tensor([[[[1.0, 0.0], [2.0, 0.0]]]], dtype=torch.float32)
+
+    monkeypatch.setattr(layer.kernel, "forward", lambda *args, **kwargs: out_kernel.clone())
+    monkeypatch.setattr(layer, "_landmark_attention", lambda *args, **kwargs: out_land.clone())
+
+    out = layer(q, k, v)
+
+    alpha = torch.sigmoid(layer.alpha.detach())
+    expected = out_kernel + alpha.view(1, 1, 1, 1) * out_land
+    assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_runtime_extracts_sigma_and_cfg_scale():
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
     opts = {"sigmas": torch.tensor([0.35]), "flux2_ttr": {"cfg_scale": 6.5}}
@@ -1163,6 +1212,35 @@ def test_load_checkpoint_old_landmark_count_falls_back_to_dynamic_defaults(tmp_p
     assert loaded.landmark_fraction == pytest.approx(0.08)
     assert loaded.landmark_min == 64
     assert loaded.landmark_max == 512
+
+
+def test_load_checkpoint_migrates_raw_alpha_to_logit_space(tmp_path):
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+    )
+    payload = runtime.checkpoint_state()
+    payload["layers"] = {
+        "single:0": {"alpha": torch.tensor(0.1, dtype=torch.float32)},
+        "single:1": {"alpha": torch.tensor(-2.1972246, dtype=torch.float32)},
+    }
+
+    ckpt = tmp_path / "flux2_ttr_alpha_migration.pt"
+    torch.save(payload, ckpt)
+
+    loaded = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+    )
+    loaded.load_checkpoint(str(ckpt))
+
+    expected_logit = math.log(0.1 / (1.0 - 0.1))
+    assert float(loaded.pending_state["single:0"]["alpha"].item()) == pytest.approx(expected_logit)
+    assert float(loaded.pending_state["single:1"]["alpha"].item()) == pytest.approx(-2.1972246)
 
 
 def test_recover_runtime_from_config_inference_requires_checkpoint():
