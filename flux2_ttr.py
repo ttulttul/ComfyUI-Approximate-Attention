@@ -132,6 +132,28 @@ def validate_feature_dim(feature_dim: int) -> int:
     return dim
 
 
+def _checkpoint_feature_dim_from_payload(payload: dict[str, Any], checkpoint_path: str) -> int:
+    fmt = payload.get("format")
+    if fmt != "flux2_ttr_v2":
+        raise ValueError(f"Flux2TTR: unsupported checkpoint format in {checkpoint_path}: {fmt!r}")
+    try:
+        return validate_feature_dim(int(payload.get("feature_dim", 0)))
+    except Exception as exc:
+        raise ValueError(
+            f"Flux2TTR: invalid checkpoint feature_dim in {checkpoint_path}: {payload.get('feature_dim')!r}."
+        ) from exc
+
+
+def load_checkpoint_feature_dim(checkpoint_path: str) -> int:
+    path = str(checkpoint_path or "").strip()
+    if not path:
+        raise ValueError("Flux2TTR: checkpoint_path must be set when reading checkpoint metadata.")
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Flux2TTR: unsupported checkpoint payload in {path}.")
+    return _checkpoint_feature_dim_from_payload(payload, path)
+
+
 def _normalize_landmark_min(landmark_min: int) -> int:
     return max(1, int(landmark_min))
 
@@ -2856,11 +2878,9 @@ class Flux2TTRRuntime:
             raise ValueError("Flux2TTR: checkpoint_path must be set when loading.")
 
         payload = torch.load(path, map_location="cpu")
-        fmt = payload.get("format")
-        if fmt != "flux2_ttr_v2":
-            raise ValueError(f"Flux2TTR: unsupported checkpoint format in {path}: {fmt!r}")
-
-        ckpt_feature_dim = int(payload.get("feature_dim", 0))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Flux2TTR: unsupported checkpoint payload in {path}.")
+        ckpt_feature_dim = _checkpoint_feature_dim_from_payload(payload, path)
         if ckpt_feature_dim != self.feature_dim:
             raise ValueError(
                 f"Flux2TTR: checkpoint feature_dim={ckpt_feature_dim} does not match requested feature_dim={self.feature_dim}."

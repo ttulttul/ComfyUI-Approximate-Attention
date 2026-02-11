@@ -64,6 +64,32 @@ def test_validate_feature_dim():
         flux2_ttr.validate_feature_dim(384)
 
 
+def test_load_checkpoint_feature_dim_reads_saved_value(tmp_path):
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=512,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+    )
+    ckpt = tmp_path / "flux2_ttr_feature_dim_512.pt"
+    runtime.save_checkpoint(str(ckpt))
+    assert flux2_ttr.load_checkpoint_feature_dim(str(ckpt)) == 512
+
+
+def test_load_checkpoint_feature_dim_rejects_unsupported_format(tmp_path):
+    ckpt = tmp_path / "flux2_ttr_bad_format.pt"
+    torch.save({"format": "bad_format", "feature_dim": 512}, ckpt)
+    with pytest.raises(ValueError, match="unsupported checkpoint format"):
+        flux2_ttr.load_checkpoint_feature_dim(str(ckpt))
+
+
+def test_load_checkpoint_feature_dim_rejects_invalid_feature_dim(tmp_path):
+    ckpt = tmp_path / "flux2_ttr_bad_feature_dim.pt"
+    torch.save({"format": "flux2_ttr_v2", "feature_dim": 384}, ckpt)
+    with pytest.raises(ValueError, match="invalid checkpoint feature_dim"):
+        flux2_ttr.load_checkpoint_feature_dim(str(ckpt))
+
+
 def test_infer_flux_single_layer_specs():
     specs = flux2_ttr.infer_flux_single_layer_specs(_DummyPatcher())
     assert len(specs) == 2

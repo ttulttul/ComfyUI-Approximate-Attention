@@ -73,7 +73,7 @@ Controller training uses policy gradients with quality-driven rewards. A teacher
 
 **Sigma-aware training.** When `sigma_aware_training` is enabled (the default), a trajectory wrapper logs per-step actions and recomputes sigma-weighted log-probs under a grad-enabled context, matching how routing is actually used during denoising.
 
-**Inference.** `Flux2TTRController` exposes a `quality_speed` knob to trade quality against speed through controller thresholding. It supports two policy modes: `stochastic` (the default) samples one controller mask per diffusion step — cached for all layer calls in that step — to match sigma-aware policy training behavior, while `threshold` mode uses a deterministic cutoff. Per-step routing summaries (sigma, threshold, student-routed layer set) are logged once per step.
+**Inference.** `Flux2TTRController` exposes a `quality_speed` knob to trade quality against speed through controller thresholding. It supports two policy modes: `stochastic` (the default) samples one controller mask per diffusion step — cached for all layer calls in that step — to match sigma-aware policy training behavior, while `threshold` mode uses a deterministic cutoff. For checkpoint consistency, controller inference now derives `feature_dim` directly from TTR checkpoint metadata rather than assuming a default. Per-step routing summaries (sigma, threshold, student-routed layer set) are logged once per step.
 
 ---
 

@@ -1869,7 +1869,23 @@ class Flux2TTRController(io.ComfyNode):
             if isinstance(prev_runtime, str):
                 flux2_ttr.unregister_runtime(prev_runtime)
 
-        feature_dim = flux2_ttr.validate_feature_dim(int(prev_cfg.get("feature_dim", 256)) if isinstance(prev_cfg, dict) else 256)
+        feature_dim = flux2_ttr.load_checkpoint_feature_dim(ttr_checkpoint_path)
+        if isinstance(prev_cfg, dict):
+            prev_feature_dim_raw = prev_cfg.get("feature_dim")
+            if prev_feature_dim_raw is not None:
+                try:
+                    prev_feature_dim = flux2_ttr.validate_feature_dim(int(prev_feature_dim_raw))
+                    if prev_feature_dim != feature_dim:
+                        logger.info(
+                            "Flux2TTRController: using feature_dim=%d from checkpoint metadata (ignoring previous config value %d).",
+                            feature_dim,
+                            prev_feature_dim,
+                        )
+                except Exception:
+                    logger.debug(
+                        "Flux2TTRController: ignored invalid previous feature_dim value %r when loading checkpoint metadata.",
+                        prev_feature_dim_raw,
+                    )
         learning_rate = _float_or(
             prev_cfg.get("learning_rate", _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["learning_rate"]) if isinstance(prev_cfg, dict) else _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["learning_rate"],
             _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["learning_rate"],
