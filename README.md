@@ -33,6 +33,107 @@ Training:
 Inference:
 - `MODEL -> Flux2TTRController -> KSampler`
 
+## Network Overview
+
+### Phase 1: TTR Attention Network (`Flux2HKRAttnLayer`)
+
+Each patched Flux single-attention block gets a trainable TTR layer with two branches:
+
+- Kernel-regression branch (`KernelRegressorAttention`):
+  - Learns positive feature maps with a 3-layer MLP (`head_dim -> hidden -> hidden -> feature_dim`, `hidden=max(head_dim, 2*feature_dim)`).
+  - Uses split Q/K phi networks by default.
+  - Streams K/V in chunks to build linear-time statistics (`Ksum`, `K^T V`) and evaluates Q in chunks.
+- Landmark softmax branch:
+  - Always keeps all conditioning tokens as landmarks.
+  - Adds image-token landmarks from a dynamic budget (`landmark_fraction`, `landmark_min`, `landmark_max`; `landmark_max=0` means unlimited).
+- Sigma/CFG conditioner:
+  - Small MLP predicts per-branch scale/bias modulation (`kernel` and `landmark` branches).
+  - Initialized to identity behavior for backward-compatible startup.
+
+Branch fusion is residual and strictly convex by construction:
+
+```text
+out = out_kernel + alpha * (out_land - out_kernel)
+```
+
+- Non-adaptive mode: `alpha = alpha_max * sigmoid(base_logit)`
+- Adaptive mode: `alpha_token = alpha_max * sigmoid(base_logit + gamma * (d_norm - 0.5))`
+- `d_norm` comes from cosine disagreement (`1 - cosine_similarity(kernel, landmark)`), which avoids pure magnitude bias.
+- `alpha` is always in `(0, alpha_max)` (default `alpha_max=0.2`), so the landmark branch stays a bounded correction.
+
+### Phase 1 Training Mechanics (Online Distillation)
+
+Training is performed online during sampling:
+
+- Teacher targets are native Flux attention outputs on real prompts/sampling states.
+- Replay stores query-subsampled examples with full keys/values:
+  - `(q_sub, k_full, v_full, teacher_sub, masks, sigma, cfg)`
+  - Query-only subsampling keeps global context while reducing training cost.
+- Replay is CPU-offload friendly with configurable storage dtype and a global byte budget + eviction.
+- Per-step layer selection is randomized (`min_swap_layers` / `max_swap_layers`) so training coverage remains broad.
+- Readiness is fail-closed:
+  - Inference uses teacher attention until a layer has enough updates and low EMA cosine distance.
+  - Hysteresis (`exit = threshold * 1.2`) reduces ready/not-ready flapping.
+
+Distillation loss (per replay update) is uncertainty-weighted multi-task optimization:
+
+```text
+huber = SmoothL1(student, teacher; beta=huber_beta)
+cosine_term = 1 - cosine_similarity(student, teacher, dim=-1).mean()
+
+loss =
+  huber / (2 * exp(log_var_huber)) + log_var_huber / 2
+  + cosine_term / (2 * exp(log_var_cosine)) + log_var_cosine / 2
+```
+
+- `log_var_huber` and `log_var_cosine` are learned scalars (Kendall-style weighting).
+- Layer weights and loss-weight scalars have persisted optimizer state in checkpoints for stable resume behavior.
+
+### Phase 2: Controller Network (`TTRController`)
+
+The controller predicts a per-layer routing logit for each diffusion step:
+
+- Inputs: `sigma`, `cfg_scale`, latent `width`, latent `height`.
+- Embeddings:
+  - Sinusoidal scalar embeddings for `sigma` and `cfg`.
+  - Learned resolution embedding from sinusoidal `width`/`height`.
+- MLP head: 3 linear layers to `num_layers` logits.
+- Semantics:
+  - High logit/probability means full attention.
+  - Low logit/probability means route that layer through Phase-1 TTR.
+
+### Phase 2 Training Mechanics (`Flux2TTRControllerTrainer`)
+
+Controller training uses policy gradients with quality-driven rewards:
+
+- Teacher path: sample with original model.
+- Student path: sample with TTR model + controller routing.
+- Quality objective (`compute_loss`) on latent/image outputs:
+  - `rmse_weight * RMSE`
+  - `+ cosine_weight * cosine_distance`
+  - `+ lpips_weight * LPIPS` (optional)
+- Reward shaping:
+  - `reward_quality = -quality_loss`
+  - `reward = reward_quality - lambda_eff * efficiency_penalty + lambda_entropy * entropy_bonus`
+  - `efficiency_penalty = relu(actual_full_attn_ratio - target_full_attn_ratio)` where `target_full_attn_ratio = 1 - target_ttr_ratio`.
+- REINFORCE update:
+  - Policy loss is `-(reward - baseline) * log_prob(actions)` over eligible (ready) layers only.
+  - Entropy bonus keeps policies from collapsing to saturated Bernoulli decisions.
+  - Reward baseline + AdamW optimizer state are checkpointed/restored.
+
+Sigma-aware mode uses a trajectory wrapper that logs per-step actions and recomputes sigma-weighted log-probs under grad-enabled context, matching how routing is actually used during denoising.
+
+## Unique Implementation Ideas
+
+- Fail-closed readiness gates at layer granularity, with EMA cosine-distance hysteresis.
+- Query-only replay subsampling with full K/V context for better learnability.
+- Learned uncertainty weighting between robust regression and directional alignment losses.
+- Strictly bounded adaptive blend (`alpha_max`) with logit-space modulation from cosine disagreement.
+- Dynamic landmark policy that always preserves conditioning tokens and scales image landmarks with resolution.
+- Inference-mode-safe training: explicit `torch.inference_mode(False)` / grad-enabled guards plus inference-tensor rebuild paths.
+- Controller penalties and routing ratios computed over eligible layers (with forced-full layers tracked separately), avoiding biased policy pressure.
+- Rich observability: per-layer + cross-layer quantile metrics, Pareto-style readiness frontier, persistent Comet experiment handling.
+
 ## Flux2TTR Notes
 
 - `Flux2TTRControllerTrainer` supports `sigma_aware_training` (default `true`) for per-step sigma-dependent routing policy updates.
