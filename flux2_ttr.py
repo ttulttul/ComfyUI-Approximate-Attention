@@ -75,13 +75,16 @@ _COMET_AGG_METRICS = (
 
 
 def _git_short_hash(length: int = 7) -> str:
+    from pathlib import Path
     import subprocess
 
+    repo_dir = Path(__file__).resolve().parent
     try:
         return subprocess.check_output(
             ["git", "rev-parse", f"--short={max(1, int(length))}", "HEAD"],
             stderr=subprocess.DEVNULL,
             text=True,
+            cwd=str(repo_dir),
         ).strip()
     except Exception:
         return "nogit"

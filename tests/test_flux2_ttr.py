@@ -2097,6 +2097,26 @@ def test_runtime_honors_explicit_comet_experiment_key():
     assert runtime.comet_persist_experiment is False
 
 
+def test_git_short_hash_uses_flux2_ttr_module_directory(monkeypatch):
+    call_args = {}
+
+    def _fake_check_output(cmd, stderr=None, text=None, cwd=None):
+        call_args["cmd"] = cmd
+        call_args["stderr"] = stderr
+        call_args["text"] = text
+        call_args["cwd"] = cwd
+        return "b3ed63\n"
+
+    monkeypatch.setattr(flux2_ttr, "__file__", "/tmp/custom_nodes/ComfyUI-Taylor-Attention/flux2_ttr.py")
+    monkeypatch.setattr("subprocess.check_output", _fake_check_output)
+
+    out = flux2_ttr._git_short_hash(6)
+    assert out == "b3ed63"
+    assert call_args["cmd"] == ["git", "rev-parse", "--short=6", "HEAD"]
+    assert call_args["cwd"] == "/tmp/custom_nodes/ComfyUI-Taylor-Attention"
+    assert call_args["text"] is True
+
+
 def test_release_resources_clears_run_ema_accumulator_state():
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
     runtime._run_ema_accum_loss["single:0"] = [0.1]
