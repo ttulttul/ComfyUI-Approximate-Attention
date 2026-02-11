@@ -194,6 +194,19 @@ def test_flux2_hkr_effective_landmark_count_scales_with_image_tokens():
     assert layer._effective_landmark_count(10000) == 512
 
 
+def test_flux2_hkr_effective_landmark_count_unlimited_when_max_is_zero():
+    layer = flux2_ttr.Flux2HKRAttnLayer(
+        head_dim=8,
+        feature_dim=256,
+        landmark_fraction=0.08,
+        landmark_min=64,
+        landmark_max=0,
+    )
+    assert layer.landmark_max == 0
+    assert layer._effective_landmark_count(0) == 64
+    assert layer._effective_landmark_count(10000) == 800
+
+
 def test_flux2_hkr_sigma_cfg_conditioning_identity_by_default():
     torch.manual_seed(0)
     layer = flux2_ttr.Flux2HKRAttnLayer(head_dim=8, feature_dim=256)
@@ -1389,7 +1402,7 @@ def test_load_checkpoint_old_landmark_count_falls_back_to_dynamic_defaults(tmp_p
     loaded.load_checkpoint(str(ckpt))
     assert loaded.landmark_fraction == pytest.approx(0.08)
     assert loaded.landmark_min == 64
-    assert loaded.landmark_max == 512
+    assert loaded.landmark_max == 0
 
 
 def test_load_checkpoint_missing_loss_log_vars_uses_default_bias(tmp_path):
@@ -1921,6 +1934,36 @@ def test_memory_reserve_estimate_scales_with_landmark_max():
     assert large > small
 
 
+def test_memory_reserve_estimate_treats_landmark_max_zero_as_unlimited():
+    finite = flux2_ttr._estimate_flux2_ttr_memory_bytes(
+        batch=1,
+        heads=24,
+        n_query=256,
+        n_key=4096,
+        head_dim=128,
+        feature_dim=256,
+        q_chunk_size=256,
+        k_chunk_size=1024,
+        dtype_size=4,
+        training=False,
+        landmark_max=512,
+    )
+    unlimited = flux2_ttr._estimate_flux2_ttr_memory_bytes(
+        batch=1,
+        heads=24,
+        n_query=256,
+        n_key=4096,
+        head_dim=128,
+        feature_dim=256,
+        q_chunk_size=256,
+        k_chunk_size=1024,
+        dtype_size=4,
+        training=False,
+        landmark_max=0,
+    )
+    assert unlimited > finite
+
+
 def test_memory_reserve_estimate_includes_conditioning_token_landmarks():
     base = flux2_ttr._estimate_flux2_ttr_memory_bytes(
         batch=1,
@@ -1982,7 +2025,8 @@ def test_training_oom_recovery_reduces_pressure_and_clears_layer_buffer():
     assert runtime.training_query_token_cap <= 64
     assert runtime.query_chunk_size <= 128
     assert runtime.key_chunk_size <= 512
-    assert runtime.landmark_max <= 256
+    assert runtime.landmark_max > 0
+    assert runtime.landmark_max <= 512
     assert len(runtime.replay_buffers[layer_key]) == 0
 
 

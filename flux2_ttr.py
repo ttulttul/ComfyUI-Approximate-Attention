@@ -44,7 +44,8 @@ _DEFAULT_PHI_LR_MUL = 1.0
 _DEFAULT_GRAD_CLIP = 1.0
 _DEFAULT_LANDMARK_FRACTION = 0.08
 _DEFAULT_LANDMARK_MIN = 64
-_DEFAULT_LANDMARK_MAX = 512
+_DEFAULT_LANDMARK_MAX = 0
+_OOM_RECOVERY_LANDMARK_MAX = 512
 _DEFAULT_TEXT_TOKENS_GUESS = 77
 _DEFAULT_REPLAY_OFFLOAD_CPU = True
 _DEFAULT_REPLAY_STORAGE_DTYPE = "float16"
@@ -112,6 +113,24 @@ def validate_feature_dim(feature_dim: int) -> int:
     if dim % 256 != 0:
         raise ValueError(f"Flux2TTR: feature_dim must be a multiple of 256 (got {dim}).")
     return dim
+
+
+def _normalize_landmark_min(landmark_min: int) -> int:
+    return max(1, int(landmark_min))
+
+
+def _normalize_landmark_max(landmark_max: int) -> int:
+    # 0 means "unlimited landmark budget".
+    return max(0, int(landmark_max))
+
+
+def _bounded_landmark_count(raw_count: int, landmark_min: int, landmark_max: int) -> int:
+    min_count = _normalize_landmark_min(landmark_min)
+    max_count = _normalize_landmark_max(landmark_max)
+    count = max(min_count, int(raw_count))
+    if max_count <= 0:
+        return count
+    return min(max_count, count)
 
 
 def _supports_key_padding_mask(mask: Optional[torch.Tensor], batch: int, n_query: int, n_key: int) -> bool:
@@ -199,7 +218,12 @@ def _estimate_flux2_ttr_memory_bytes(
     # Landmark branch: q_chunk x landmarks score matrix and softmax output.
     # Conditioning tokens are always landmarks; image tokens still use the landmark budget.
     cond_landmarks = min(nk, max(0, int(text_count_estimate)))
-    image_landmarks = min(max(0, nk - cond_landmarks), max(1, int(landmark_max)))
+    max_image_landmarks = max(0, nk - cond_landmarks)
+    lm_max = _normalize_landmark_max(landmark_max)
+    if lm_max <= 0:
+        image_landmarks = max_image_landmarks
+    else:
+        image_landmarks = min(max_image_landmarks, lm_max)
     landmarks = min(nk, cond_landmarks + image_landmarks)
     landmark_elems = bh * (q_chunk * landmarks + landmarks * head_dim + q_chunk * head_dim)
 
@@ -513,8 +537,8 @@ class Flux2HKRAttnLayer(nn.Module):
         self.query_chunk_size = max(1, int(query_chunk_size))
         self.key_chunk_size = max(1, int(key_chunk_size))
         self.landmark_fraction = max(0.0, min(1.0, float(landmark_fraction)))
-        self.landmark_min = max(1, int(landmark_min))
-        self.landmark_max = max(self.landmark_min, int(landmark_max))
+        self.landmark_min = _normalize_landmark_min(landmark_min)
+        self.landmark_max = _normalize_landmark_max(landmark_max)
         self.text_tokens_guess = max(0, int(text_tokens_guess))
         self.landmark_qk_norm = bool(landmark_qk_norm)
         self.adaptive_alpha = True
@@ -553,7 +577,7 @@ class Flux2HKRAttnLayer(nn.Module):
     def _effective_landmark_count(self, n_image_tokens: int) -> int:
         """Compute landmark count dynamically from the number of image tokens."""
         raw = round(max(0, int(n_image_tokens)) * self.landmark_fraction)
-        return max(self.landmark_min, min(self.landmark_max, raw))
+        return _bounded_landmark_count(raw, self.landmark_min, self.landmark_max)
 
     def _resolve_conditioning_token_count(
         self,
@@ -788,8 +812,8 @@ class Flux2TTRRuntime:
         self.query_chunk_size = max(1, int(scan_chunk_size))
         self.key_chunk_size = max(1, int(key_chunk_size))
         self.landmark_fraction = max(0.0, min(1.0, float(landmark_fraction)))
-        self.landmark_min = max(1, int(landmark_min))
-        self.landmark_max = max(self.landmark_min, int(landmark_max))
+        self.landmark_min = _normalize_landmark_min(landmark_min)
+        self.landmark_max = _normalize_landmark_max(landmark_max)
         self.text_tokens_guess = max(0, int(text_tokens_guess))
         self.alpha_init = float(alpha_init)
         self.alpha_lr_multiplier = max(0.0, float(alpha_lr_multiplier))
@@ -1553,8 +1577,8 @@ class Flux2TTRRuntime:
 
     def _sync_layer_landmark_config(self, layer: Flux2HKRAttnLayer) -> None:
         layer.landmark_fraction = max(0.0, min(1.0, float(self.landmark_fraction)))
-        layer.landmark_min = max(1, int(self.landmark_min))
-        layer.landmark_max = max(layer.landmark_min, int(self.landmark_max))
+        layer.landmark_min = _normalize_landmark_min(self.landmark_min)
+        layer.landmark_max = _normalize_landmark_max(self.landmark_max)
         layer.text_tokens_guess = max(0, int(self.text_tokens_guess))
 
     def _ensure_layer(self, layer_key: str, head_dim: int, device: torch.device) -> Flux2HKRAttnLayer:
@@ -2201,7 +2225,12 @@ class Flux2TTRRuntime:
         if self.key_chunk_size > 256:
             self.key_chunk_size = max(256, self.key_chunk_size // 2)
             changed = True
-        if self.landmark_max > self.landmark_min:
+        if self.landmark_max <= 0:
+            # Unlimited landmark mode can be too expensive under pressure;
+            # cap first, then normal halving can continue on subsequent OOMs.
+            self.landmark_max = max(self.landmark_min, int(_OOM_RECOVERY_LANDMARK_MAX))
+            changed = True
+        elif self.landmark_max > self.landmark_min:
             self.landmark_max = max(self.landmark_min, self.landmark_max // 2)
             changed = True
 
@@ -2860,16 +2889,16 @@ class Flux2TTRRuntime:
         else:
             self.landmark_fraction = float(_DEFAULT_LANDMARK_FRACTION)
         if "landmark_min" in payload:
-            self.landmark_min = max(1, int(payload["landmark_min"]))
+            self.landmark_min = _normalize_landmark_min(payload["landmark_min"])
         else:
             self.landmark_min = int(_DEFAULT_LANDMARK_MIN)
         if "landmark_max" in payload:
-            self.landmark_max = max(self.landmark_min, int(payload["landmark_max"]))
+            self.landmark_max = _normalize_landmark_max(payload["landmark_max"])
         else:
             self.landmark_max = int(_DEFAULT_LANDMARK_MAX)
         self.landmark_fraction = max(0.0, min(1.0, float(self.landmark_fraction)))
-        self.landmark_min = max(1, int(self.landmark_min))
-        self.landmark_max = max(self.landmark_min, int(self.landmark_max))
+        self.landmark_min = _normalize_landmark_min(self.landmark_min)
+        self.landmark_max = _normalize_landmark_max(self.landmark_max)
         self.text_tokens_guess = max(0, int(payload.get("text_tokens_guess", self.text_tokens_guess)))
         self.alpha_init = float(payload.get("alpha_init", self.alpha_init))
         self.alpha_lr_multiplier = float(payload.get("alpha_lr_multiplier", self.alpha_lr_multiplier))

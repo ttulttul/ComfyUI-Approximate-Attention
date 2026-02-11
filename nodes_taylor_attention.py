@@ -405,11 +405,11 @@ class Flux2TTRTrainer(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "landmark_max",
-                    default=512,
-                    min=1,
+                    default=0,
+                    min=0,
                     max=2048,
                     step=1,
-                    tooltip="Maximum landmark count used at high resolution.",
+                    tooltip="Maximum landmark count used at high resolution (0 means unlimited).",
                 ),
                 io.Int.Input(
                     "text_tokens_guess",
@@ -1885,7 +1885,7 @@ class Flux2TTRController(io.ComfyNode):
             0.08,
         )
         landmark_min = _int_or(prev_cfg.get("landmark_min", 64) if isinstance(prev_cfg, dict) else 64, 64)
-        landmark_max = _int_or(prev_cfg.get("landmark_max", 512) if isinstance(prev_cfg, dict) else 512, 512)
+        landmark_max = _int_or(prev_cfg.get("landmark_max", 0) if isinstance(prev_cfg, dict) else 0, 0)
         text_tokens_guess = _int_or(prev_cfg.get("text_tokens_guess", 77) if isinstance(prev_cfg, dict) else 77, 77)
         alpha_init = _float_or(prev_cfg.get("alpha_init", 0.1) if isinstance(prev_cfg, dict) else 0.1, 0.1)
         alpha_lr_multiplier = _float_or(

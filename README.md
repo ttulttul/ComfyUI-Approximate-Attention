@@ -38,7 +38,7 @@ Inference:
 - `Flux2TTRControllerTrainer` supports `sigma_aware_training` (default `true`) for per-step sigma-dependent routing policy updates.
 - Controller checkpoints persist trainer state (`reward_baseline`, `reward_count`, optimizer state) for stable resume behavior.
 - `Flux2TTRController` exposes `quality_speed` to trade quality and speed through controller thresholding.
-- Flux2TTR landmark selection always includes all conditioning tokens as landmarks; the dynamic landmark budget is now applied only to image/spatial tokens.
+- Flux2TTR landmark selection always includes all conditioning tokens as landmarks; the dynamic landmark budget is applied only to image/spatial tokens, and `landmark_max=0` now means unlimited (the trainer node default).
 - Runtime accepts conditioning token hints through `transformer_options` keys: `conditioning_token_count`, `cond_token_count`, or `prefix_token_count`.
 - Comet logging now emits latest per-layer metrics for all tracked layers at each log tick, plus `flux2ttr/global/pareto_frontier` for ready-layer quality/coverage tracking.
 - Phase-1 TTR Comet logging now supports persistent experiments across ComfyUI sampling runs when `comet_experiment` is set, reusing the same Comet run key instead of ending at each cleanup.
