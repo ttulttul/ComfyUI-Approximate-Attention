@@ -111,3 +111,5 @@ scripts/build_paper.sh
 ```
 
 The script accepts `--dry-run`, `--engine latexmk`, and `--engine pdflatex --clean` as options.
+
+The paper text is now aligned with current implementation details (Kendall-weighted Phase-1 loss, EMA-cosine readiness with hysteresis, and sigma-aware stochastic controller routing), and lists the author as `Skoogeer`.

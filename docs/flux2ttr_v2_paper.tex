@@ -68,6 +68,10 @@
 
   \bigskip
 
+  {\large Author: Skoogeer}
+
+  \bigskip
+
   Technical Report\,---\,Work in Progress\\[2pt]
   February 2026
 \end{center}
@@ -225,20 +229,20 @@ where $\bphi(\cdot):\R^d\to\R^F_+$ is a learned feature map constrained to produ
 
 \subsection{Architecture: Two-Branch Hybrid}
 
-Pure kernel regression attention, while theoretically sound and linear-time, has known failure modes inherited from all linear attention variants: it struggles with sharp retrieval (where one key should dominate), rare correlations, and compositional binding~\citep{arora2024}. These are precisely the interactions where the softmax's exponential amplification matters most. Rather than accepting this quality gap, v2 compensates with a small exact-attention residual computed against a sparse set of landmark tokens. The full architecture is:
+Pure kernel regression attention, while theoretically sound and linear-time, has known failure modes inherited from all linear attention variants: it struggles with sharp retrieval (where one key should dominate), rare correlations, and compositional binding~\citep{arora2024}. These are precisely the interactions where the softmax's exponential amplification matters most. Rather than accepting this quality gap, v2 compensates with a small exact-attention residual computed against a sparse set of landmark tokens. The implemented fusion is a residual interpolation:
 \begin{equation}\label{eq:hybrid}
   \boxed{\;\text{Output}
-  = \underbrace{\text{Normalized Kernel Linear Attention}}_{\text{Branch A (linear-time)}}
-  + \;\alpha\cdot\underbrace{\text{Landmark Softmax Residual}}_{\text{Branch B (quality rescue)}}\;}
+  = \underbrace{\by^{\,\text{kernel}}}_{\text{Branch A (linear-time)}}
+  + \;\alpha\cdot\underbrace{\bigl(\by^{\,\text{landmark}}-\by^{\,\text{kernel}}\bigr)}_{\text{Branch B correction}}\;}
 \end{equation}
 
 \subsubsection{Branch A: Nadaraya--Watson Kernel Attention}
 
-Branch~A computes normalized kernel regression in linear time using chunked accumulation. The learned positive feature map $\bphi$ is implemented as an MLP followed by an $\ELU{+}1$ activation:
+Branch~A computes normalized kernel regression in linear time using chunked accumulation. The learned positive feature map $\bphi$ is implemented as a 3-layer MLP (\texttt{head\_dim -> hidden -> hidden -> feature\_dim}, with $\text{hidden}=\max(d,2F)$) followed by an $\ELU{+}1$ activation:
 \begin{equation}\label{eq:phi}
   \bphi(\mathbf{x}) = \ELU\bigl(\MLP(\mathbf{x})\bigr) + 1\,,
 \end{equation}
-which guarantees strictly positive features. Separate feature networks $\bphi_q$ and $\bphi_k$ are optionally supported but we default to shared weights. The computation proceeds in two phases:
+which guarantees strictly positive features. The implementation supports separate $\bphi_q$/$\bphi_k$ networks (default) and optionally L2-normalizes the resulting features before accumulation. The computation proceeds in two phases:
 
 \textbf{Accumulation phase} (one pass over keys, chunked). Compute the global numerator matrix and denominator vector, both accumulated in fp32 regardless of inference dtype:
 \begin{align}
@@ -260,18 +264,20 @@ Equally crucial is what Branch~A does \emph{not} do: there is no bidirectional s
 
 \subsubsection{Branch B: Landmark Softmax Residual}
 
-Branch~B performs exact softmax attention from all queries to a small set of $M$ landmark tokens (typically 64--256). Landmark selection is deterministic: all text conditioning tokens are included (as they carry critical semantic information), plus uniformly-spaced image tokens to fill the remaining budget. Effective landmarks scale dynamically:
+Branch~B performs exact softmax attention from all queries to a small set of landmark tokens. Landmark selection is deterministic: all conditioning-prefix tokens (text and any other provided conditioning tokens) are always included, and the landmark budget is applied only to image tokens using uniform spacing. Effective image landmarks scale dynamically:
 \begin{equation}\label{eq:landmarks}
-  M_\text{eff} = \mathrm{clamp}\bigl(\lfloor n\cdot f\rceil,\; M_\text{min},\; M_\text{max}\bigr)
+  M_\text{img} = \mathrm{clamp}\bigl(\lfloor n_\text{img}\cdot f\rceil,\; M_\text{min},\; M_\text{max}\bigr)
 \end{equation}
-where $f$ is a configurable fraction (default~0.08), $M_\text{min}=64$, $M_\text{max}=512$.
+where $f$ is a configurable fraction (default~0.08), $M_\text{min}=64$, and $M_\text{max}=0$ denotes ``no upper cap'' for image-token landmarks.
 
-The landmark attention cost is $O(n\cdot M\cdot d)$, which for $M=128$ and $n=16{,}384$ ($1024\times1024$ image) is approximately $128\times$ cheaper than full $n\times n$ attention. The landmark output is mixed in with a per-head learnable scalar~$\alpha$, initialized near zero so that the kernel branch dominates during early training:
+The landmark attention cost is $O(n\cdot M\cdot d)$, which for $M=128$ and $n=16{,}384$ ($1024\times1024$ image) is approximately $128\times$ cheaper than full $n\times n$ attention. The blend weight is stored in logit space and constrained to $(0,\alpha_{\max})$ by construction:
 \begin{equation}\label{eq:gate}
-  \by_i = \by_i^{\,\text{kernel}} + \alpha\cdot\by_i^{\,\text{landmark}}\,.
+  \alpha_i = \alpha_{\max}\,\sigma\!\bigl(\ell + \gamma\,(d_i - 0.5)\bigr),\qquad
+  \by_i = \by_i^{\,\text{kernel}} + \alpha_i\bigl(\by_i^{\,\text{landmark}}-\by_i^{\,\text{kernel}}\bigr)\,,
 \end{equation}
+where $d_i$ is a normalized per-token kernel-vs-landmark disagreement signal (cosine-distance based), $\ell$ is a learned base logit, and $\gamma$ controls adaptive sensitivity.
 
-The landmark branch serves as a ``quality rescue'' mechanism, compensating for the known limitations of kernel attention by providing a small dose of exact softmax computation at the tokens most likely to carry globally-relevant information. Because the landmark set always includes text tokens, the system preserves the text-to-image cross-attention pathways that are critical for prompt adherence.
+The landmark branch serves as a ``quality rescue'' mechanism, compensating for the known limitations of kernel attention by providing a small dose of exact softmax computation at the tokens most likely to carry globally-relevant information. Because all conditioning tokens are always retained as landmarks, the system preserves critical conditioning pathways while using the image-token budget for spatial detail.
 
 % ══════════════════════════════════════════════════════════════
 % 5. CORRECTED TRAINING
@@ -293,35 +299,43 @@ where both student and teacher receive the \emph{same} complete $\bK\in\R^{n\tim
 
 \subsection{Per-Layer Replay Buffers and Readiness Gating}
 
-Training on consecutive attention calls within a single denoising trajectory produces highly correlated gradients. We address this with per-layer replay buffers that store $(\bq_\text{sub}, \bK, \bV, \by_\text{teacher})$ tuples from previous steps, globally budgeted across all layers to a configurable memory cap (default 768\,MB) with oldest-sample eviction. Multiple training steps draw random minibatches from the buffer, providing temporal diversity across denoising timesteps and reducing overfitting to any single noise level.
+Training on consecutive attention calls within a single denoising trajectory produces highly correlated gradients. We address this with per-layer replay buffers that store $(\bq_\text{sub}, \bK, \bV, \by_\text{teacher}, \sigma,\text{CFG})$ tuples from previous steps, globally budgeted across all layers to a configurable memory cap (default 768\,MB) with oldest-sample eviction and CPU offload by default. Multiple training steps draw random minibatches from the buffer, providing temporal diversity across denoising timesteps and reducing overfitting to any single noise level.
 
-Each layer maintains an exponential moving average of its training loss:
+Each layer maintains an exponential moving average of \emph{cosine distance} (not raw loss) as the readiness statistic:
 \begin{equation}
-  \bar{\mathcal{L}}_t = \beta\,\bar{\mathcal{L}}_{t-1} + (1-\beta)\,\mathcal{L}_t\,,
+  \bar{d}_t = \beta\,\bar{d}_{t-1} + (1-\beta)\,d_t\,,
   \qquad \beta=0.9\,.
 \end{equation}
-A layer is flagged as ``ready'' for deployment only when $\bar{\mathcal{L}} < \tau$ (configurable threshold) and it has accumulated a minimum number of training updates. Non-ready layers are clamped to full attention during inference regardless of the controller's output.
+To reduce within-image correlation, updates are accumulated during a denoising run and flushed once at run boundaries (with a periodic fallback flush every $\sim$20 updates if no sigma boundary appears). A layer is marked ready only when it has enough updates and $\bar{d}\le\tau$; once ready, hysteresis keeps it ready until $\bar{d}>\,1.2\tau$. Non-ready layers are clamped to full attention during inference regardless of controller output.
 
 \subsection{Loss Function and Optimization}
 
-The training loss combines three terms:
+Phase-1 distillation uses uncertainty-weighted multi-task loss over Smooth~L1 and cosine alignment:
 \begin{equation}\label{eq:loss}
-  \mathcal{L} = w_\text{rmse}\cdot\mathcal{L}_\text{RMSE}
-              + w_\text{cos}\cdot(1 - \cos\text{-sim})
-              + w_\text{lpips}\cdot\mathcal{L}_\text{LPIPS}
+  \mathcal{L}
+  = \frac{\mathcal{L}_\text{huber}}{2e^{s_h}} + \frac{s_h}{2}
+  + \frac{\mathcal{L}_\text{cos}}{2e^{s_c}} + \frac{s_c}{2},
+  \qquad
+  \mathcal{L}_\text{cos} = 1 - \cos\text{-sim}\,.
 \end{equation}
-where RMSE captures overall magnitude, cosine dissimilarity captures directional alignment in the high-dimensional output space, and LPIPS~\citep{zhang2018} (computed by decoding both outputs to pixel space) ensures the distillation preserves perceptually-relevant structure. Optimization uses AdamW with separate learning rates for the feature-map parameters (lower) and the gate/$\alpha$ parameters (higher), plus gradient clipping at norm~1.0 for stability.
+Here $s_h$ and $s_c$ are learned log-variance scalars. Cosine alignment is computed per token/head over the feature axis (not on flattened vectors), which gives better directional pressure on hard tokens. Optimization uses AdamW with separate learning rates for feature-map parameters and alpha-logit parameters, gradient clipping, and a dedicated optimizer for $(s_h,s_c)$.
 
 % ══════════════════════════════════════════════════════════════
 % 6. CONTROLLER
 % ══════════════════════════════════════════════════════════════
 \section{Phase 2: Learned Dynamic Controller}
 
-Once TTR layers have been distilled, a binary controller is trained to decide per-layer, per-denoising-step routing. The controller runs dual-path sampling: the original model as teacher versus the TTR-patched model as student. It computes quality deltas ($\Delta$RMSE, $\Delta$cosine, $\Delta$LPIPS) between the two paths and updates its routing policy via REINFORCE~\citep{williams1992}, with the reward balancing image quality against a configurable efficiency target (the fraction of layers routed to TTR).
+Once TTR layers have been distilled, a binary controller is trained to decide per-layer, per-denoising-step routing. The controller embeds $(\sigma,\text{CFG},\text{width},\text{height})$ with sinusoidal features and predicts one routing logit per layer. Training runs dual-path sampling: original model as teacher versus TTR-patched model as student. Policy updates use REINFORCE~\citep{williams1992} with reward shaping:
+\begin{equation}
+  r = -\mathcal{L}_\text{quality}
+      - \lambda_\text{eff}\,\max\!\bigl(0,\rho_\text{full}^{\text{eligible}}-(1-\rho_\text{ttr}^{\star})\bigr)
+      + \lambda_\text{ent}\,H\,,
+\end{equation}
+where $\mathcal{L}_\text{quality}$ combines RMSE, cosine distance, and optional LPIPS~\citep{zhang2018}; $\rho_\text{full}^{\text{eligible}}$ is full-attention usage over readiness-eligible layers; and $H$ is an entropy bonus preventing policy collapse.
 
-The controller uses Gumbel-Softmax relaxation during training, annealing temperature from a warm start to near-deterministic selection. At inference, a quality/speed slider maps to a probability threshold: $0.0$ favors maximum TTR usage (threshold~$0.1$), $1.0$ favors full attention (threshold~$0.9$). Efficiency targets are computed only over readiness-qualified layers, with both eligible-layer and overall ratios logged for interpretability.
+In sigma-aware training mode (default), masks are sampled per diffusion step and trajectory log-prob is recomputed from stored $(\sigma,\text{mask})$ actions to keep gradients valid under host inference-mode constraints. At inference, a quality/speed slider maps to a threshold ($0.1+0.8\,\text{quality\_speed}$). Two policy modes are supported: \texttt{stochastic} (default; one sampled mask per step) and \texttt{threshold} (deterministic cutoff). Efficiency targets are computed over readiness-qualified layers, with eligible-layer and overall routing ratios logged separately.
 
-Critically, the controller currently operates only on layer index and diffusion timestep ($\sigma$) information. It does not examine text tokens or image content. We believe this is a significant limitation: intuitively, some prompts require more precise attention (e.g., detailed spatial compositions, text rendering) while others are more tolerant of approximation (e.g., simple scenes, abstract imagery). Future work will extend the controller with a small MLP that extracts signal from the text conditioning tokens to guide routing decisions.
+Critically, the controller still does not directly inspect prompt-token or latent-content features. It uses only scalar run-state inputs ($\sigma$, CFG, resolution). This remains a significant limitation: some prompts require precision (text rendering, counting, strict layouts) while others tolerate approximation. Future work will add prompt/content features to routing decisions.
 
 % ══════════════════════════════════════════════════════════════
 % 7. COMPUTATIONAL ANALYSIS
@@ -381,15 +395,15 @@ Flux2TTR v2 is a work in progress. However, early training on a single RTX~4090 
 
 \subsection{Layer Distillation}
 
-After a few hours of online distillation during normal image generation workflows, approximately half of Flux2's single-stream attention layers converge to EMA losses below the deployment threshold. These layers span primarily the middle and later blocks, consistent with the intuition that early layers (which establish coarse global structure) require more precise attention, while later layers (which refine local detail within an already-structured representation) tolerate the kernel regression approximation. The aggregate training snapshots logged every 10~updates show clear loss convergence with q25--q75 ranges for per-layer loss, cosine similarity, and NMSE all tightening over time.
+After a few hours of online distillation during normal image generation workflows, approximately half of Flux2's single-stream attention layers converge to EMA cosine-distance thresholds suitable for deployment. These layers span primarily the middle and later blocks, consistent with the intuition that early layers (which establish coarse global structure) require more precise attention, while later layers (which refine local detail within an already-structured representation) tolerate the kernel regression approximation. Aggregate training snapshots logged every 10~updates show clear convergence, including tightening q25--q75 ranges for per-layer loss, cosine similarity, and NMSE.
 
 \subsection{Image Quality}
 
-Images generated with TTR~v2 substitution on ready layers are in many cases coherent enough to be used. The most common degradation is a subtle softening of fine texture and high-frequency detail, consistent with the kernel attention's smoothing bias. Prompt adherence, global composition, and color fidelity are largely preserved, likely thanks to the landmark branch's inclusion of all text tokens in its exact-attention set.
+Images generated with TTR~v2 substitution on ready layers are in many cases coherent enough to be used. The most common degradation is a subtle softening of fine texture and high-frequency detail, consistent with the kernel attention's smoothing bias. Prompt adherence, global composition, and color fidelity are largely preserved, likely thanks to always retaining conditioning tokens in the exact-attention landmark set.
 
 \subsection{Controller Routing}
 
-The REINFORCE-trained controller learns meaningful routing patterns: it routes more layers to TTR during early denoising steps (high~$\sigma$ / high noise, where attention patterns are diffuse) and falls back to full attention during later steps (low~$\sigma$, where fine detail matters). This sigma-dependent routing emerges naturally from the quality/efficiency reward signal without explicit scheduling.
+The REINFORCE-trained controller learns meaningful routing patterns: it routes more layers to TTR during early denoising steps (high~$\sigma$ / high noise, where attention patterns are diffuse) and falls back to full attention during later steps (low~$\sigma$, where fine detail matters). This sigma-dependent routing emerges from reward shaping and per-step stochastic policy sampling rather than explicit hand scheduling.
 
 % ══════════════════════════════════════════════════════════════
 % 9. v1 vs v2 COMPARISON
@@ -409,7 +423,7 @@ Truncated Taylor expansion of $\exp$ kernel; polynomial feature map over minimal
 Nadaraya--Watson normalized kernel regression with learned positive feature map \\[4pt]
 Feature map &
 Deterministic (symmetric tensor indices) or learned (unconstrained) &
-Learned MLP + $\ELU{+}1$ (guaranteed positive) \\[4pt]
+Learned 3-layer MLP (+ optional split Q/K) + $\ELU{+}1$ \\[4pt]
 Feature dimension &
 $\binom{d/B+P-1}{P-1}$; e.g.\ 6,545 ($B{=}4$) or 373,156 ($B{=}1$) &
 Configurable; typically 256 \\[4pt]
@@ -421,10 +435,10 @@ Bidirectional prefix/suffix scan (raster-order bias) &
 Global commutative sums (order-independent) \\[4pt]
 Quality rescue &
 None (fallback to full attention on failure) &
-Landmark softmax residual (64--512 tokens, learnable gate) \\[4pt]
+Landmark softmax correction with bounded residual interpolation \\[4pt]
 Distillation &
 Joint Q/K/V subsampling (internally inconsistent) &
-Query-only subsampling; full K/V preserved \\[4pt]
+Query-only subsampling, Kendall-style loss weighting, EMA-cosine readiness + hysteresis \\[4pt]
 Practical result &
 Failed to produce acceptable images after extensive tuning &
 ${\sim}50\%$ of layers distillable; coherent images after hours of training \\
@@ -449,7 +463,7 @@ Third, \textbf{distillation setup errors dominate approximation errors}. Our v1'
 
 \subsection{Current Limitations}
 
-Several important limitations remain. The landmark softmax branch, while much cheaper than full attention, still scales as $O(n\cdot M)$, contributing to memory pressure at very high resolutions. The controller architecture is currently blind to prompt content---it cannot distinguish a prompt requiring precise spatial composition (``a red ball on the left and a blue ball on the right'') from one tolerant of approximation (``a sunset over the ocean''). The distillation requires running the teacher model alongside the student during training, roughly doubling compute cost during the training phase.
+Several important limitations remain. The landmark softmax branch, while much cheaper than full attention, still scales as $O(n\cdot M)$, contributing to memory pressure at very high resolutions. The controller still lacks direct prompt/content features and cannot distinguish a prompt requiring precise spatial composition (``a red ball on the left and a blue ball on the right'') from one tolerant of approximation (``a sunset over the ocean''). The distillation requires running the teacher model alongside the student during training, roughly doubling compute cost during the training phase.
 
 \subsection{Future Work}
 
