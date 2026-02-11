@@ -54,6 +54,8 @@ Here `log_var_huber` and `log_var_cosine` are learned scalars that let neither o
 
 **Checkpointing.** Phase 1 checkpoints persist per-layer AdamW optimizer states and the loss-weight optimizer state for `log_var_huber` / `log_var_cosine`, so cross-run resume preserves momentum and variance estimates instead of restarting optimizer warmup. Layer and optimizer restoration strips inference-tensor metadata and auto-rebuilds stale inference-backed layers before replay training, preventing "inplace update to inference tensor" failures at run boundaries. Loss-balance parameters are likewise rebuilt as normal trainable tensors if they were created under `torch.inference_mode()`.
 
+When `comet_experiment` is not provided, `Flux2TTRRuntime` now auto-generates a per-runtime Comet experiment key using `git rev-parse --short=7 HEAD` plus a start timestamp (`YYYYMMDD-HHMMSS`), and enables persistent experiment reuse for that key.
+
 **Inference-mode safety.** The codebase includes explicit `torch.inference_mode(False)` and grad-enabled guards, plus inference-tensor rebuild paths, to handle the ComfyUI runtime context cleanly.
 
 ### Phase 2: Controller Network

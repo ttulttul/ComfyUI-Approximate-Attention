@@ -73,6 +73,24 @@ _COMET_AGG_METRICS = (
     "layers_total",
 )
 
+
+def _generate_experiment_key() -> str:
+    """Build a unique Comet experiment key from git HEAD + current time."""
+    import datetime
+    import subprocess
+
+    try:
+        short_hash = subprocess.check_output(
+            ["git", "rev-parse", "--short=7", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        short_hash = "nogit"
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{short_hash}-{ts}"
+
+
 try:
     from comfy import model_management
 except Exception:
@@ -866,6 +884,10 @@ class Flux2TTRRuntime:
         self.comet_workspace = str(comet_workspace or "comet-workspace")
         self.comet_experiment = str(comet_experiment or "").strip()
         self.comet_persist_experiment = bool(comet_persist_experiment) and bool(self.comet_experiment)
+        # Auto-generate a unique experiment key if none was provided.
+        if not self.comet_experiment:
+            self.comet_experiment = _generate_experiment_key()
+            self.comet_persist_experiment = True
         self.comet_log_every = max(1, int(comet_log_every))
 
         self.max_safe_inference_loss = float(_MAX_SAFE_INFERENCE_LOSS)

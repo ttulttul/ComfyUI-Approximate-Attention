@@ -1693,6 +1693,8 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     fake_comet = types.ModuleType("comet_ml")
     fake_comet.start = _fake_start
     monkeypatch.setitem(sys.modules, "comet_ml", fake_comet)
+    flux2_ttr._TTR_COMET_EXPERIMENTS.clear()
+    flux2_ttr._TTR_COMET_LOGGED_PARAM_KEYS.clear()
 
     runtime = flux2_ttr.Flux2TTRRuntime(
         feature_dim=256,
@@ -1703,6 +1705,8 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
         comet_api_key="test-key",
         comet_project_name="proj",
         comet_workspace="ws",
+        comet_experiment="metrics_test_run",
+        comet_persist_experiment=False,
         comet_log_every=1,
     )
     runtime.training_updates_done = 3
@@ -1715,7 +1719,7 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     runtime._record_training_metrics("single:11", {"loss": 0.5, "mse": 1.0, "nmse": 0.9, "cosine_similarity": 0.8, "ema_loss": 0.7})
     runtime._record_training_metrics("single:10", {"loss": 1.0, "mse": 2.0})
 
-    assert start_calls == [("test-key", "proj", "ws", None)]
+    assert start_calls == [("test-key", "proj", "ws", "metrics_test_run")]
     assert len(params_calls) == 1
     assert metric_calls
     payload, step = metric_calls[-1]
@@ -1773,6 +1777,8 @@ def test_record_training_metrics_logs_pareto_frontier_edge_cases(monkeypatch):
     fake_comet = types.ModuleType("comet_ml")
     fake_comet.start = _fake_start
     monkeypatch.setitem(sys.modules, "comet_ml", fake_comet)
+    flux2_ttr._TTR_COMET_EXPERIMENTS.clear()
+    flux2_ttr._TTR_COMET_LOGGED_PARAM_KEYS.clear()
 
     runtime = flux2_ttr.Flux2TTRRuntime(
         feature_dim=256,
@@ -1783,6 +1789,8 @@ def test_record_training_metrics_logs_pareto_frontier_edge_cases(monkeypatch):
         comet_api_key="test-key",
         comet_project_name="proj",
         comet_workspace="ws",
+        comet_experiment="pareto_test_run",
+        comet_persist_experiment=False,
         comet_log_every=1,
     )
     runtime.training_updates_done = 1
@@ -1826,6 +1834,8 @@ def test_record_training_metrics_throttles_comet_logging(monkeypatch):
     fake_comet = types.ModuleType("comet_ml")
     fake_comet.start = _fake_start
     monkeypatch.setitem(sys.modules, "comet_ml", fake_comet)
+    flux2_ttr._TTR_COMET_EXPERIMENTS.clear()
+    flux2_ttr._TTR_COMET_LOGGED_PARAM_KEYS.clear()
 
     runtime = flux2_ttr.Flux2TTRRuntime(
         feature_dim=256,
@@ -1836,6 +1846,8 @@ def test_record_training_metrics_throttles_comet_logging(monkeypatch):
         comet_api_key="test-key",
         comet_project_name="proj",
         comet_workspace="ws",
+        comet_experiment="throttle_test_run",
+        comet_persist_experiment=False,
         comet_log_every=50,
     )
 
@@ -1919,6 +1931,33 @@ def test_comet_experiment_persists_across_runtime_release(monkeypatch):
     runtime_b.comet_persist_experiment = False
     runtime_b.release_resources()
     assert end_calls == [True]
+
+
+def test_runtime_autogenerates_comet_experiment_key_when_missing(monkeypatch):
+    monkeypatch.setattr(flux2_ttr, "_generate_experiment_key", lambda: "abc1234-20260211-143022")
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        comet_experiment="",
+        comet_persist_experiment=False,
+    )
+    assert runtime.comet_experiment == "abc1234-20260211-143022"
+    assert runtime.comet_persist_experiment is True
+
+
+def test_runtime_honors_explicit_comet_experiment_key():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        comet_experiment="manual_exp_key",
+        comet_persist_experiment=False,
+    )
+    assert runtime.comet_experiment == "manual_exp_key"
+    assert runtime.comet_persist_experiment is False
 
 
 def test_release_resources_clears_run_ema_accumulator_state():
