@@ -57,6 +57,7 @@ Inference:
 - Loss-balance parameters are now rebuilt as normal trainable tensors if created under `torch.inference_mode()`, preventing Adam in-place update failures in ComfyUI runtime contexts.
 - Layer blend `alpha` is now stored in logit-space and interpreted through `sigmoid`; forward pass supports error-driven adaptive per-token alpha gating, and old raw-alpha checkpoints are auto-migrated on load.
 - Landmark/kernel blending now uses residual gating (`out_kernel + alpha * (out_land - out_kernel)`) so alpha controls interpolation toward landmark attention instead of adding an unconditional landmark residual.
+- Adaptive alpha now uses cosine disagreement with logit-space shifts and an explicit cap (`alpha_max`, default `0.2`), so per-token blend weights stay strictly convex (`0 < alpha < alpha_max`) in both adaptive and non-adaptive paths.
 - Controller inference now logs per-step routing summaries (extracted sigma, controller threshold, and student-routed layer set) once per step.
 - `Flux2TTRController` supports `policy_mode` (`stochastic` or `threshold`). The default `stochastic` mode samples one controller mask per diffusion step (cached for all layer calls in that step) to match sigma-aware policy training behavior.
 - The HKR phi feature map MLP now uses split Q/K networks by default and a 3-layer shape (`head_dim -> hidden -> hidden -> feature_dim`) with two SiLU activations, where `hidden = max(head_dim, 2 * feature_dim)`, increasing kernel expressivity versus the previous 2-layer mapping.

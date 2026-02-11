@@ -528,6 +528,8 @@ class Flux2HKRAttnLayer(nn.Module):
         text_tokens_guess: int = _DEFAULT_TEXT_TOKENS_GUESS,
         landmark_qk_norm: bool = False,
         alpha_init: float = 0.1,
+        alpha_max: float = 0.2,
+        gamma: float = 2.0,
     ):
         super().__init__()
         self.head_dim = int(head_dim)
@@ -542,6 +544,8 @@ class Flux2HKRAttnLayer(nn.Module):
         self.text_tokens_guess = max(0, int(text_tokens_guess))
         self.landmark_qk_norm = bool(landmark_qk_norm)
         self.adaptive_alpha = True
+        self.alpha_max = max(0.0, min(1.0, float(alpha_max)))
+        self.gamma = float(gamma)
 
         self.kernel = KernelRegressorAttention(
             head_dim=self.head_dim,
@@ -737,19 +741,22 @@ class Flux2HKRAttnLayer(nn.Module):
 
         self.last_den_min = float(self.kernel.last_den_min)
 
-        base_alpha = torch.sigmoid(self.alpha)
+        base_logit = self.alpha  # raw logit, not sigmoided yet
 
         if self.adaptive_alpha:
             with torch.no_grad():
                 diff = out_kernel.float() - out_land.float()
-                disagreement = diff.norm(dim=-1)                          # [B, H, N]
+                # Use cosine disagreement instead of L2 norm to avoid magnitude bias
+                disagreement = 1.0 - F.cosine_similarity(out_kernel.float(), out_land.float(), dim=-1)  # [B, H, N]
                 d_mean = disagreement.mean(dim=-1, keepdim=True).clamp(min=1e-6)
                 d_norm = (disagreement / d_mean).clamp(max=3.0) / 3.0    # [B, H, N] in [0, 1]
 
-            alpha_per_token = (base_alpha * (0.5 + d_norm)).unsqueeze(-1).to(dtype=v.dtype)  # [B, H, N, 1]
+            # Modulate the logit directly so alpha_per_token stays in (0, alpha_max) by construction
+            alpha_per_token = self.alpha_max * torch.sigmoid(base_logit + self.gamma * (d_norm - 0.5))
+            alpha_per_token = alpha_per_token.unsqueeze(-1).to(dtype=v.dtype)  # [B, H, N, 1]
             return out_kernel + alpha_per_token * (out_land - out_kernel)
         else:
-            alpha = base_alpha.to(dtype=v.dtype)
+            alpha = (self.alpha_max * torch.sigmoid(base_logit)).to(dtype=v.dtype)
             return out_kernel + alpha.view(1, 1, 1, 1) * (out_land - out_kernel)
 
 
@@ -771,6 +778,8 @@ class Flux2TTRRuntime:
         landmark_max: int = _DEFAULT_LANDMARK_MAX,
         text_tokens_guess: int = _DEFAULT_TEXT_TOKENS_GUESS,
         alpha_init: float = 0.1,
+        alpha_max: float = 0.2,
+        gamma: float = 2.0,
         alpha_lr_multiplier: float = _DEFAULT_ALPHA_LR_MUL,
         phi_lr_multiplier: float = _DEFAULT_PHI_LR_MUL,
         training_query_token_cap: int = _DEFAULT_TRAIN_QUERY_CAP,
@@ -816,6 +825,8 @@ class Flux2TTRRuntime:
         self.landmark_max = _normalize_landmark_max(landmark_max)
         self.text_tokens_guess = max(0, int(text_tokens_guess))
         self.alpha_init = float(alpha_init)
+        self.alpha_max = max(0.0, min(1.0, float(alpha_max)))
+        self.gamma = float(gamma)
         self.alpha_lr_multiplier = max(0.0, float(alpha_lr_multiplier))
         self.phi_lr_multiplier = max(0.0, float(phi_lr_multiplier))
 
@@ -1625,6 +1636,8 @@ class Flux2TTRRuntime:
                     landmark_max=self.landmark_max,
                     text_tokens_guess=self.text_tokens_guess,
                     alpha_init=self.alpha_init,
+                    alpha_max=self.alpha_max,
+                    gamma=self.gamma,
                 ).to(device=device, dtype=torch.float32)
             self._sync_layer_landmark_config(layer)
             optimizer = self._ensure_optimizer(layer)
@@ -2784,6 +2797,8 @@ class Flux2TTRRuntime:
             "landmark_max": self.landmark_max,
             "text_tokens_guess": self.text_tokens_guess,
             "alpha_init": self.alpha_init,
+            "alpha_max": self.alpha_max,
+            "gamma": self.gamma,
             "alpha_lr_multiplier": self.alpha_lr_multiplier,
             "phi_lr_multiplier": self.phi_lr_multiplier,
             "training_query_token_cap": self.training_query_token_cap,
@@ -2901,6 +2916,8 @@ class Flux2TTRRuntime:
         self.landmark_max = _normalize_landmark_max(self.landmark_max)
         self.text_tokens_guess = max(0, int(payload.get("text_tokens_guess", self.text_tokens_guess)))
         self.alpha_init = float(payload.get("alpha_init", self.alpha_init))
+        self.alpha_max = max(0.0, min(1.0, float(payload.get("alpha_max", 0.2))))
+        self.gamma = float(payload.get("gamma", 2.0))
         self.alpha_lr_multiplier = float(payload.get("alpha_lr_multiplier", self.alpha_lr_multiplier))
         self.phi_lr_multiplier = float(payload.get("phi_lr_multiplier", self.phi_lr_multiplier))
 
@@ -3054,6 +3071,8 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         landmark_max=int(cfg.get("landmark_max", _DEFAULT_LANDMARK_MAX)),
         text_tokens_guess=int(cfg.get("text_tokens_guess", _DEFAULT_TEXT_TOKENS_GUESS)),
         alpha_init=float(cfg.get("alpha_init", 0.1)),
+        alpha_max=float(cfg.get("alpha_max", 0.2)),
+        gamma=float(cfg.get("gamma", 2.0)),
         alpha_lr_multiplier=float(cfg.get("alpha_lr_multiplier", _DEFAULT_ALPHA_LR_MUL)),
         phi_lr_multiplier=float(cfg.get("phi_lr_multiplier", _DEFAULT_PHI_LR_MUL)),
         training_query_token_cap=int(cfg.get("training_query_token_cap", _DEFAULT_TRAIN_QUERY_CAP)),

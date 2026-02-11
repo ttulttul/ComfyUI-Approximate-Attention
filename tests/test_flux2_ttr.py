@@ -6,6 +6,7 @@ from collections import deque
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import flux2_ttr
 import flux2_ttr_controller
@@ -223,6 +224,8 @@ def test_flux2_hkr_alpha_init_uses_logit_space_with_adaptive_enabled():
     layer = flux2_ttr.Flux2HKRAttnLayer(head_dim=8, feature_dim=256, alpha_init=0.1)
     assert layer.adaptive_alpha is True
     assert float(torch.sigmoid(layer.alpha).item()) == pytest.approx(0.1, rel=1e-4, abs=1e-4)
+    assert float(layer.alpha_max) == pytest.approx(0.2)
+    assert float(layer.gamma) == pytest.approx(2.0)
 
 
 def test_flux2_hkr_adaptive_alpha_gating_modulates_blend_per_token(monkeypatch):
@@ -231,21 +234,25 @@ def test_flux2_hkr_adaptive_alpha_gating_modulates_blend_per_token(monkeypatch):
     k = torch.zeros(1, 1, 2, 2)
     v = torch.zeros(1, 1, 2, 2)
 
-    out_kernel = torch.tensor([[[[0.0, 0.0], [0.0, 0.0]]]], dtype=torch.float32)
-    out_land = torch.tensor([[[[1.0, 0.0], [2.0, 0.0]]]], dtype=torch.float32)
+    out_kernel = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]], dtype=torch.float32)
+    out_land = torch.tensor([[[[1.0, 0.0], [-1.0, 0.0]]]], dtype=torch.float32)
 
     monkeypatch.setattr(layer.kernel, "forward", lambda *args, **kwargs: out_kernel.clone())
     monkeypatch.setattr(layer, "_landmark_attention", lambda *args, **kwargs: out_land.clone())
 
     out = layer(q, k, v)
 
-    base_alpha = torch.sigmoid(layer.alpha.detach())
+    base_logit = layer.alpha.detach()
     diff = out_kernel.float() - out_land.float()
-    disagreement = diff.norm(dim=-1)
+    disagreement = 1.0 - F.cosine_similarity(out_kernel.float(), out_land.float(), dim=-1)
     d_mean = disagreement.mean(dim=-1, keepdim=True).clamp(min=1e-6)
     d_norm = (disagreement / d_mean).clamp(max=3.0) / 3.0
-    expected = out_kernel + (base_alpha * (0.5 + d_norm)).unsqueeze(-1) * (out_land - out_kernel)
+    alpha_per_token = layer.alpha_max * torch.sigmoid(base_logit + layer.gamma * (d_norm - 0.5))
+    expected = out_kernel + alpha_per_token.unsqueeze(-1) * (out_land - out_kernel)
     assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
+    assert float(alpha_per_token.max().item()) <= float(layer.alpha_max) + 1e-6
+    assert float(alpha_per_token.min().item()) > 0.0
+    assert float(alpha_per_token[0, 0, 1].item()) > float(alpha_per_token[0, 0, 0].item())
 
 
 def test_flux2_hkr_non_adaptive_alpha_uses_scalar_blend(monkeypatch):
@@ -263,7 +270,7 @@ def test_flux2_hkr_non_adaptive_alpha_uses_scalar_blend(monkeypatch):
 
     out = layer(q, k, v)
 
-    alpha = torch.sigmoid(layer.alpha.detach())
+    alpha = layer.alpha_max * torch.sigmoid(layer.alpha.detach())
     expected = out_kernel + alpha.view(1, 1, 1, 1) * (out_land - out_kernel)
     assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
 
@@ -418,6 +425,8 @@ def test_train_from_replay_loss_combines_huber_and_cosine(monkeypatch):
             )
         ]
     )
+    layer = runtime._ensure_layer(layer_key=layer_key, head_dim=4, device=torch.device("cpu"))
+    layer.adaptive_alpha = False
 
     seen_dims = []
     seen_eps = []
@@ -1101,6 +1110,8 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
         landmark_fraction=0.12,
         landmark_min=48,
         landmark_max=640,
+        alpha_max=0.33,
+        gamma=3.25,
         readiness_min_updates=1,
         readiness_threshold=10.0,
         cfg_scale=3.5,
@@ -1140,6 +1151,8 @@ def test_checkpoint_round_trip_preserves_state(tmp_path):
     assert runtime_loaded.landmark_fraction == pytest.approx(0.12)
     assert runtime_loaded.landmark_min == 48
     assert runtime_loaded.landmark_max == 640
+    assert runtime_loaded.alpha_max == pytest.approx(0.33)
+    assert runtime_loaded.gamma == pytest.approx(3.25)
     assert runtime_loaded.cfg_scale == pytest.approx(3.5)
     assert runtime_loaded.min_swap_layers == 2
     assert runtime_loaded.max_swap_layers == 5
@@ -1224,6 +1237,8 @@ def test_checkpoint_state_includes_per_layer_readiness_criteria():
     runtime._refresh_layer_ready("single:0")
 
     payload = runtime.checkpoint_state()
+    assert float(payload["alpha_max"]) == pytest.approx(runtime.alpha_max)
+    assert float(payload["gamma"]) == pytest.approx(runtime.gamma)
     assert "layer_readiness" in payload
     assert "single:0" in payload["layer_readiness"]
     meta = payload["layer_readiness"]["single:0"]
@@ -1485,6 +1500,8 @@ def test_recover_runtime_from_config_training_without_checkpoint():
         "landmark_fraction": 0.2,
         "landmark_min": 32,
         "landmark_max": 320,
+        "alpha_max": 0.27,
+        "gamma": 3.7,
         "cfg_scale": 2.25,
         "min_swap_layers": 3,
         "max_swap_layers": 7,
@@ -1499,9 +1516,25 @@ def test_recover_runtime_from_config_training_without_checkpoint():
     assert runtime.landmark_fraction == pytest.approx(0.2)
     assert runtime.landmark_min == 32
     assert runtime.landmark_max == 320
+    assert runtime.alpha_max == pytest.approx(0.27)
+    assert runtime.gamma == pytest.approx(3.7)
     assert runtime.cfg_scale == pytest.approx(2.25)
     assert runtime.min_swap_layers == 3
     assert runtime.max_swap_layers == 7
+
+
+def test_runtime_ensure_layer_propagates_alpha_max_and_gamma():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        alpha_max=0.41,
+        gamma=4.5,
+    )
+    layer = runtime._ensure_layer(layer_key="single:0", head_dim=4, device=torch.device("cpu"))
+    assert layer.alpha_max == pytest.approx(0.41)
+    assert layer.gamma == pytest.approx(4.5)
 
 
 def test_recover_runtime_from_config_inference_overrides_checkpoint_mode(tmp_path):
