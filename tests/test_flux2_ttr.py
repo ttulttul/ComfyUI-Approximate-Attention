@@ -1598,6 +1598,50 @@ def test_recover_runtime_from_config_inference_overrides_checkpoint_mode(tmp_pat
     assert runtime.training_preview_ttr is False
 
 
+def test_recover_runtime_from_config_comet_settings_override_checkpoint(tmp_path):
+    runtime_train = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-4,
+        training=True,
+        steps=4,
+        comet_enabled=True,
+        comet_project_name="ckpt_proj",
+        comet_workspace="ckpt_ws",
+        comet_experiment="ckpt_exp",
+        comet_persist_experiment=True,
+        comet_log_every=77,
+    )
+    ckpt = tmp_path / "flux2_ttr_recover_comet.pt"
+    runtime_train.save_checkpoint(str(ckpt))
+
+    cfg = {
+        "training_mode": True,
+        "training": True,
+        "training_steps_total": 8,
+        "training_steps_remaining": 8,
+        "learning_rate": 1e-4,
+        "feature_dim": 256,
+        "query_chunk_size": 256,
+        "key_chunk_size": 1024,
+        "checkpoint_path": str(ckpt),
+        "comet_enabled": False,
+        "comet_project_name": "ui_proj",
+        "comet_workspace": "ui_ws",
+        "comet_experiment": "ui_exp",
+        "comet_persist_experiment": True,
+        "comet_log_every": 9,
+    }
+
+    runtime = flux2_ttr._recover_runtime_from_config(cfg)
+    assert runtime is not None
+    assert runtime.comet_enabled is False
+    assert runtime.comet_project_name == "ui_proj"
+    assert runtime.comet_workspace == "ui_ws"
+    assert runtime.comet_experiment == "ui_exp"
+    assert runtime.comet_persist_experiment is True
+    assert runtime.comet_log_every == 9
+
+
 def test_recover_runtime_from_config_loads_controller_checkpoint(tmp_path):
     controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
     controller_ckpt = tmp_path / "controller.pt"

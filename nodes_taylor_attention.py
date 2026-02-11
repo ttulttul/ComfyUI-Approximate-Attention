@@ -661,6 +661,13 @@ class Flux2TTRTrainer(io.ComfyNode):
             comet_experiment=comet_experiment,
             log_every=comet_log_every,
         )
+        ui_comet_enabled = bool(comet_enabled)
+        ui_comet_api_key = str(comet_api_key or "")
+        ui_comet_project_name = str(comet_project_name or "ttr-distillation")
+        ui_comet_workspace = str(comet_workspace or "comet-workspace")
+        ui_comet_experiment = str(comet_experiment or "").strip()
+        ui_comet_persist_experiment = bool(ui_comet_experiment)
+        ui_comet_log_every = max(1, int(comet_log_every))
 
         m = model.clone()
         transformer_options = m.model_options.setdefault("transformer_options", {})
@@ -734,6 +741,16 @@ class Flux2TTRTrainer(io.ComfyNode):
             runtime.steps_remaining = 0
             runtime.training_updates_done = 0
             loss_value = float(runtime.last_loss) if not math.isnan(runtime.last_loss) else 0.0
+
+        # UI training_config should override checkpoint metadata for Comet fields.
+        if has_training_config:
+            runtime.comet_enabled = ui_comet_enabled
+            runtime.comet_api_key = ui_comet_api_key
+            runtime.comet_project_name = ui_comet_project_name
+            runtime.comet_workspace = ui_comet_workspace
+            runtime.comet_experiment = ui_comet_experiment
+            runtime.comet_persist_experiment = bool(ui_comet_persist_experiment and ui_comet_experiment)
+            runtime.comet_log_every = ui_comet_log_every
 
         runtime.cfg_scale = float(cfg_scale)
         runtime.min_swap_layers = max(0, int(min_swap_layers))
