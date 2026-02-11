@@ -1667,7 +1667,12 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             total_steps,
                             checkpoint_path,
                         )
-                    if comet_experiment is not None and (global_step % log_every == 0 or global_step == total_steps):
+                    if comet_experiment is not None and flux2_comet_logging.should_log_step(
+                        step=global_step,
+                        every=log_every,
+                        total_steps=total_steps,
+                        include_first_step=True,
+                    ):
                         cls._safe_comet_log_metrics(
                             comet_experiment,
                             cls._build_comet_metrics(metrics),

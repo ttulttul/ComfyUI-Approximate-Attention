@@ -145,6 +145,48 @@ def test_safe_log_metrics_returns_false_on_experiment_error():
     assert ok is False
 
 
+def test_should_log_step_can_force_first_step():
+    assert flux2_comet_logging.should_log_step(
+        step=1,
+        every=10,
+        total_steps=100,
+        include_first_step=True,
+    )
+    assert not flux2_comet_logging.should_log_step(
+        step=2,
+        every=10,
+        total_steps=100,
+        include_first_step=True,
+    )
+    assert flux2_comet_logging.should_log_step(
+        step=10,
+        every=10,
+        total_steps=100,
+        include_first_step=True,
+    )
+
+
+def test_should_log_step_uses_interval_and_final_step_by_default():
+    assert not flux2_comet_logging.should_log_step(
+        step=1,
+        every=10,
+        total_steps=100,
+        include_first_step=False,
+    )
+    assert flux2_comet_logging.should_log_step(
+        step=10,
+        every=10,
+        total_steps=100,
+        include_first_step=False,
+    )
+    assert flux2_comet_logging.should_log_step(
+        step=7,
+        every=10,
+        total_steps=7,
+        include_first_step=False,
+    )
+
+
 def test_normalize_experiment_key_enforces_comet_constraints():
     key = flux2_comet_logging.normalize_experiment_key("nogit-20260211-104443")
     assert key.isalnum()

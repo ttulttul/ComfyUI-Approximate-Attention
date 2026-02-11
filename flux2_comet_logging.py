@@ -356,6 +356,27 @@ def safe_log_metrics(
         return False
 
 
+def should_log_step(
+    *,
+    step: int,
+    every: int,
+    total_steps: int,
+    include_first_step: bool = False,
+) -> bool:
+    step_value = int(step)
+    if step_value <= 0:
+        return False
+
+    interval = max(1, int(every))
+    total_value = int(total_steps)
+
+    if include_first_step and step_value == 1:
+        return True
+    if total_value > 0 and step_value == total_value:
+        return True
+    return step_value % interval == 0
+
+
 def safe_log_parameters(
     *,
     experiment: Any,
