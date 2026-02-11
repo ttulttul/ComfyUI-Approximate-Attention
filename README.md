@@ -74,6 +74,8 @@ Controller training uses policy gradients with quality-driven rewards. A teacher
 
 **Sigma-aware training.** When `sigma_aware_training` is enabled (the default), a trajectory wrapper logs per-step actions and recomputes sigma-weighted log-probs under a grad-enabled context, matching how routing is actually used during denoising.
 
+**Trainer modularization.** The `Flux2TTRControllerTrainer` node now delegates its execution flow to `flux2_ttr_controller_trainer_node.py`, with small composable helper functions for sampling, policy updates, metrics, checkpointing, and Comet logging.
+
 **Inference.** `Flux2TTRController` exposes a `quality_speed` knob to trade quality against speed through controller thresholding. It supports two policy modes: `stochastic` (the default) samples one controller mask per diffusion step — cached for all layer calls in that step — to match sigma-aware policy training behavior, while `threshold` mode uses a deterministic cutoff. For checkpoint consistency, controller inference now derives `feature_dim` directly from TTR checkpoint metadata rather than assuming a default. Per-step routing summaries (sigma, threshold, student-routed layer set) are logged once per step.
 
 ---
@@ -81,7 +83,7 @@ Controller training uses policy gradients with quality-driven rewards. A teacher
 ## Observability
 
 Comet logging emits rich per-layer and cross-layer quantile metrics at each log tick, including a `flux2ttr/global/pareto_frontier` for ready-layer quality and coverage tracking, per-layer `alpha_sigmoid` values with cross-layer aggregates for adaptive alpha monitoring, and the learned loss-balance parameters (`log_var_huber`, `log_var_cosine`). Distill snapshot logs also print the current loss-weight parameters to the console for quick monitoring. Controller training also forces a first-step Comet log (`global_step == 1`) so long diffusion-step runs show immediate telemetry before the regular `log_every` cadence. Persistent Comet experiments can be maintained across ComfyUI sampling runs by setting `comet_experiment`, which reuses the same run key instead of ending at each cleanup.
-Comet lifecycle handling is centralized in `flux2_comet_logging.py` and shared by both Phase-1 (`flux2_ttr.py`) and Phase-2 (`nodes_taylor_attention.py`) training flows so API-key resolution, experiment start/reuse, display naming, parameter logging, and metric logging failure behavior stay consistent.
+Comet lifecycle handling is centralized in `flux2_comet_logging.py` and shared by both Phase-1 (`flux2_ttr.py`) and Phase-2 (`flux2_ttr_controller_trainer_node.py`) training flows so API-key resolution, experiment start/reuse, display naming, parameter logging, and metric logging failure behavior stay consistent.
 Comet experiment keys are normalized to strict Comet constraints (alphanumeric, 32-50 chars) before start, and git hash discovery falls back to reading `.git` metadata (`HEAD` + refs) when `git rev-parse` is unavailable in the runtime environment.
 
 ## Design Highlights
