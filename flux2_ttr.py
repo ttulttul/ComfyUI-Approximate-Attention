@@ -1781,7 +1781,9 @@ class Flux2TTRRuntime:
                 self._comet_experiment = cached
                 return cached
 
-        api_key = self.comet_api_key.strip() or os.getenv("COMET_API_KEY", "").strip()
+        configured_api_key = self.comet_api_key.strip()
+        env_api_key = os.getenv("COMET_API_KEY", "").strip()
+        api_key = configured_api_key or env_api_key
         if not api_key:
             logger.warning("Flux2TTR: Comet logging enabled but no API key configured; disabling Comet logging.")
             self._comet_disabled = True
@@ -1794,6 +1796,35 @@ class Flux2TTRRuntime:
             return None
 
         try:
+            comet_params = {
+                "learning_rate": float(self.learning_rate),
+                "feature_dim": int(self.feature_dim),
+                "query_chunk_size": int(self.query_chunk_size),
+                "key_chunk_size": int(self.key_chunk_size),
+                "landmark_fraction": float(self.landmark_fraction),
+                "landmark_min": int(self.landmark_min),
+                "landmark_max": int(self.landmark_max),
+                "training_query_token_cap": int(self.training_query_token_cap),
+                "replay_buffer_size": int(self.replay_buffer_size),
+                "train_steps_per_call": int(self.train_steps_per_call),
+                "huber_beta": float(self.huber_beta),
+                "readiness_threshold": float(self.readiness_threshold),
+                "readiness_min_updates": int(self.readiness_min_updates),
+                "cfg_scale": float(self.cfg_scale),
+                "min_swap_layers": int(self.min_swap_layers),
+                "max_swap_layers": int(self.max_swap_layers),
+                "comet_log_every": int(self.comet_log_every),
+                "comet_experiment": experiment_key,
+            }
+            logger.info(
+                "Flux2TTR: preparing Comet logging (project=%s workspace=%s experiment=%s persist=%s api_key_source=%s params=%s).",
+                self.comet_project_name,
+                self.comet_workspace,
+                experiment_key or "<none>",
+                bool(self.comet_persist_experiment and experiment_key),
+                "config" if configured_api_key else "env",
+                comet_params,
+            )
             kwargs = dict(
                 api_key=api_key,
                 project_name=self.comet_project_name,
@@ -1806,28 +1837,7 @@ class Flux2TTRRuntime:
 
             param_key = experiment_key if experiment_key else f"runtime:{id(experiment)}"
             if param_key not in _TTR_COMET_LOGGED_PARAM_KEYS:
-                experiment.log_parameters(
-                    {
-                        "learning_rate": float(self.learning_rate),
-                        "feature_dim": int(self.feature_dim),
-                        "query_chunk_size": int(self.query_chunk_size),
-                        "key_chunk_size": int(self.key_chunk_size),
-                        "landmark_fraction": float(self.landmark_fraction),
-                        "landmark_min": int(self.landmark_min),
-                        "landmark_max": int(self.landmark_max),
-                        "training_query_token_cap": int(self.training_query_token_cap),
-                        "replay_buffer_size": int(self.replay_buffer_size),
-                        "train_steps_per_call": int(self.train_steps_per_call),
-                        "huber_beta": float(self.huber_beta),
-                        "readiness_threshold": float(self.readiness_threshold),
-                        "readiness_min_updates": int(self.readiness_min_updates),
-                        "cfg_scale": float(self.cfg_scale),
-                        "min_swap_layers": int(self.min_swap_layers),
-                        "max_swap_layers": int(self.max_swap_layers),
-                        "comet_log_every": int(self.comet_log_every),
-                        "comet_experiment": experiment_key,
-                    }
-                )
+                experiment.log_parameters(comet_params)
                 _TTR_COMET_LOGGED_PARAM_KEYS.add(param_key)
             self._comet_experiment = experiment
             if self.comet_persist_experiment and experiment_key:

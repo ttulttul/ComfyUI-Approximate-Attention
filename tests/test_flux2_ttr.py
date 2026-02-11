@@ -1933,6 +1933,51 @@ def test_comet_experiment_persists_across_runtime_release(monkeypatch):
     assert end_calls == [True]
 
 
+def test_comet_logs_parameters_before_starting_experiment(monkeypatch, caplog):
+    class _FakeExperiment:
+        def log_parameters(self, params):
+            del params
+            return None
+
+        def log_metrics(self, metrics, step=None):
+            del metrics, step
+            return None
+
+        def end(self):
+            return None
+
+    def _fake_start(api_key=None, project_name=None, workspace=None, experiment_key=None):
+        del api_key, project_name, workspace, experiment_key
+        return _FakeExperiment()
+
+    fake_comet = types.ModuleType("comet_ml")
+    fake_comet.start = _fake_start
+    monkeypatch.setitem(sys.modules, "comet_ml", fake_comet)
+    flux2_ttr._TTR_COMET_EXPERIMENTS.clear()
+    flux2_ttr._TTR_COMET_LOGGED_PARAM_KEYS.clear()
+
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        comet_enabled=True,
+        comet_api_key="test-key",
+        comet_project_name="proj",
+        comet_workspace="ws",
+        comet_experiment="preflight_log_test",
+        comet_persist_experiment=False,
+    )
+
+    caplog.set_level(logging.INFO, logger="flux2_ttr")
+    runtime._ensure_comet_experiment()
+
+    messages = [record.getMessage() for record in caplog.records]
+    preparing_idx = next(i for i, msg in enumerate(messages) if "preparing Comet logging" in msg)
+    enabled_idx = next(i for i, msg in enumerate(messages) if "Comet logging enabled" in msg)
+    assert preparing_idx < enabled_idx
+
+
 def test_runtime_autogenerates_comet_experiment_key_when_missing(monkeypatch):
     monkeypatch.setattr(flux2_ttr, "_generate_experiment_key", lambda: "abc1234-20260211-143022")
     runtime = flux2_ttr.Flux2TTRRuntime(
