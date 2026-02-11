@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import flux2_comet_logging
 from flux2_ttr_embeddings import ScalarSinusoidalEmbedding
 
 logger = logging.getLogger(__name__)
@@ -20,8 +21,9 @@ logger = logging.getLogger(__name__)
 _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
 _PATCH_DEPTH = 0
 _RUNTIME_REGISTRY: Dict[str, "Flux2TTRRuntime"] = {}
-_TTR_COMET_EXPERIMENTS: Dict[str, Any] = {}
-_TTR_COMET_LOGGED_PARAM_KEYS: set[str] = set()
+_TTR_COMET_NAMESPACE = "flux2_ttr_runtime"
+_TTR_COMET_EXPERIMENTS: Dict[str, Any] = flux2_comet_logging.experiments_for(_TTR_COMET_NAMESPACE)
+_TTR_COMET_LOGGED_PARAM_KEYS: set[str] = flux2_comet_logging.logged_param_keys_for(_TTR_COMET_NAMESPACE)
 _MEMORY_RESERVE_FACTOR = 1.1
 _EMPIRICAL_TRAINING_FLOOR_BYTES = 3 * 1024 * 1024 * 1024
 _DISTILL_METRIC_EPS = 1e-8
@@ -75,37 +77,17 @@ _COMET_AGG_METRICS = (
 
 
 def _git_short_hash(length: int = 7) -> str:
-    from pathlib import Path
-    import subprocess
-
-    repo_dir = Path(__file__).resolve().parent
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", f"--short={max(1, int(length))}", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            cwd=str(repo_dir),
-        ).strip()
-    except Exception:
-        return "nogit"
+    return flux2_comet_logging.git_short_hash(__file__, length=int(length))
 
 
 def _generate_experiment_key() -> str:
     """Build a unique Comet experiment key from git HEAD + current time."""
-    import datetime
-
-    short_hash = _git_short_hash(7)
-    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"{short_hash}-{ts}"
+    return flux2_comet_logging.generate_experiment_key(__file__)
 
 
 def _generate_experiment_display_name() -> str:
     """Build a readable Comet display name as YYYY-MM-DD-HHMMSS-<git6>."""
-    import datetime
-
-    short_hash = _git_short_hash(6)
-    ts = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    return f"{ts}-{short_hash}"
+    return flux2_comet_logging.generate_experiment_display_name(__file__)
 
 
 try:
@@ -1092,17 +1074,15 @@ class Flux2TTRRuntime:
 
     def release_resources(self) -> None:
         if self._comet_experiment is not None:
-            keep_open = bool(self.comet_enabled and self.comet_persist_experiment and self.comet_experiment)
-            if not keep_open:
-                try:
-                    self._comet_experiment.end()
-                except Exception as exc:
-                    logger.warning("Flux2TTR: failed to end Comet experiment cleanly: %s", exc)
-                if self.comet_experiment:
-                    cached = _TTR_COMET_EXPERIMENTS.get(self.comet_experiment)
-                    if cached is self._comet_experiment:
-                        _TTR_COMET_EXPERIMENTS.pop(self.comet_experiment, None)
-                        _TTR_COMET_LOGGED_PARAM_KEYS.discard(self.comet_experiment)
+            flux2_comet_logging.release_experiment(
+                namespace=_TTR_COMET_NAMESPACE,
+                logger=logger,
+                component_name="Flux2TTR",
+                experiment=self._comet_experiment,
+                enabled=bool(self.comet_enabled),
+                persist_experiment=bool(self.comet_persist_experiment),
+                experiment_key=str(self.comet_experiment),
+            )
             self._comet_experiment = None
 
         # Avoid explicit CPU transfers here; cleanup can be called near the end of
@@ -1797,92 +1777,44 @@ class Flux2TTRRuntime:
         if not display_name:
             display_name = _generate_experiment_display_name()
             self.comet_display_name = display_name
-        if self.comet_persist_experiment and experiment_key:
-            cached = _TTR_COMET_EXPERIMENTS.get(experiment_key)
-            if cached is not None:
-                self._comet_experiment = cached
-                return cached
-
-        configured_api_key = self.comet_api_key.strip()
-        env_api_key = os.getenv("COMET_API_KEY", "").strip()
-        api_key = configured_api_key or env_api_key
-        if not api_key:
-            logger.warning("Flux2TTR: Comet logging enabled but no API key configured; disabling Comet logging.")
-            self._comet_disabled = True
-            return None
-        try:
-            from comet_ml import start
-        except Exception as exc:
-            logger.warning("Flux2TTR: could not import comet_ml; disabling Comet logging (%s).", exc)
-            self._comet_disabled = True
-            return None
-
-        try:
-            comet_params = {
-                "learning_rate": float(self.learning_rate),
-                "feature_dim": int(self.feature_dim),
-                "query_chunk_size": int(self.query_chunk_size),
-                "key_chunk_size": int(self.key_chunk_size),
-                "landmark_fraction": float(self.landmark_fraction),
-                "landmark_min": int(self.landmark_min),
-                "landmark_max": int(self.landmark_max),
-                "training_query_token_cap": int(self.training_query_token_cap),
-                "replay_buffer_size": int(self.replay_buffer_size),
-                "train_steps_per_call": int(self.train_steps_per_call),
-                "huber_beta": float(self.huber_beta),
-                "readiness_threshold": float(self.readiness_threshold),
-                "readiness_min_updates": int(self.readiness_min_updates),
-                "cfg_scale": float(self.cfg_scale),
-                "min_swap_layers": int(self.min_swap_layers),
-                "max_swap_layers": int(self.max_swap_layers),
-                "comet_log_every": int(self.comet_log_every),
-                "comet_experiment": experiment_key,
-            }
-            logger.info(
-                "Flux2TTR: preparing Comet logging (project=%s workspace=%s experiment=%s display_name=%s persist=%s api_key_source=%s params=%s).",
-                self.comet_project_name,
-                self.comet_workspace,
-                experiment_key or "<none>",
-                display_name,
-                bool(self.comet_persist_experiment and experiment_key),
-                "config" if configured_api_key else "env",
-                comet_params,
-            )
-            kwargs = dict(
-                api_key=api_key,
-                project_name=self.comet_project_name,
-                workspace=self.comet_workspace,
-            )
-            if experiment_key:
-                kwargs["experiment_key"] = experiment_key
-
-            experiment = start(**kwargs)
-            if hasattr(experiment, "set_name"):
-                try:
-                    experiment.set_name(display_name)
-                except Exception as exc:
-                    logger.warning("Flux2TTR: failed to set Comet display name %s (%s).", display_name, exc)
-
-            param_key = experiment_key if experiment_key else f"runtime:{id(experiment)}"
-            if param_key not in _TTR_COMET_LOGGED_PARAM_KEYS:
-                experiment.log_parameters(comet_params)
-                _TTR_COMET_LOGGED_PARAM_KEYS.add(param_key)
-            self._comet_experiment = experiment
-            if self.comet_persist_experiment and experiment_key:
-                _TTR_COMET_EXPERIMENTS[experiment_key] = experiment
-            logger.info(
-                "Flux2TTR: Comet logging enabled (project=%s workspace=%s experiment=%s display_name=%s persist=%s).",
-                self.comet_project_name,
-                self.comet_workspace,
-                experiment_key or "<none>",
-                display_name,
-                bool(self.comet_persist_experiment and experiment_key),
-            )
-            return experiment
-        except Exception as exc:
-            logger.warning("Flux2TTR: failed to start Comet experiment; disabling Comet logging (%s).", exc)
-            self._comet_disabled = True
-            return None
+        comet_params = {
+            "learning_rate": float(self.learning_rate),
+            "feature_dim": int(self.feature_dim),
+            "query_chunk_size": int(self.query_chunk_size),
+            "key_chunk_size": int(self.key_chunk_size),
+            "landmark_fraction": float(self.landmark_fraction),
+            "landmark_min": int(self.landmark_min),
+            "landmark_max": int(self.landmark_max),
+            "training_query_token_cap": int(self.training_query_token_cap),
+            "replay_buffer_size": int(self.replay_buffer_size),
+            "train_steps_per_call": int(self.train_steps_per_call),
+            "huber_beta": float(self.huber_beta),
+            "readiness_threshold": float(self.readiness_threshold),
+            "readiness_min_updates": int(self.readiness_min_updates),
+            "cfg_scale": float(self.cfg_scale),
+            "min_swap_layers": int(self.min_swap_layers),
+            "max_swap_layers": int(self.max_swap_layers),
+            "comet_log_every": int(self.comet_log_every),
+            "comet_experiment": experiment_key,
+        }
+        experiment, disabled = flux2_comet_logging.ensure_experiment(
+            namespace=_TTR_COMET_NAMESPACE,
+            logger=logger,
+            component_name="Flux2TTR",
+            enabled=bool(self.comet_enabled),
+            disabled=bool(self._comet_disabled),
+            existing_experiment=self._comet_experiment,
+            api_key=str(self.comet_api_key),
+            project_name=str(self.comet_project_name),
+            workspace=str(self.comet_workspace),
+            experiment_key=experiment_key,
+            display_name=display_name,
+            persist_experiment=bool(self.comet_persist_experiment),
+            params=comet_params,
+        )
+        self._comet_disabled = bool(disabled)
+        self._comet_experiment = experiment
+        return experiment
 
     def flush_run_emas(self) -> None:
         """Flush accumulated per-run EMA samples into single EMA updates.
@@ -2002,10 +1934,13 @@ class Flux2TTRRuntime:
             pareto_frontier, _, worst_ema_cosine_dist = self._pareto_frontier_score(tracked_layers)
             payload["flux2ttr/global/pareto_frontier"] = float(pareto_frontier)
             payload["flux2ttr/global/pareto_worst_ema_cosine_dist"] = float(worst_ema_cosine_dist)
-        try:
-            experiment.log_metrics(payload, step=int(self.training_updates_done))
-        except Exception as exc:
-            logger.warning("Flux2TTR: Comet metric logging failed; disabling Comet logging (%s).", exc)
+        if not flux2_comet_logging.safe_log_metrics(
+            experiment=experiment,
+            payload=payload,
+            step=int(self.training_updates_done),
+            logger=logger,
+            component_name="Flux2TTR",
+        ):
             self._comet_disabled = True
 
     def _select_training_query_indices(self, seq_len: int, device: torch.device) -> Optional[torch.Tensor]:
@@ -2781,17 +2716,18 @@ class Flux2TTRRuntime:
                 maybe_sigma = self._as_float(self._current_step_id[1])
                 if maybe_sigma is not None:
                     last_sigma = maybe_sigma
-            try:
-                experiment.log_parameters(
-                    {
-                        "cfg_scale": float(self.cfg_scale),
-                        "last_sigma": float(last_sigma),
-                        "min_swap_layers": int(self.min_swap_layers),
-                        "max_swap_layers": int(self.max_swap_layers),
-                    }
-                )
-            except Exception as exc:
-                logger.warning("Flux2TTR: failed to log checkpoint hyperparameters to Comet (%s).", exc)
+            if not flux2_comet_logging.safe_log_parameters(
+                experiment=experiment,
+                payload={
+                    "cfg_scale": float(self.cfg_scale),
+                    "last_sigma": float(last_sigma),
+                    "min_swap_layers": int(self.min_swap_layers),
+                    "max_swap_layers": int(self.max_swap_layers),
+                },
+                logger=logger,
+                component_name="Flux2TTR",
+                failure_message="failed to log checkpoint hyperparameters to Comet",
+            ):
                 self._comet_disabled = True
 
         layer_states = {}
