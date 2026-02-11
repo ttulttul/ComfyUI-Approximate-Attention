@@ -1453,6 +1453,7 @@ def test_load_checkpoint_migrates_raw_alpha_to_logit_space(tmp_path):
         steps=1,
     )
     payload = runtime.checkpoint_state()
+    payload.pop("alpha_format", None)
     payload["layers"] = {
         "single:0": {"alpha": torch.tensor(0.1, dtype=torch.float32)},
         "single:1": {"alpha": torch.tensor(-2.1972246, dtype=torch.float32)},
@@ -1472,6 +1473,31 @@ def test_load_checkpoint_migrates_raw_alpha_to_logit_space(tmp_path):
     expected_logit = math.log(0.1 / (1.0 - 0.1))
     assert float(loaded.pending_state["single:0"]["alpha"].item()) == pytest.approx(expected_logit)
     assert float(loaded.pending_state["single:1"]["alpha"].item()) == pytest.approx(-2.1972246)
+
+
+def test_load_checkpoint_skips_alpha_migration_for_logit_format(tmp_path):
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+    )
+    payload = runtime.checkpoint_state()
+    payload["layers"] = {
+        "single:0": {"alpha": torch.tensor(0.3, dtype=torch.float32)},
+    }
+
+    ckpt = tmp_path / "flux2_ttr_alpha_no_migration.pt"
+    torch.save(payload, ckpt)
+
+    loaded = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+    )
+    loaded.load_checkpoint(str(ckpt))
+    assert float(loaded.pending_state["single:0"]["alpha"].item()) == pytest.approx(0.3)
 
 
 def test_recover_runtime_from_config_inference_requires_checkpoint():

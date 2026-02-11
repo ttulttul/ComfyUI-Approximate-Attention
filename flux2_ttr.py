@@ -2779,6 +2779,7 @@ class Flux2TTRRuntime:
         return {
             "format": "flux2_ttr_v2",
             "feature_dim": self.feature_dim,
+            "alpha_format": "logit",
             "learning_rate": self.learning_rate,
             "training_mode": self.training_mode,
             "training_preview_ttr": self.training_preview_ttr,
@@ -2984,30 +2985,32 @@ class Flux2TTRRuntime:
                 self.layer_ready[key] = bool(meta.get("ready", False))
 
         # Migrate old raw-space alpha to logit-space for sigmoid interpretation.
+        _alpha_format = payload.get("alpha_format", "raw")
         _raw_layers = payload.get("layers", {})
         if not isinstance(_raw_layers, dict):
             _raw_layers = {}
-        for _lk, _lstate in _raw_layers.items():
-            if not isinstance(_lstate, dict):
-                continue
-            if "alpha" not in _lstate:
-                continue
-            _alpha_tensor = _lstate["alpha"]
-            if not torch.is_tensor(_alpha_tensor):
-                continue
-            _alpha_val = float(_alpha_tensor.reshape(-1)[0].item())
-            # Old checkpoints stored raw alpha (typically 0.01–0.5).
-            # New code interprets self.alpha through sigmoid, so convert:
-            # if the stored value looks like raw-space (0 < val < 1 and small),
-            # convert to logit. Values outside (0,1) or already large-magnitude
-            # are assumed to already be in logit-space.
-            if 0.0 < _alpha_val < 1.0 and abs(_alpha_val) < 2.0:
-                _logit_val = math.log(_alpha_val / (1.0 - _alpha_val))
-                _lstate["alpha"] = torch.tensor(_logit_val, dtype=torch.float32)
-                logger.info(
-                    "Flux2TTR: migrated alpha for %s from raw %.6g to logit %.6g",
-                    _lk, _alpha_val, _logit_val,
-                )
+        if _alpha_format != "logit":
+            for _lk, _lstate in _raw_layers.items():
+                if not isinstance(_lstate, dict):
+                    continue
+                if "alpha" not in _lstate:
+                    continue
+                _alpha_tensor = _lstate["alpha"]
+                if not torch.is_tensor(_alpha_tensor):
+                    continue
+                _alpha_val = float(_alpha_tensor.reshape(-1)[0].item())
+                # Old checkpoints stored raw alpha (typically 0.01–0.5).
+                # New code interprets self.alpha through sigmoid, so convert:
+                # if the stored value looks like raw-space (0 < val < 1 and small),
+                # convert to logit. Values outside (0,1) or already large-magnitude
+                # are assumed to already be in logit-space.
+                if 0.0 < _alpha_val < 1.0 and abs(_alpha_val) < 2.0:
+                    _logit_val = math.log(_alpha_val / (1.0 - _alpha_val))
+                    _lstate["alpha"] = torch.tensor(_logit_val, dtype=torch.float32)
+                    logger.info(
+                        "Flux2TTR: migrated alpha for %s from raw %.6g to logit %.6g",
+                        _lk, _alpha_val, _logit_val,
+                    )
 
         self.pending_state = _raw_layers
         for layer_key, layer in self.layers.items():
