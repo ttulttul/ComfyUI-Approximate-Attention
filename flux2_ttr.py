@@ -74,21 +74,35 @@ _COMET_AGG_METRICS = (
 )
 
 
-def _generate_experiment_key() -> str:
-    """Build a unique Comet experiment key from git HEAD + current time."""
-    import datetime
+def _git_short_hash(length: int = 7) -> str:
     import subprocess
 
     try:
-        short_hash = subprocess.check_output(
-            ["git", "rev-parse", "--short=7", "HEAD"],
+        return subprocess.check_output(
+            ["git", "rev-parse", f"--short={max(1, int(length))}", "HEAD"],
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
     except Exception:
-        short_hash = "nogit"
+        return "nogit"
+
+
+def _generate_experiment_key() -> str:
+    """Build a unique Comet experiment key from git HEAD + current time."""
+    import datetime
+
+    short_hash = _git_short_hash(7)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"{short_hash}-{ts}"
+
+
+def _generate_experiment_display_name() -> str:
+    """Build a readable Comet display name as YYYY-MM-DD-HHMMSS-<git6>."""
+    import datetime
+
+    short_hash = _git_short_hash(6)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    return f"{ts}-{short_hash}"
 
 
 try:
@@ -884,6 +898,7 @@ class Flux2TTRRuntime:
         self.comet_workspace = str(comet_workspace or "comet-workspace")
         self.comet_experiment = str(comet_experiment or "").strip()
         self.comet_persist_experiment = bool(comet_persist_experiment) and bool(self.comet_experiment)
+        self.comet_display_name = _generate_experiment_display_name()
         # Auto-generate a unique experiment key if none was provided.
         if not self.comet_experiment:
             self.comet_experiment = _generate_experiment_key()
@@ -1775,6 +1790,10 @@ class Flux2TTRRuntime:
             return self._comet_experiment
 
         experiment_key = self.comet_experiment.strip()
+        display_name = str(self.comet_display_name or "").strip()
+        if not display_name:
+            display_name = _generate_experiment_display_name()
+            self.comet_display_name = display_name
         if self.comet_persist_experiment and experiment_key:
             cached = _TTR_COMET_EXPERIMENTS.get(experiment_key)
             if cached is not None:
@@ -1817,10 +1836,11 @@ class Flux2TTRRuntime:
                 "comet_experiment": experiment_key,
             }
             logger.info(
-                "Flux2TTR: preparing Comet logging (project=%s workspace=%s experiment=%s persist=%s api_key_source=%s params=%s).",
+                "Flux2TTR: preparing Comet logging (project=%s workspace=%s experiment=%s display_name=%s persist=%s api_key_source=%s params=%s).",
                 self.comet_project_name,
                 self.comet_workspace,
                 experiment_key or "<none>",
+                display_name,
                 bool(self.comet_persist_experiment and experiment_key),
                 "config" if configured_api_key else "env",
                 comet_params,
@@ -1834,6 +1854,11 @@ class Flux2TTRRuntime:
                 kwargs["experiment_key"] = experiment_key
 
             experiment = start(**kwargs)
+            if hasattr(experiment, "set_name"):
+                try:
+                    experiment.set_name(display_name)
+                except Exception as exc:
+                    logger.warning("Flux2TTR: failed to set Comet display name %s (%s).", display_name, exc)
 
             param_key = experiment_key if experiment_key else f"runtime:{id(experiment)}"
             if param_key not in _TTR_COMET_LOGGED_PARAM_KEYS:
@@ -1843,10 +1868,11 @@ class Flux2TTRRuntime:
             if self.comet_persist_experiment and experiment_key:
                 _TTR_COMET_EXPERIMENTS[experiment_key] = experiment
             logger.info(
-                "Flux2TTR: Comet logging enabled (project=%s workspace=%s experiment=%s persist=%s).",
+                "Flux2TTR: Comet logging enabled (project=%s workspace=%s experiment=%s display_name=%s persist=%s).",
                 self.comet_project_name,
                 self.comet_workspace,
                 experiment_key or "<none>",
+                display_name,
                 bool(self.comet_persist_experiment and experiment_key),
             )
             return experiment
@@ -2819,6 +2845,7 @@ class Flux2TTRRuntime:
             "comet_project_name": self.comet_project_name,
             "comet_workspace": self.comet_workspace,
             "comet_experiment": self.comet_experiment,
+            "comet_display_name": self.comet_display_name,
             "comet_persist_experiment": self.comet_persist_experiment,
             "last_loss": self.last_loss,
             "loss_log_var_huber": float(self.log_var_huber.detach().cpu().item()),
@@ -2899,6 +2926,9 @@ class Flux2TTRRuntime:
         self.comet_project_name = str(payload.get("comet_project_name", self.comet_project_name))
         self.comet_workspace = str(payload.get("comet_workspace", self.comet_workspace))
         self.comet_experiment = str(payload.get("comet_experiment", self.comet_experiment)).strip()
+        self.comet_display_name = str(payload.get("comet_display_name", self.comet_display_name)).strip()
+        if not self.comet_display_name:
+            self.comet_display_name = _generate_experiment_display_name()
         self.comet_persist_experiment = bool(payload.get("comet_persist_experiment", self.comet_persist_experiment))
         self.comet_persist_experiment = bool(self.comet_persist_experiment and self.comet_experiment)
         self.comet_log_every = max(1, int(payload.get("comet_log_every", self.comet_log_every)))
