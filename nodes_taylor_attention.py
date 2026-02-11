@@ -79,6 +79,8 @@ _LEGACY_TRAINER_DEFAULTS = {
 }
 
 _CONTROLLER_COMET_NAMESPACE = "flux2_ttr_controller"
+_DEFAULT_TTR_CHECKPOINT_FILENAME = "flux2_ttr.pt"
+_DEFAULT_CONTROLLER_CHECKPOINT_FILENAME = "flux2_ttr_controller.pt"
 
 
 @io.comfytype(io_type="TTR_TRAINING_CONFIG")
@@ -143,6 +145,43 @@ def _string_or(value: Any, default: str) -> str:
 
 def _default_comet_experiment_name() -> str:
     return flux2_comet_logging.generate_experiment_key(__file__)
+
+
+def _default_ttr_checkpoint_path() -> str:
+    return flux2_ttr.resolve_default_checkpoint_path(
+        "",
+        default_filename=_DEFAULT_TTR_CHECKPOINT_FILENAME,
+        anchor_file=__file__,
+        ensure_dir=False,
+    )
+
+
+def _default_controller_checkpoint_path() -> str:
+    return flux2_ttr.resolve_default_checkpoint_path(
+        "",
+        default_filename=_DEFAULT_CONTROLLER_CHECKPOINT_FILENAME,
+        anchor_file=__file__,
+        ensure_dir=False,
+    )
+
+
+def _resolve_checkpoint_path_or_default(
+    raw_path: str,
+    *,
+    default_filename: str,
+    component_name: str,
+    field_name: str,
+) -> str:
+    provided = str(raw_path or "").strip()
+    resolved = flux2_ttr.resolve_default_checkpoint_path(
+        provided,
+        default_filename=default_filename,
+        anchor_file=__file__,
+        ensure_dir=True,
+    )
+    if not provided:
+        logger.info("%s: using default %s=%s", component_name, field_name, resolved)
+    return resolved
 
 
 def _extract_layer_idx(layer_key: str) -> Optional[int]:
@@ -361,9 +400,9 @@ class Flux2TTRTrainer(io.ComfyNode):
                 ),
                 io.String.Input(
                     "checkpoint_path",
-                    default="",
+                    default=_default_ttr_checkpoint_path(),
                     multiline=False,
-                    tooltip="Checkpoint file to load/save TTR layer weights.",
+                    tooltip="Checkpoint file to load/save TTR layer weights (defaults to ComfyUI/models/approximate_attention/flux2_ttr.pt).",
                 ),
                 io.Int.Input(
                     "feature_dim",
@@ -580,7 +619,12 @@ class Flux2TTRTrainer(io.ComfyNode):
     ) -> io.NodeOutput:
         del latents, conditioning
         feature_dim = flux2_ttr.validate_feature_dim(feature_dim)
-        checkpoint_path = (checkpoint_path or "").strip()
+        checkpoint_path = _resolve_checkpoint_path_or_default(
+            checkpoint_path,
+            default_filename=_DEFAULT_TTR_CHECKPOINT_FILENAME,
+            component_name="Flux2TTRTrainer",
+            field_name="checkpoint_path",
+        )
         controller_checkpoint_path = (controller_checkpoint_path or "").strip()
         train_steps = int(steps)
 
@@ -895,7 +939,15 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 io.Float.Input("cfg", default=1.0, min=0.0, max=100.0, step=1e-3),
                 io.Combo.Input("sampler_name", options=sampler_options, default="euler"),
                 io.Combo.Input("scheduler", options=scheduler_options, default="normal"),
-                io.String.Input("checkpoint_path", default="", multiline=False),
+                io.String.Input(
+                    "checkpoint_path",
+                    default=_default_controller_checkpoint_path(),
+                    multiline=False,
+                    tooltip=(
+                        "Controller checkpoint path (defaults to "
+                        "ComfyUI/models/approximate_attention/flux2_ttr_controller.pt)."
+                    ),
+                ),
                 io.Int.Input("training_iterations", default=100, min=1, max=100000, step=1),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=1e-3),
                 io.Boolean.Input("sigma_aware_training", default=True),
@@ -1218,7 +1270,12 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         )
         log_every = max(1, _int_or(logging_cfg.get("log_every"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["log_every"]))
 
-        checkpoint_path = (checkpoint_path or "").strip()
+        checkpoint_path = _resolve_checkpoint_path_or_default(
+            checkpoint_path,
+            default_filename=_DEFAULT_CONTROLLER_CHECKPOINT_FILENAME,
+            component_name="Flux2TTRControllerTrainer",
+            field_name="checkpoint_path",
+        )
         if checkpoint_path and os.path.isfile(checkpoint_path):
             controller = flux2_ttr_controller.load_controller_checkpoint(checkpoint_path, map_location="cpu")
         else:

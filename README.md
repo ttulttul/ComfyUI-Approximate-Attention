@@ -13,6 +13,7 @@ The package includes eight nodes. The core training pair is `Flux2TTRTrainingPar
 ## Workflow
 
 Training proceeds in two phases. In Phase 1, `Flux2TTRTrainingParameters` feeds into `Flux2TTRTrainer` to distill the TTR attention layers. In Phase 2, the same parameters node feeds into `Flux2TTRControllerTrainer` to train the routing controller. At inference time, a model is patched through `Flux2TTRController` and then passed to a `KSampler`.
+By default, the Phase-1 and Phase-2 training nodes read/write checkpoints under `ComfyUI/models/approximate_attention` (`flux2_ttr.pt` and `flux2_ttr_controller.pt`), and create that folder automatically if it does not exist.
 
 ---
 

@@ -3,6 +3,7 @@ import math
 import sys
 import types
 from collections import deque
+from pathlib import Path
 
 import pytest
 import torch
@@ -62,6 +63,60 @@ def test_validate_feature_dim():
         flux2_ttr.validate_feature_dim(64)
     with pytest.raises(ValueError):
         flux2_ttr.validate_feature_dim(384)
+
+
+def test_approximate_attention_models_dir_resolves_from_custom_nodes_anchor(monkeypatch, tmp_path):
+    monkeypatch.setattr(flux2_ttr, "folder_paths", None)
+    anchor = tmp_path / "ComfyUI" / "custom_nodes" / "ComfyUI-Approximate-Attention" / "flux2_ttr.py"
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.write_text("# anchor\n", encoding="utf-8")
+
+    out = Path(flux2_ttr.approximate_attention_models_dir(anchor_file=str(anchor), ensure_exists=True))
+    expected = tmp_path / "ComfyUI" / "models" / "approximate_attention"
+    assert out == expected
+    assert expected.is_dir()
+
+
+def test_approximate_attention_models_dir_falls_back_to_anchor_parent(monkeypatch, tmp_path):
+    monkeypatch.setattr(flux2_ttr, "folder_paths", None)
+    anchor = tmp_path / "plugin_repo" / "flux2_ttr.py"
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.write_text("# anchor\n", encoding="utf-8")
+
+    out = Path(flux2_ttr.approximate_attention_models_dir(anchor_file=str(anchor), ensure_exists=True))
+    expected = tmp_path / "plugin_repo" / "models" / "approximate_attention"
+    assert out == expected
+    assert expected.is_dir()
+
+
+def test_resolve_default_checkpoint_path_uses_models_approximate_attention(monkeypatch, tmp_path):
+    monkeypatch.setattr(flux2_ttr, "folder_paths", None)
+    anchor = tmp_path / "ComfyUI" / "custom_nodes" / "ComfyUI-Approximate-Attention" / "flux2_ttr.py"
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.write_text("# anchor\n", encoding="utf-8")
+
+    out = Path(
+        flux2_ttr.resolve_default_checkpoint_path(
+            "",
+            default_filename="flux2_ttr.pt",
+            anchor_file=str(anchor),
+            ensure_dir=True,
+        )
+    )
+    expected = tmp_path / "ComfyUI" / "models" / "approximate_attention" / "flux2_ttr.pt"
+    assert out == expected
+    assert expected.parent.is_dir()
+
+
+def test_resolve_default_checkpoint_path_preserves_explicit_path(tmp_path):
+    explicit = str(tmp_path / "manual" / "checkpoint.pt")
+    out = flux2_ttr.resolve_default_checkpoint_path(
+        explicit,
+        default_filename="flux2_ttr.pt",
+        anchor_file=__file__,
+        ensure_dir=True,
+    )
+    assert out == explicit
 
 
 def test_load_checkpoint_feature_dim_reads_saved_value(tmp_path):

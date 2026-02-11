@@ -7,6 +7,7 @@ import random
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, Optional
 
 import torch
@@ -96,6 +97,11 @@ except Exception:
     model_management = None
 
 try:
+    import folder_paths
+except Exception:
+    folder_paths = None
+
+try:
     import flux2_ttr_controller
 except Exception:
     flux2_ttr_controller = None
@@ -130,6 +136,42 @@ def validate_feature_dim(feature_dim: int) -> int:
     if dim % 256 != 0:
         raise ValueError(f"Flux2TTR: feature_dim must be a multiple of 256 (got {dim}).")
     return dim
+
+
+def _infer_comfyui_root_from_anchor(anchor_file: str) -> Path:
+    anchor = Path(str(anchor_file)).resolve()
+    for parent in (anchor.parent, *anchor.parents):
+        if parent.name == "custom_nodes":
+            return parent.parent
+    return anchor.parent
+
+
+def approximate_attention_models_dir(*, anchor_file: str = __file__, ensure_exists: bool = True) -> str:
+    models_dir_value = getattr(folder_paths, "models_dir", None) if folder_paths is not None else None
+    if models_dir_value:
+        base_models_dir = Path(str(models_dir_value)).resolve()
+    else:
+        comfy_root = _infer_comfyui_root_from_anchor(anchor_file)
+        base_models_dir = comfy_root / "models"
+
+    target_dir = base_models_dir / "approximate_attention"
+    if ensure_exists:
+        os.makedirs(target_dir, exist_ok=True)
+    return str(target_dir)
+
+
+def resolve_default_checkpoint_path(
+    checkpoint_path: str,
+    *,
+    default_filename: str,
+    anchor_file: str = __file__,
+    ensure_dir: bool = True,
+) -> str:
+    path = str(checkpoint_path or "").strip()
+    if path:
+        return path
+    base_dir = approximate_attention_models_dir(anchor_file=anchor_file, ensure_exists=ensure_dir)
+    return str(Path(base_dir) / str(default_filename))
 
 
 def _checkpoint_feature_dim_from_payload(payload: dict[str, Any], checkpoint_path: str) -> int:
