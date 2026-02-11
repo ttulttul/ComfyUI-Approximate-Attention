@@ -231,7 +231,7 @@ def test_flux2_hkr_adaptive_alpha_gating_modulates_blend_per_token(monkeypatch):
     disagreement = diff.norm(dim=-1)
     d_mean = disagreement.mean(dim=-1, keepdim=True).clamp(min=1e-6)
     d_norm = (disagreement / d_mean).clamp(max=3.0) / 3.0
-    expected = out_kernel + (base_alpha * (0.5 + d_norm)).unsqueeze(-1) * out_land
+    expected = out_kernel + (base_alpha * (0.5 + d_norm)).unsqueeze(-1) * (out_land - out_kernel)
     assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
 
 
@@ -251,7 +251,7 @@ def test_flux2_hkr_non_adaptive_alpha_uses_scalar_blend(monkeypatch):
     out = layer(q, k, v)
 
     alpha = torch.sigmoid(layer.alpha.detach())
-    expected = out_kernel + alpha.view(1, 1, 1, 1) * out_land
+    expected = out_kernel + alpha.view(1, 1, 1, 1) * (out_land - out_kernel)
     assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
 
 

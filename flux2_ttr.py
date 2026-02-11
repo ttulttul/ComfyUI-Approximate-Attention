@@ -723,10 +723,10 @@ class Flux2HKRAttnLayer(nn.Module):
                 d_norm = (disagreement / d_mean).clamp(max=3.0) / 3.0    # [B, H, N] in [0, 1]
 
             alpha_per_token = (base_alpha * (0.5 + d_norm)).unsqueeze(-1).to(dtype=v.dtype)  # [B, H, N, 1]
-            return out_kernel + alpha_per_token * out_land
+            return out_kernel + alpha_per_token * (out_land - out_kernel)
         else:
             alpha = base_alpha.to(dtype=v.dtype)
-            return out_kernel + alpha.view(1, 1, 1, 1) * out_land
+            return out_kernel + alpha.view(1, 1, 1, 1) * (out_land - out_kernel)
 
 
 # Backward-compat alias for downstream imports.
