@@ -242,7 +242,10 @@ def _build_training_config_payload(
             "comet_api_key": str(comet_api_key or ""),
             "comet_project_name": str(comet_project_name or "ttr-distillation"),
             "comet_workspace": str(comet_workspace or "comet-workspace"),
-            "comet_experiment": str(comet_experiment or "").strip(),
+            "comet_experiment": flux2_comet_logging.normalize_experiment_key(
+                str(comet_experiment or "").strip(),
+                allow_empty=True,
+            ),
             "log_every": max(1, int(log_every)),
         },
     }
@@ -1087,7 +1090,14 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
             return None
         project_name = _string_or(logging_cfg.get("comet_project_name"), "ttr-distillation")
         workspace = _string_or(logging_cfg.get("comet_workspace"), "comet-workspace")
-        experiment_key = _string_or(logging_cfg.get("comet_experiment"), "").strip()
+        raw_experiment_key = _string_or(logging_cfg.get("comet_experiment"), "").strip()
+        experiment_key = flux2_comet_logging.normalize_experiment_key(raw_experiment_key, allow_empty=True)
+        if raw_experiment_key != experiment_key:
+            logger.info(
+                "Flux2TTRControllerTrainer: normalized comet_experiment from %r to %r.",
+                raw_experiment_key,
+                experiment_key,
+            )
         if not experiment_key:
             experiment_key = flux2_comet_logging.generate_experiment_key(__file__)
         logging_cfg["comet_experiment"] = experiment_key

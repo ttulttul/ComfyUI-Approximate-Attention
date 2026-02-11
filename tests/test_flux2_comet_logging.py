@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import types
+from pathlib import Path
 
 import flux2_comet_logging
 
@@ -142,3 +143,38 @@ def test_safe_log_metrics_returns_false_on_experiment_error():
         component_name="TestComet",
     )
     assert ok is False
+
+
+def test_normalize_experiment_key_enforces_comet_constraints():
+    key = flux2_comet_logging.normalize_experiment_key("nogit-20260211-104443")
+    assert key.isalnum()
+    assert len(key) >= 32
+    assert len(key) <= 50
+
+
+def test_generate_experiment_key_is_alnum_and_valid_length():
+    key = flux2_comet_logging.generate_experiment_key(__file__)
+    assert key.isalnum()
+    assert 32 <= len(key) <= 50
+
+
+def test_git_short_hash_reads_git_metadata_when_git_cli_fails(monkeypatch, tmp_path: Path):
+    repo = tmp_path / "repo"
+    git_dir = repo / ".git"
+    ref_dir = git_dir / "refs" / "heads"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (ref_dir / "main").write_text(f"{commit}\n", encoding="utf-8")
+
+    anchor = repo / "flux2_comet_logging.py"
+    anchor.write_text("# test anchor\n", encoding="utf-8")
+
+    def _boom(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("git unavailable")
+
+    monkeypatch.setattr("subprocess.check_output", _boom)
+
+    out = flux2_comet_logging.git_short_hash(str(anchor), length=8)
+    assert out == commit[:8]

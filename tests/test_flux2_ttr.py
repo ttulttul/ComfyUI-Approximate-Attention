@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import flux2_comet_logging
 import flux2_ttr
 import flux2_ttr_controller
 
@@ -1764,7 +1765,8 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     runtime._record_training_metrics("single:11", {"loss": 0.5, "mse": 1.0, "nmse": 0.9, "cosine_similarity": 0.8, "ema_loss": 0.7})
     runtime._record_training_metrics("single:10", {"loss": 1.0, "mse": 2.0})
 
-    assert start_calls == [("test-key", "proj", "ws", "metrics_test_run")]
+    expected_key = flux2_comet_logging.normalize_experiment_key("metrics_test_run")
+    assert start_calls == [("test-key", "proj", "ws", expected_key)]
     assert len(params_calls) == 1
     assert metric_calls
     payload, step = metric_calls[-1]

@@ -1772,7 +1772,15 @@ class Flux2TTRRuntime:
         if self._comet_experiment is not None:
             return self._comet_experiment
 
-        experiment_key = self.comet_experiment.strip()
+        raw_experiment_key = self.comet_experiment.strip()
+        experiment_key = flux2_comet_logging.normalize_experiment_key(raw_experiment_key, allow_empty=True)
+        if raw_experiment_key != experiment_key:
+            logger.info(
+                "Flux2TTR: normalized comet_experiment from %r to %r.",
+                raw_experiment_key,
+                experiment_key,
+            )
+            self.comet_experiment = experiment_key
         display_name = str(self.comet_display_name or "").strip()
         if not display_name:
             display_name = _generate_experiment_display_name()
