@@ -7,8 +7,12 @@ requires-python = ">=3.10"
 dependencies = [
   "comfy_kitchen",
   "comet-ml",
+  "dreamsim",
   "einops",
+  "hpsv2",
+  "image-reward",
   "psutil",
+  "pyiqa>=0.1.11",
   "pillow",
   "torch",
   "numpy",
