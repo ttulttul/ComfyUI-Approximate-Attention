@@ -1,4 +1,5 @@
 import sys
+import types
 
 import pytest
 import torch
@@ -517,6 +518,50 @@ def test_controller_trainer_compute_loss_with_additional_quality_terms():
     assert metrics["biqa_quality_penalty"] == pytest.approx(0.7)
     assert metrics["biqa_aesthetic_penalty"] == pytest.approx(0.3)
     assert loss.item() == pytest.approx(base_terms + expected_quality_terms, rel=1e-5)
+
+
+def test_controller_trainer_dreamsim_recovers_from_shadowed_utils(monkeypatch, tmp_path):
+    dreamsim_pkg = tmp_path / "dreamsim"
+    dreamsim_pkg.mkdir()
+    (dreamsim_pkg / "__init__.py").write_text("from .entry import dreamsim\n", encoding="utf-8")
+    (dreamsim_pkg / "entry.py").write_text(
+        "from utils import trunc_normal_\n"
+        "\n"
+        "class FakeDreamSimModel:\n"
+        "    def __init__(self):\n"
+        "        self.eval_called = False\n"
+        "\n"
+        "    def eval(self):\n"
+        "        self.eval_called = True\n"
+        "        return self\n"
+        "\n"
+        "    def __call__(self, student, teacher):\n"
+        "        return 0.0\n"
+        "\n"
+        "def dreamsim(pretrained=True, device='cpu'):\n"
+        "    del pretrained, device\n"
+        "    trunc_normal_(None)\n"
+        "    return FakeDreamSimModel(), (lambda img: img)\n",
+        encoding="utf-8",
+    )
+    (dreamsim_pkg / "utils.py").write_text(
+        "def trunc_normal_(_):\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+
+    shadow_utils = types.ModuleType("utils")
+    monkeypatch.setitem(sys.modules, "utils", shadow_utils)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for module_name in ("dreamsim", "dreamsim.entry", "dreamsim.utils"):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, dreamsim_weight=1.0)
+
+    assert getattr(trainer.dreamsim_model, "eval_called", False) is True
+    assert callable(trainer.dreamsim_preprocess)
+    assert sys.modules["utils"] is shadow_utils
 
 
 def test_controller_trainer_dreamsim_requires_dependency(monkeypatch):

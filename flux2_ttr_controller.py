@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
+import sys
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -760,9 +762,87 @@ class ControllerTrainer:
             return torch.as_tensor(scores, device=device, dtype=dtype).reshape(-1)
         return torch.tensor([float(scores)], device=device, dtype=dtype)
 
+    @staticmethod
+    def _is_dreamsim_utils_shadow_error(exc: Exception) -> bool:
+        message = str(exc)
+        return "trunc_normal_" in message and "from 'utils'" in message
+
+    @staticmethod
+    def _find_dreamsim_utils_file() -> Optional[str]:
+        try:
+            spec = importlib.util.find_spec("dreamsim")
+        except Exception:
+            return None
+        if spec is None or not spec.submodule_search_locations:
+            return None
+        for location in spec.submodule_search_locations:
+            candidate = os.path.join(str(location), "utils.py")
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    @classmethod
+    def _import_dreamsim_with_utils_shim(cls) -> Optional[Callable[..., Any]]:
+        utils_file = cls._find_dreamsim_utils_file()
+        if not utils_file:
+            logger.debug("ControllerTrainer: dreamsim retry skipped; dreamsim/utils.py was not found.")
+            return None
+
+        utils_spec = importlib.util.spec_from_file_location("_dreamsim_utils_shim", utils_file)
+        if utils_spec is None or utils_spec.loader is None:
+            logger.debug("ControllerTrainer: dreamsim retry skipped; unable to load spec for %s.", utils_file)
+            return None
+
+        dreamsim_utils = importlib.util.module_from_spec(utils_spec)
+        try:
+            utils_spec.loader.exec_module(dreamsim_utils)
+        except Exception:
+            logger.debug(
+                "ControllerTrainer: dreamsim retry skipped; failed to execute utils shim from %s.",
+                utils_file,
+                exc_info=True,
+            )
+            return None
+
+        sentinel = object()
+        previous_utils = sys.modules.get("utils", sentinel)
+        sys.modules["utils"] = dreamsim_utils
+        for name in [k for k in list(sys.modules.keys()) if k == "dreamsim" or k.startswith("dreamsim.")]:
+            sys.modules.pop(name, None)
+
+        try:
+            from dreamsim import dreamsim as dreamsim_factory  # type: ignore
+
+            logger.warning(
+                "ControllerTrainer: recovered dreamsim import by retrying with dreamsim's bundled utils shim."
+            )
+            return dreamsim_factory
+        except Exception:
+            logger.debug("ControllerTrainer: dreamsim retry with bundled utils shim failed.", exc_info=True)
+            return None
+        finally:
+            if previous_utils is sentinel:
+                sys.modules.pop("utils", None)
+            else:
+                sys.modules["utils"] = previous_utils
+
+    @classmethod
+    def _import_dreamsim_factory(cls) -> Callable[..., Any]:
+        try:
+            from dreamsim import dreamsim as dreamsim_factory  # type: ignore
+
+            return dreamsim_factory
+        except Exception as exc:
+            if not cls._is_dreamsim_utils_shadow_error(exc):
+                raise
+            recovered = cls._import_dreamsim_with_utils_shim()
+            if recovered is not None:
+                return recovered
+            raise
+
     def _init_dreamsim_model(self) -> None:
         try:
-            from dreamsim import dreamsim  # type: ignore
+            dreamsim = self._import_dreamsim_factory()
 
             controller_device, _ = self.controller._input_device_dtype()
             loaded = dreamsim(pretrained=True, device=str(controller_device))
