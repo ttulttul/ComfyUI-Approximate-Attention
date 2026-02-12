@@ -773,12 +773,24 @@ class ControllerTrainer:
             spec = importlib.util.find_spec("dreamsim")
         except Exception:
             return None
-        if spec is None or not spec.submodule_search_locations:
+        if spec is None:
             return None
-        for location in spec.submodule_search_locations:
-            candidate = os.path.join(str(location), "utils.py")
-            if os.path.isfile(candidate):
-                return candidate
+
+        candidate_dirs: list[str] = []
+        if spec.submodule_search_locations:
+            candidate_dirs.extend(str(location) for location in spec.submodule_search_locations)
+        if spec.origin:
+            candidate_dirs.append(os.path.dirname(str(spec.origin)))
+
+        seen: set[str] = set()
+        for location in candidate_dirs:
+            if not location or location in seen:
+                continue
+            seen.add(location)
+            for rel_path in ("utils.py", os.path.join("utils", "__init__.py")):
+                candidate = os.path.join(location, rel_path)
+                if os.path.isfile(candidate):
+                    return candidate
         return None
 
     @classmethod
