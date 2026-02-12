@@ -826,10 +826,22 @@ class ControllerTrainer:
         try:
             from dreamsim import dreamsim as dreamsim_factory  # type: ignore
 
+            def _wrapped_factory(*args: Any, **kwargs: Any) -> Any:
+                call_sentinel = object()
+                previous_call_utils = sys.modules.get("utils", call_sentinel)
+                sys.modules["utils"] = dreamsim_utils
+                try:
+                    return dreamsim_factory(*args, **kwargs)
+                finally:
+                    if previous_call_utils is call_sentinel:
+                        sys.modules.pop("utils", None)
+                    else:
+                        sys.modules["utils"] = previous_call_utils
+
             logger.warning(
                 "ControllerTrainer: recovered dreamsim import by retrying with dreamsim's bundled utils shim."
             )
-            return dreamsim_factory
+            return _wrapped_factory
         except Exception:
             logger.debug("ControllerTrainer: dreamsim retry with bundled utils shim failed.", exc_info=True)
             return None
@@ -865,10 +877,41 @@ class ControllerTrainer:
         try:
             from dreamsim import dreamsim as dreamsim_factory  # type: ignore
 
+            def _wrapped_factory(*args: Any, **kwargs: Any) -> Any:
+                call_sentinel = object()
+                previous_call_utils = sys.modules.get("utils", call_sentinel)
+                call_utils: Any = previous_call_utils
+                if previous_call_utils is call_sentinel:
+                    try:
+                        import utils as imported_utils  # type: ignore
+
+                        call_utils = imported_utils
+                    except Exception:
+                        call_utils = types.ModuleType("utils")
+
+                injected_call = False
+                if not hasattr(call_utils, "trunc_normal_"):
+                    setattr(call_utils, "trunc_normal_", torch.nn.init.trunc_normal_)
+                    injected_call = True
+
+                sys.modules["utils"] = call_utils
+                try:
+                    return dreamsim_factory(*args, **kwargs)
+                finally:
+                    if previous_call_utils is call_sentinel:
+                        sys.modules.pop("utils", None)
+                    else:
+                        if injected_call:
+                            try:
+                                delattr(previous_call_utils, "trunc_normal_")
+                            except Exception:
+                                pass
+                        sys.modules["utils"] = previous_call_utils
+
             logger.warning(
                 "ControllerTrainer: recovered dreamsim import by patching missing utils.trunc_normal_."
             )
-            return dreamsim_factory
+            return _wrapped_factory
         except Exception:
             logger.debug("ControllerTrainer: dreamsim retry with utils.trunc_normal_ patch failed.", exc_info=True)
             return None
@@ -906,7 +949,20 @@ class ControllerTrainer:
             dreamsim = self._import_dreamsim_factory()
 
             controller_device, _ = self.controller._input_device_dtype()
-            loaded = dreamsim(pretrained=True, device=str(controller_device))
+            try:
+                loaded = dreamsim(pretrained=True, device=str(controller_device))
+            except Exception as exc:
+                if not self._is_dreamsim_utils_shadow_error(exc):
+                    raise
+                logger.warning(
+                    "ControllerTrainer: dreamsim() failed with utils.trunc_normal_ collision; retrying import recovery path."
+                )
+                recovered = self._import_dreamsim_with_utils_shim()
+                if recovered is None:
+                    recovered = self._import_dreamsim_with_trunc_normal_patch()
+                if recovered is None:
+                    raise
+                loaded = recovered(pretrained=True, device=str(controller_device))
             if not isinstance(loaded, tuple) or len(loaded) < 2:
                 raise RuntimeError("unexpected dreamsim() return signature")
             self.dreamsim_model, self.dreamsim_preprocess = loaded[0], loaded[1]
