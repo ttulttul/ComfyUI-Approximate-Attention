@@ -4,6 +4,7 @@ import importlib.util
 import logging
 import os
 import sys
+import types
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -839,6 +840,51 @@ class ControllerTrainer:
                 sys.modules["utils"] = previous_utils
 
     @classmethod
+    def _import_dreamsim_with_trunc_normal_patch(cls) -> Optional[Callable[..., Any]]:
+        sentinel = object()
+        previous_utils = sys.modules.get("utils", sentinel)
+        utils_module: Any = previous_utils
+
+        if previous_utils is sentinel:
+            try:
+                import utils as imported_utils  # type: ignore
+
+                utils_module = imported_utils
+            except Exception:
+                utils_module = types.ModuleType("utils")
+
+        injected = False
+        if not hasattr(utils_module, "trunc_normal_"):
+            setattr(utils_module, "trunc_normal_", torch.nn.init.trunc_normal_)
+            injected = True
+
+        sys.modules["utils"] = utils_module
+        for name in [k for k in list(sys.modules.keys()) if k == "dreamsim" or k.startswith("dreamsim.")]:
+            sys.modules.pop(name, None)
+
+        try:
+            from dreamsim import dreamsim as dreamsim_factory  # type: ignore
+
+            logger.warning(
+                "ControllerTrainer: recovered dreamsim import by patching missing utils.trunc_normal_."
+            )
+            return dreamsim_factory
+        except Exception:
+            logger.debug("ControllerTrainer: dreamsim retry with utils.trunc_normal_ patch failed.", exc_info=True)
+            return None
+        finally:
+            if previous_utils is sentinel:
+                sys.modules.pop("utils", None)
+            elif injected:
+                try:
+                    delattr(previous_utils, "trunc_normal_")
+                except Exception:
+                    pass
+                sys.modules["utils"] = previous_utils
+            else:
+                sys.modules["utils"] = previous_utils
+
+    @classmethod
     def _import_dreamsim_factory(cls) -> Callable[..., Any]:
         try:
             from dreamsim import dreamsim as dreamsim_factory  # type: ignore
@@ -848,6 +894,9 @@ class ControllerTrainer:
             if not cls._is_dreamsim_utils_shadow_error(exc):
                 raise
             recovered = cls._import_dreamsim_with_utils_shim()
+            if recovered is not None:
+                return recovered
+            recovered = cls._import_dreamsim_with_trunc_normal_patch()
             if recovered is not None:
                 return recovered
             raise
