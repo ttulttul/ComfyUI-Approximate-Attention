@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import random
+import threading
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
 _PATCH_DEPTH = 0
 _RUNTIME_REGISTRY: Dict[str, "Flux2TTRRuntime"] = {}
+_RUNTIME_CHECKPOINT_CACHE: Dict[tuple[str, int, int, int, bool], "Flux2TTRRuntime"] = {}
+_RUNTIME_CHECKPOINT_CACHE_LOCK = threading.Lock()
 _TTR_COMET_NAMESPACE = "flux2_ttr_runtime"
 _TTR_COMET_EXPERIMENTS: Dict[str, Any] = flux2_comet_logging.experiments_for(_TTR_COMET_NAMESPACE)
 _TTR_COMET_LOGGED_PARAM_KEYS: set[str] = flux2_comet_logging.logged_param_keys_for(_TTR_COMET_NAMESPACE)
@@ -194,6 +197,95 @@ def load_checkpoint_feature_dim(checkpoint_path: str) -> int:
     if not isinstance(payload, dict):
         raise ValueError(f"Flux2TTR: unsupported checkpoint payload in {path}.")
     return _checkpoint_feature_dim_from_payload(payload, path)
+
+
+def runtime_checkpoint_cache_key(
+    checkpoint_path: str,
+    *,
+    feature_dim: int,
+    training: bool,
+) -> tuple[str, int, int, int, bool]:
+    path = str(checkpoint_path or "").strip()
+    if not path:
+        raise ValueError("Flux2TTR: checkpoint_path must be set when deriving cache key.")
+    resolved_path = os.path.realpath(path)
+    stat_result = os.stat(resolved_path)
+    mtime_ns = int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)))
+    return (
+        resolved_path,
+        mtime_ns,
+        int(stat_result.st_size),
+        int(feature_dim),
+        bool(training),
+    )
+
+
+def get_cached_runtime_for_checkpoint(
+    checkpoint_path: str,
+    *,
+    feature_dim: int,
+    training: bool,
+) -> Optional["Flux2TTRRuntime"]:
+    try:
+        cache_key = runtime_checkpoint_cache_key(
+            checkpoint_path,
+            feature_dim=int(feature_dim),
+            training=bool(training),
+        )
+    except Exception:
+        return None
+    with _RUNTIME_CHECKPOINT_CACHE_LOCK:
+        return _RUNTIME_CHECKPOINT_CACHE.get(cache_key)
+
+
+def cache_runtime_for_checkpoint(
+    checkpoint_path: str,
+    *,
+    feature_dim: int,
+    training: bool,
+    runtime: "Flux2TTRRuntime",
+) -> None:
+    try:
+        cache_key = runtime_checkpoint_cache_key(
+            checkpoint_path,
+            feature_dim=int(feature_dim),
+            training=bool(training),
+        )
+    except Exception as exc:
+        logger.debug(
+            "Flux2TTR: runtime checkpoint cache key unavailable for %r (%s).",
+            checkpoint_path,
+            exc,
+        )
+        return
+
+    cache_path, _, _, cache_feature_dim, cache_training = cache_key
+    with _RUNTIME_CHECKPOINT_CACHE_LOCK:
+        stale_keys = [
+            key
+            for key in _RUNTIME_CHECKPOINT_CACHE
+            if key[0] == cache_path
+            and key[3] == cache_feature_dim
+            and key[4] == cache_training
+            and key != cache_key
+        ]
+        for key in stale_keys:
+            _RUNTIME_CHECKPOINT_CACHE.pop(key, None)
+        _RUNTIME_CHECKPOINT_CACHE[cache_key] = runtime
+
+    if stale_keys:
+        logger.debug(
+            "Flux2TTR: runtime checkpoint cache refreshed for %s (removed %d stale entries).",
+            cache_path,
+            len(stale_keys),
+        )
+    else:
+        logger.debug("Flux2TTR: cached runtime for checkpoint %s.", cache_path)
+
+
+def clear_runtime_checkpoint_cache() -> None:
+    with _RUNTIME_CHECKPOINT_CACHE_LOCK:
+        _RUNTIME_CHECKPOINT_CACHE.clear()
 
 
 def _normalize_landmark_min(landmark_min: int) -> int:

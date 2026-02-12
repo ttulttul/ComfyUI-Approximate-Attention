@@ -775,6 +775,18 @@ class Flux2TTRTrainer(io.ComfyNode):
         ui_comet_experiment = str(comet_experiment or "").strip()
         ui_comet_persist_experiment = bool(ui_comet_experiment)
         ui_comet_log_every = max(1, int(comet_log_every))
+        checkpoint_exists = bool(checkpoint_path and os.path.isfile(checkpoint_path))
+        runtime = None
+        runtime_cache_hit = False
+        if checkpoint_exists:
+            runtime = flux2_ttr.get_cached_runtime_for_checkpoint(
+                checkpoint_path,
+                feature_dim=feature_dim,
+                training=bool(training),
+            )
+            runtime_cache_hit = runtime is not None
+            if runtime_cache_hit:
+                logger.info("Flux2TTRTrainer: reusing cached runtime for checkpoint: %s", checkpoint_path)
 
         m = model.clone()
         transformer_options = m.model_options.setdefault("transformer_options", {})
@@ -785,51 +797,58 @@ class Flux2TTRTrainer(io.ComfyNode):
             if isinstance(prev_runtime, str):
                 flux2_ttr.unregister_runtime(prev_runtime)
 
-        runtime = flux2_ttr.Flux2TTRRuntime(
-            feature_dim=feature_dim,
-            learning_rate=float(learning_rate),
-            training=bool(training),
-            steps=train_steps,
-            scan_chunk_size=int(query_chunk_size),
-            key_chunk_size=int(key_chunk_size),
-            landmark_fraction=float(landmark_fraction),
-            landmark_min=int(landmark_min),
-            landmark_max=int(landmark_max),
-            text_tokens_guess=int(text_tokens_guess),
-            alpha_init=float(alpha_init),
-            alpha_lr_multiplier=float(alpha_lr_multiplier),
-            phi_lr_multiplier=float(phi_lr_multiplier),
-            training_query_token_cap=int(training_query_token_cap),
-            replay_buffer_size=int(replay_buffer_size),
-            replay_offload_cpu=bool(replay_offload_cpu),
-            replay_max_bytes=int(replay_max_mb) * 1024 * 1024,
-            train_steps_per_call=int(train_steps_per_call),
-            huber_beta=float(huber_beta),
-            grad_clip_norm=float(grad_clip_norm),
-            readiness_threshold=float(readiness_threshold),
-            readiness_min_updates=int(readiness_min_updates),
-            enable_memory_reserve=bool(enable_memory_reserve),
-            layer_start=int(layer_start),
-            layer_end=int(layer_end),
-            cfg_scale=float(cfg_scale),
-            min_swap_layers=int(min_swap_layers),
-            max_swap_layers=int(max_swap_layers),
-            inference_mixed_precision=bool(inference_mixed_precision),
-            training_preview_ttr=bool(training_preview_ttr),
-            comet_enabled=bool(comet_enabled),
-            comet_project_name=str(comet_project_name or "ttr-distillation"),
-            comet_workspace=str(comet_workspace or "comet-workspace"),
-            comet_experiment=str(comet_experiment or ""),
-            comet_persist_experiment=bool(comet_experiment),
-            comet_api_key=str(comet_api_key or ""),
-            comet_log_every=int(comet_log_every),
-        )
+        if runtime is None:
+            runtime = flux2_ttr.Flux2TTRRuntime(
+                feature_dim=feature_dim,
+                learning_rate=float(learning_rate),
+                training=bool(training),
+                steps=train_steps,
+                scan_chunk_size=int(query_chunk_size),
+                key_chunk_size=int(key_chunk_size),
+                landmark_fraction=float(landmark_fraction),
+                landmark_min=int(landmark_min),
+                landmark_max=int(landmark_max),
+                text_tokens_guess=int(text_tokens_guess),
+                alpha_init=float(alpha_init),
+                alpha_lr_multiplier=float(alpha_lr_multiplier),
+                phi_lr_multiplier=float(phi_lr_multiplier),
+                training_query_token_cap=int(training_query_token_cap),
+                replay_buffer_size=int(replay_buffer_size),
+                replay_offload_cpu=bool(replay_offload_cpu),
+                replay_max_bytes=int(replay_max_mb) * 1024 * 1024,
+                train_steps_per_call=int(train_steps_per_call),
+                huber_beta=float(huber_beta),
+                grad_clip_norm=float(grad_clip_norm),
+                readiness_threshold=float(readiness_threshold),
+                readiness_min_updates=int(readiness_min_updates),
+                enable_memory_reserve=bool(enable_memory_reserve),
+                layer_start=int(layer_start),
+                layer_end=int(layer_end),
+                cfg_scale=float(cfg_scale),
+                min_swap_layers=int(min_swap_layers),
+                max_swap_layers=int(max_swap_layers),
+                inference_mixed_precision=bool(inference_mixed_precision),
+                training_preview_ttr=bool(training_preview_ttr),
+                comet_enabled=bool(comet_enabled),
+                comet_project_name=str(comet_project_name or "ttr-distillation"),
+                comet_workspace=str(comet_workspace or "comet-workspace"),
+                comet_experiment=str(comet_experiment or ""),
+                comet_persist_experiment=bool(comet_experiment),
+                comet_api_key=str(comet_api_key or ""),
+                comet_log_every=int(comet_log_every),
+            )
         runtime.register_layer_specs(flux2_ttr.infer_flux_single_layer_specs(m))
 
         if training:
-            if checkpoint_path and os.path.isfile(checkpoint_path):
+            if checkpoint_exists and not runtime_cache_hit:
                 logger.info("Flux2TTRTrainer: loading existing checkpoint before online distillation: %s", checkpoint_path)
                 runtime.load_checkpoint(checkpoint_path)
+                flux2_ttr.cache_runtime_for_checkpoint(
+                    checkpoint_path,
+                    feature_dim=feature_dim,
+                    training=True,
+                    runtime=runtime,
+                )
             runtime.training_mode = True
             runtime.training_enabled = train_steps > 0
             runtime.training_steps_total = max(0, train_steps)
@@ -839,9 +858,16 @@ class Flux2TTRTrainer(io.ComfyNode):
         else:
             if not checkpoint_path:
                 raise ValueError("Flux2TTRTrainer: checkpoint_path is required when training is disabled.")
-            if not os.path.isfile(checkpoint_path):
+            if not checkpoint_exists:
                 raise FileNotFoundError(f"Flux2TTRTrainer: checkpoint not found: {checkpoint_path}")
-            runtime.load_checkpoint(checkpoint_path)
+            if not runtime_cache_hit:
+                runtime.load_checkpoint(checkpoint_path)
+                flux2_ttr.cache_runtime_for_checkpoint(
+                    checkpoint_path,
+                    feature_dim=feature_dim,
+                    training=False,
+                    runtime=runtime,
+                )
             runtime.training_mode = False
             runtime.training_enabled = False
             runtime.training_steps_total = 0

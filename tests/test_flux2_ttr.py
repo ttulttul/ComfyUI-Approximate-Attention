@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import sys
 import types
 from collections import deque
@@ -143,6 +144,120 @@ def test_load_checkpoint_feature_dim_rejects_invalid_feature_dim(tmp_path):
     torch.save({"format": "flux2_ttr_v2", "feature_dim": 384}, ckpt)
     with pytest.raises(ValueError, match="invalid checkpoint feature_dim"):
         flux2_ttr.load_checkpoint_feature_dim(str(ckpt))
+
+
+def test_runtime_checkpoint_cache_key_includes_file_identity_and_flags(tmp_path):
+    flux2_ttr.clear_runtime_checkpoint_cache()
+    ckpt = tmp_path / "flux2_ttr_runtime_cache.pt"
+    ckpt.write_bytes(b"checkpoint")
+    stat_result = ckpt.stat()
+    path_with_dot = str(ckpt.parent / "." / ckpt.name)
+
+    key = flux2_ttr.runtime_checkpoint_cache_key(
+        path_with_dot,
+        feature_dim=512,
+        training=True,
+    )
+
+    assert key == (
+        os.path.realpath(path_with_dot),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+        512,
+        True,
+    )
+    flux2_ttr.clear_runtime_checkpoint_cache()
+
+
+def test_runtime_checkpoint_cache_round_trip_is_partitioned_by_training_flag(tmp_path):
+    flux2_ttr.clear_runtime_checkpoint_cache()
+    ckpt = tmp_path / "flux2_ttr_runtime_cache_partition.pt"
+    ckpt.write_bytes(b"checkpoint-v1")
+
+    runtime_infer = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime_train = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=0)
+
+    flux2_ttr.cache_runtime_for_checkpoint(
+        str(ckpt),
+        feature_dim=256,
+        training=False,
+        runtime=runtime_infer,
+    )
+    assert (
+        flux2_ttr.get_cached_runtime_for_checkpoint(
+            str(ckpt),
+            feature_dim=256,
+            training=False,
+        )
+        is runtime_infer
+    )
+    assert flux2_ttr.get_cached_runtime_for_checkpoint(str(ckpt), feature_dim=256, training=True) is None
+
+    flux2_ttr.cache_runtime_for_checkpoint(
+        str(ckpt),
+        feature_dim=256,
+        training=True,
+        runtime=runtime_train,
+    )
+    assert (
+        flux2_ttr.get_cached_runtime_for_checkpoint(
+            str(ckpt),
+            feature_dim=256,
+            training=True,
+        )
+        is runtime_train
+    )
+    assert (
+        flux2_ttr.get_cached_runtime_for_checkpoint(
+            str(ckpt),
+            feature_dim=256,
+            training=False,
+        )
+        is runtime_infer
+    )
+
+
+def test_runtime_checkpoint_cache_invalidates_after_checkpoint_metadata_change(tmp_path):
+    flux2_ttr.clear_runtime_checkpoint_cache()
+    ckpt = tmp_path / "flux2_ttr_runtime_cache_mutation.pt"
+    ckpt.write_bytes(b"checkpoint-v1")
+
+    runtime_v1 = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    flux2_ttr.cache_runtime_for_checkpoint(
+        str(ckpt),
+        feature_dim=256,
+        training=False,
+        runtime=runtime_v1,
+    )
+    assert (
+        flux2_ttr.get_cached_runtime_for_checkpoint(
+            str(ckpt),
+            feature_dim=256,
+            training=False,
+        )
+        is runtime_v1
+    )
+
+    ckpt.write_bytes(b"checkpoint-v2-with-new-size")
+    assert flux2_ttr.get_cached_runtime_for_checkpoint(str(ckpt), feature_dim=256, training=False) is None
+
+    runtime_v2 = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    flux2_ttr.cache_runtime_for_checkpoint(
+        str(ckpt),
+        feature_dim=256,
+        training=False,
+        runtime=runtime_v2,
+    )
+    assert (
+        flux2_ttr.get_cached_runtime_for_checkpoint(
+            str(ckpt),
+            feature_dim=256,
+            training=False,
+        )
+        is runtime_v2
+    )
+    assert len(flux2_ttr._RUNTIME_CHECKPOINT_CACHE) == 1
+    flux2_ttr.clear_runtime_checkpoint_cache()
 
 
 def test_infer_flux_single_layer_specs():
