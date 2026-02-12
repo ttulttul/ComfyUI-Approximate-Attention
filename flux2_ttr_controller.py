@@ -773,7 +773,7 @@ class ControllerTrainer:
                 self.dreamsim_model.eval()
         except Exception as exc:
             raise RuntimeError(
-                "ControllerTrainer: dreamsim_weight > 0 requires the 'dreamsim' package."
+                    "ControllerTrainer: dreamsim_weight > 0 requires the 'dreamsim' package: %s." % exc
             ) from exc
 
     def _init_hps_model(self) -> None:
