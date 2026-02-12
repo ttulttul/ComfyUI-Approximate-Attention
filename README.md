@@ -4,7 +4,11 @@ This repository provides ComfyUI nodes for Flux2TTR v2 distillation and controll
 
 ## Installation
 
-Copy this folder into your ComfyUI `custom_nodes` directory and restart ComfyUI.
+Copy this folder into your ComfyUI `custom_nodes` directory and restart
+ComfyUI.  For prerequisites, unless you are using ComfyUI's official installer
+(unlikely), run `uv pip install -e custom_nodes/ComfyUI-Approximate-Attention`
+to install all of the prerequisites you will need for training using this node
+pack. Pre-requisites are found in `pyproject.toml`.
 
 ## Available Nodes
 
@@ -54,7 +58,6 @@ loss = huber / (2 × exp(log_var_huber)) + log_var_huber / 2
 Here `log_var_huber` and `log_var_cosine` are learned scalars that let neither objective dominate. Initialization is asymmetric (`log_var_huber=0.0`, `log_var_cosine=−1.0`) so cosine alignment starts with higher effective weight before the Kendall balancing converges. Cosine alignment computes per-token, per-head similarity over the head dimension (`dim=−1`), preventing high-dimensional flattening from masking hard-token directional errors.
 
 **Checkpointing.** Phase 1 checkpoints persist per-layer AdamW optimizer states and the loss-weight optimizer state for `log_var_huber` / `log_var_cosine`, so cross-run resume preserves momentum and variance estimates instead of restarting optimizer warmup. Layer and optimizer restoration strips inference-tensor metadata and auto-rebuilds stale inference-backed layers before replay training, preventing "inplace update to inference tensor" failures at run boundaries. Loss-balance parameters are likewise rebuilt as normal trainable tensors if they were created under `torch.inference_mode()`.
-
 When `comet_experiment` is not provided, `Flux2TTRRuntime` now auto-generates a per-runtime Comet experiment key using `git rev-parse --short=7 HEAD` plus a start timestamp (`YYYYMMDD-HHMMSS`), and enables persistent experiment reuse for that key. The git hash is resolved from the directory containing `flux2_ttr.py`, so it tracks the extension repository rather than a parent repo. Comet display names are also set at experiment start to a human-readable run tag of the form `YYYY-MM-DD-HHMMSS-<git6>` (for example `2026-02-11-073025-b3ed63`) to make run identification easier in the Comet UI.
 When resuming from checkpoint via `Flux2TTRTrainer`, Comet settings from the UI `training_config` take precedence over checkpoint metadata so changing the experiment key/project/workspace in the workflow is respected immediately.
 
