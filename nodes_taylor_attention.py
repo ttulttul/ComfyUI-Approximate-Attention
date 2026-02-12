@@ -43,6 +43,10 @@ _TRAINING_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "rmse_weight": 1.0,
         "cosine_weight": 1.0,
         "lpips_weight": 0.0,
+        "dreamsim_weight": 0.0,
+        "hps_weight": 0.0,
+        "biqa_quality_weight": 0.0,
+        "biqa_aesthetic_weight": 0.0,
         "huber_beta": 0.05,
     },
     "optimizer_config": {
@@ -242,6 +246,10 @@ def _build_training_config_payload(
     rmse_weight: float,
     cosine_weight: float,
     lpips_weight: float,
+    dreamsim_weight: float,
+    hps_weight: float,
+    biqa_quality_weight: float,
+    biqa_aesthetic_weight: float,
     huber_beta: float,
     learning_rate: float,
     grad_clip_norm: float,
@@ -265,6 +273,10 @@ def _build_training_config_payload(
             "rmse_weight": float(rmse_weight),
             "cosine_weight": float(cosine_weight),
             "lpips_weight": float(lpips_weight),
+            "dreamsim_weight": float(dreamsim_weight),
+            "hps_weight": float(hps_weight),
+            "biqa_quality_weight": float(biqa_quality_weight),
+            "biqa_aesthetic_weight": float(biqa_aesthetic_weight),
             "huber_beta": float(huber_beta),
         },
         "optimizer_config": {
@@ -307,6 +319,10 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
                 io.Float.Input("rmse_weight", default=1.0, min=0.0, max=1000.0, step=1e-3),
                 io.Float.Input("cosine_weight", default=1.0, min=0.0, max=1000.0, step=1e-3),
                 io.Float.Input("lpips_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
+                io.Float.Input("dreamsim_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
+                io.Float.Input("hps_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
+                io.Float.Input("biqa_quality_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
+                io.Float.Input("biqa_aesthetic_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
                 io.Float.Input("huber_beta", default=0.05, min=1e-6, max=10.0, step=1e-4),
                 io.Float.Input("learning_rate", default=1e-4, min=1e-7, max=1.0, step=1e-7),
                 io.Float.Input("grad_clip_norm", default=1.0, min=0.0, max=100.0, step=1e-3),
@@ -340,6 +356,10 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
         rmse_weight: float,
         cosine_weight: float,
         lpips_weight: float,
+        dreamsim_weight: float,
+        hps_weight: float,
+        biqa_quality_weight: float,
+        biqa_aesthetic_weight: float,
         huber_beta: float,
         learning_rate: float,
         grad_clip_norm: float,
@@ -362,6 +382,10 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
             rmse_weight=rmse_weight,
             cosine_weight=cosine_weight,
             lpips_weight=lpips_weight,
+            dreamsim_weight=dreamsim_weight,
+            hps_weight=hps_weight,
+            biqa_quality_weight=biqa_quality_weight,
+            biqa_aesthetic_weight=biqa_aesthetic_weight,
             huber_beta=huber_beta,
             learning_rate=learning_rate,
             grad_clip_norm=grad_clip_norm,
@@ -689,11 +713,25 @@ class Flux2TTRTrainer(io.ComfyNode):
         rmse_weight = _float_or(loss_cfg.get("rmse_weight"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["rmse_weight"])
         cosine_weight = _float_or(loss_cfg.get("cosine_weight"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["cosine_weight"])
         lpips_weight = _float_or(loss_cfg.get("lpips_weight"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["lpips_weight"])
+        dreamsim_weight = _float_or(loss_cfg.get("dreamsim_weight"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["dreamsim_weight"])
+        hps_weight = _float_or(loss_cfg.get("hps_weight"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["hps_weight"])
+        biqa_quality_weight = _float_or(
+            loss_cfg.get("biqa_quality_weight"),
+            _TRAINING_CONFIG_DEFAULTS["loss_config"]["biqa_quality_weight"],
+        )
+        biqa_aesthetic_weight = _float_or(
+            loss_cfg.get("biqa_aesthetic_weight"),
+            _TRAINING_CONFIG_DEFAULTS["loss_config"]["biqa_aesthetic_weight"],
+        )
 
         resolved_training_config = _build_training_config_payload(
             rmse_weight=rmse_weight,
             cosine_weight=cosine_weight,
             lpips_weight=lpips_weight,
+            dreamsim_weight=dreamsim_weight,
+            hps_weight=hps_weight,
+            biqa_quality_weight=biqa_quality_weight,
+            biqa_aesthetic_weight=biqa_aesthetic_weight,
             huber_beta=huber_beta,
             learning_rate=learning_rate,
             grad_clip_norm=grad_clip_norm,

@@ -66,7 +66,9 @@ The `TTRController` predicts a per-layer routing logit for each diffusion step. 
 
 ### Phase 2: Training Mechanics
 
-Controller training uses policy gradients with quality-driven rewards. A teacher path samples with the original model while a student path samples with the TTR model under controller routing. The quality objective (`compute_loss`) on latent or image outputs combines `rmse_weight × RMSE + cosine_weight × cosine_distance + lpips_weight × LPIPS` (LPIPS is optional).
+Controller training uses policy gradients with quality-driven rewards. A teacher path samples with the original model while a student path samples with the TTR model under controller routing. The quality objective (`compute_loss`) on latent or image outputs combines `rmse_weight × RMSE + cosine_weight × cosine_distance + lpips_weight × LPIPS + dreamsim_weight × DreamSim + hps_weight × HPS_penalty + biqa_quality_weight × BIQA_quality_penalty + biqa_aesthetic_weight × BIQA_aesthetic_penalty`.
+
+For HPS/BIQA terms, the trainer compares teacher and student scores and penalizes only when the student is lower (`relu(teacher_score - student_score)`), so improving over the teacher baseline is not penalized.
 
 **Reward shaping.** The reward signal is `reward = −quality_loss − λ_eff × efficiency_penalty + λ_entropy × entropy_bonus`, where the efficiency penalty is `relu(actual_full_attn_ratio − target_full_attn_ratio)` and `target_full_attn_ratio = 1 − target_ttr_ratio`.
 
@@ -75,6 +77,8 @@ Controller training uses policy gradients with quality-driven rewards. A teacher
 **Sigma-aware training.** When `sigma_aware_training` is enabled (the default), a trajectory wrapper logs per-step actions and recomputes sigma-weighted log-probs under a grad-enabled context, matching how routing is actually used during denoising.
 
 **Trainer modularization.** The `Flux2TTRControllerTrainer` node now delegates its execution flow to `flux2_ttr_controller_trainer_node.py`, with small composable helper functions for sampling, policy updates, metrics, checkpointing, and Comet logging.
+
+**Optional quality-model dependencies.** Additional controller quality terms are activated only when their weights are non-zero: `dreamsim` for DreamSim, `hpsv2` or `ImageReward` for HPS/ImageReward, and `pyiqa` (Q-Align or LIQE fallback) for BIQA metrics.
 
 **Inference.** `Flux2TTRController` exposes a `quality_speed` knob to trade quality against speed through controller thresholding. It supports two policy modes: `stochastic` (the default) samples one controller mask per diffusion step — cached for all layer calls in that step — to match sigma-aware policy training behavior, while `threshold` mode uses a deterministic cutoff. For checkpoint consistency, controller inference now derives `feature_dim` directly from TTR checkpoint metadata rather than assuming a default. Per-step routing summaries (sigma, threshold, student-routed layer set) are logged once per step.
 

@@ -356,6 +356,10 @@ def test_controller_trainer_compute_loss_without_lpips():
     assert metrics["target_full_attn_ratio"] == pytest.approx(0.3)
     assert "rmse" in metrics
     assert "cosine_distance" in metrics
+    assert metrics["dreamsim"] == pytest.approx(0.0)
+    assert metrics["hps_penalty"] == pytest.approx(0.0)
+    assert metrics["biqa_quality_penalty"] == pytest.approx(0.0)
+    assert metrics["biqa_aesthetic_penalty"] == pytest.approx(0.0)
 
 
 def test_controller_trainer_efficiency_penalty_uses_ttr_target_semantics():
@@ -426,10 +430,21 @@ def test_controller_trainer_lpips_requires_dependency(monkeypatch):
         flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=1.0)
 
 
-def test_controller_trainer_training_config_overrides_defaults():
+def test_controller_trainer_training_config_overrides_defaults(monkeypatch):
+    monkeypatch.setattr(flux2_ttr_controller.ControllerTrainer, "_init_dreamsim_model", lambda self: None)
+    monkeypatch.setattr(flux2_ttr_controller.ControllerTrainer, "_init_hps_model", lambda self: None)
+    monkeypatch.setattr(flux2_ttr_controller.ControllerTrainer, "_init_biqa_models", lambda self: None)
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
     training_config = {
-        "loss_config": {"rmse_weight": 2.5, "cosine_weight": 0.75, "lpips_weight": 0.0},
+        "loss_config": {
+            "rmse_weight": 2.5,
+            "cosine_weight": 0.75,
+            "lpips_weight": 0.0,
+            "dreamsim_weight": 0.2,
+            "hps_weight": 0.3,
+            "biqa_quality_weight": 0.4,
+            "biqa_aesthetic_weight": 0.5,
+        },
         "optimizer_config": {"learning_rate": 3e-4, "grad_clip_norm": 0.25},
         "schedule_config": {"target_ttr_ratio": 0.4, "lambda_eff": 2.25, "lambda_entropy": 0.35},
     }
@@ -440,6 +455,10 @@ def test_controller_trainer_training_config_overrides_defaults():
         rmse_weight=7.0,
         cosine_weight=7.0,
         lpips_weight=0.0,
+        dreamsim_weight=0.0,
+        hps_weight=0.0,
+        biqa_quality_weight=0.0,
+        biqa_aesthetic_weight=0.0,
         target_ttr_ratio=0.9,
         lambda_eff=7.0,
         lambda_entropy=0.9,
@@ -451,7 +470,70 @@ def test_controller_trainer_training_config_overrides_defaults():
     assert trainer.lambda_eff == pytest.approx(2.25)
     assert trainer.lambda_entropy == pytest.approx(0.35)
     assert trainer.grad_clip_norm == pytest.approx(0.25)
+    assert trainer.dreamsim_weight == pytest.approx(0.2)
+    assert trainer.hps_weight == pytest.approx(0.3)
+    assert trainer.biqa_quality_weight == pytest.approx(0.4)
+    assert trainer.biqa_aesthetic_weight == pytest.approx(0.5)
     assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
+
+
+def test_controller_trainer_compute_loss_with_additional_quality_terms():
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0)
+    trainer.dreamsim_weight = 0.5
+    trainer.hps_weight = 0.25
+    trainer.biqa_quality_weight = 0.75
+    trainer.biqa_aesthetic_weight = 0.1
+    trainer._score_dreamsim = lambda **kwargs: torch.tensor(2.0, device=kwargs["loss"].device)
+    hps_values = iter((0.8, 0.3))
+    biqa_quality_values = iter((0.9, 0.2))
+    biqa_aesthetic_values = iter((0.7, 0.4))
+    trainer._score_hps_batch = lambda **kwargs: torch.tensor(next(hps_values), device=kwargs["loss"].device)
+    trainer._score_biqa_quality = lambda **kwargs: torch.tensor(next(biqa_quality_values), device=kwargs["loss"].device)
+    trainer._score_biqa_aesthetic = lambda **kwargs: torch.tensor(next(biqa_aesthetic_values), device=kwargs["loss"].device)
+
+    teacher = torch.zeros(1, 4, 4, 4)
+    student = torch.zeros_like(teacher)
+    teacher_rgb = torch.zeros(1, 3, 8, 8)
+    student_rgb = torch.ones(1, 3, 8, 8) * 0.25
+    loss, metrics = trainer.compute_loss(
+        teacher_latent=teacher,
+        student_latent=student,
+        actual_full_attn_ratio=0.0,
+        teacher_rgb=teacher_rgb,
+        student_rgb=student_rgb,
+        include_efficiency_penalty=False,
+    )
+
+    expected_quality_terms = 0.5 * 2.0 + 0.25 * (0.8 - 0.3) + 0.75 * (0.9 - 0.2) + 0.1 * (0.7 - 0.4)
+    base_terms = trainer.rmse_weight * metrics["rmse"] + trainer.cosine_weight * metrics["cosine_distance"]
+    assert metrics["dreamsim"] == pytest.approx(2.0)
+    assert metrics["hps_penalty"] == pytest.approx(0.5)
+    assert metrics["biqa_quality_penalty"] == pytest.approx(0.7)
+    assert metrics["biqa_aesthetic_penalty"] == pytest.approx(0.3)
+    assert loss.item() == pytest.approx(base_terms + expected_quality_terms, rel=1e-5)
+
+
+def test_controller_trainer_dreamsim_requires_dependency(monkeypatch):
+    monkeypatch.setitem(sys.modules, "dreamsim", None)
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    with pytest.raises(RuntimeError):
+        flux2_ttr_controller.ControllerTrainer(controller, dreamsim_weight=1.0)
+
+
+def test_controller_trainer_hps_requires_dependency(monkeypatch):
+    monkeypatch.setitem(sys.modules, "hpsv2", None)
+    monkeypatch.setitem(sys.modules, "ImageReward", None)
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    with pytest.raises(RuntimeError):
+        flux2_ttr_controller.ControllerTrainer(controller, hps_weight=1.0)
+
+
+def test_controller_trainer_biqa_requires_dependency(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pyiqa", None)
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    with pytest.raises(RuntimeError):
+        flux2_ttr_controller.ControllerTrainer(controller, biqa_quality_weight=1.0)
 
 
 def test_controller_trainer_compute_loss_can_skip_efficiency_penalty():

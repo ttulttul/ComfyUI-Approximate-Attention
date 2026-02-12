@@ -4,9 +4,11 @@ import logging
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from PIL import Image
 
 from flux2_ttr_embeddings import ScalarSinusoidalEmbedding
 
@@ -459,6 +461,11 @@ class ControllerTrainer:
         rmse_weight: float = 1.0,
         cosine_weight: float = 1.0,
         lpips_weight: float = 0.0,
+        dreamsim_weight: float = 0.0,
+        hps_weight: float = 0.0,
+        biqa_quality_weight: float = 0.0,
+        biqa_aesthetic_weight: float = 0.0,
+        hps_prompt: str = "",
         target_ttr_ratio: float = 0.7,
         lambda_eff: float = 1.0,
         lambda_entropy: float = 0.1,
@@ -476,6 +483,11 @@ class ControllerTrainer:
             rmse_weight = float(loss_cfg.get("rmse_weight", rmse_weight))
             cosine_weight = float(loss_cfg.get("cosine_weight", cosine_weight))
             lpips_weight = float(loss_cfg.get("lpips_weight", lpips_weight))
+            dreamsim_weight = float(loss_cfg.get("dreamsim_weight", dreamsim_weight))
+            hps_weight = float(loss_cfg.get("hps_weight", hps_weight))
+            biqa_quality_weight = float(loss_cfg.get("biqa_quality_weight", biqa_quality_weight))
+            biqa_aesthetic_weight = float(loss_cfg.get("biqa_aesthetic_weight", biqa_aesthetic_weight))
+            hps_prompt = str(loss_cfg.get("hps_prompt", hps_prompt))
             target_ttr_ratio = float(sched_cfg.get("target_ttr_ratio", target_ttr_ratio))
             lambda_eff = float(sched_cfg.get("lambda_eff", lambda_eff))
             lambda_entropy = float(sched_cfg.get("lambda_entropy", lambda_entropy))
@@ -497,6 +509,11 @@ class ControllerTrainer:
         self.rmse_weight = float(rmse_weight)
         self.cosine_weight = float(cosine_weight)
         self.lpips_weight = float(lpips_weight)
+        self.dreamsim_weight = max(0.0, float(dreamsim_weight))
+        self.hps_weight = max(0.0, float(hps_weight))
+        self.biqa_quality_weight = max(0.0, float(biqa_quality_weight))
+        self.biqa_aesthetic_weight = max(0.0, float(biqa_aesthetic_weight))
+        self.hps_prompt = str(hps_prompt or "")
         self.target_ttr_ratio = float(target_ttr_ratio)
         self.lambda_eff = max(0.0, float(lambda_eff))
         self.lambda_entropy = max(0.0, float(lambda_entropy))
@@ -504,6 +521,7 @@ class ControllerTrainer:
         self._reward_baseline = 0.0
         self._reward_count = 0
         self._train_step_warned = False
+
         self.lpips_model = None
         if self.lpips_weight > 0:
             try:
@@ -517,9 +535,25 @@ class ControllerTrainer:
                 raise RuntimeError(
                     "ControllerTrainer: lpips_weight > 0 requires the 'lpips' package."
                 ) from exc
+
+        self.dreamsim_model = None
+        self.dreamsim_preprocess = None
+        self.hps_backend = ""
+        self.hps_module = None
+        self.hps_model = None
+        self.hps_version = "v2.1"
+        self.biqa_backend = ""
+        self.biqa_quality_model = None
+        self.biqa_aesthetic_model = None
+        if self.dreamsim_weight > 0:
+            self._init_dreamsim_model()
+        if self.hps_weight > 0:
+            self._init_hps_model()
+        if self.biqa_quality_weight > 0 or self.biqa_aesthetic_weight > 0:
+            self._init_biqa_models()
         logger.info(
             (
-                "ControllerTrainer initialized: lr=%.6g rmse=%.4g cosine=%.4g lpips=%.4g "
+                "ControllerTrainer initialized: lr=%.6g rmse=%.4g cosine=%.4g lpips=%.4g dreamsim=%.4g hps=%.4g biqa_q=%.4g biqa_a=%.4g "
                 "target_ttr_ratio=%.4g target_full_attn_ratio=%.4g "
                 "lambda_eff=%.4g lambda_entropy=%.4g grad_clip=%.4g"
             ),
@@ -527,6 +561,10 @@ class ControllerTrainer:
             self.rmse_weight,
             self.cosine_weight,
             self.lpips_weight,
+            self.dreamsim_weight,
+            self.hps_weight,
+            self.biqa_quality_weight,
+            self.biqa_aesthetic_weight,
             self.target_ttr_ratio,
             self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio),
             self.lambda_eff,
@@ -650,6 +688,196 @@ class ControllerTrainer:
             with torch.inference_mode(False):
                 self.lpips_model.to(device=target_device)
 
+    def _ensure_metric_model_device(
+        self,
+        module: Any,
+        *,
+        target_device: torch.device,
+        component_name: str,
+    ) -> None:
+        if module is None or not hasattr(module, "to"):
+            return
+        current_device = self._module_primary_device(module) if isinstance(module, nn.Module) else None
+        if current_device is not None and current_device == target_device:
+            return
+        logger.debug("ControllerTrainer: moving %s from %s to %s.", component_name, str(current_device), str(target_device))
+        with torch.inference_mode(False):
+            module.to(device=target_device)
+
+    @staticmethod
+    def _prep_metric_rgb(x: torch.Tensor) -> torch.Tensor:
+        return ((ControllerTrainer._prep_lpips_rgb(x) + 1.0) * 0.5).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _tensor_to_pil(img: torch.Tensor) -> Image.Image:
+        arr = img.detach().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy()
+        arr_u8 = np.clip(np.round(arr * 255.0), 0, 255).astype(np.uint8)
+        return Image.fromarray(arr_u8, mode="RGB")
+
+    @classmethod
+    def _pil_batch_from_rgb(cls, rgb: torch.Tensor) -> list[Image.Image]:
+        return [cls._tensor_to_pil(rgb[idx]) for idx in range(int(rgb.shape[0]))]
+
+    @staticmethod
+    def _to_scalar_tensor(value: Any, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if torch.is_tensor(value):
+            t = value.to(device=device, dtype=dtype)
+            return t.mean() if t.ndim > 0 else t
+        return torch.tensor(float(value), device=device, dtype=dtype)
+
+    @staticmethod
+    def _scores_to_tensor(scores: Any, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if torch.is_tensor(scores):
+            return scores.to(device=device, dtype=dtype).reshape(-1)
+        if isinstance(scores, np.ndarray):
+            return torch.as_tensor(scores, device=device, dtype=dtype).reshape(-1)
+        if isinstance(scores, (list, tuple)):
+            if scores and any(torch.is_tensor(item) for item in scores):
+                flat: list[float] = []
+                for item in scores:
+                    if torch.is_tensor(item):
+                        flat.extend(item.detach().cpu().reshape(-1).tolist())
+                    else:
+                        flat.append(float(item))
+                return torch.tensor(flat, device=device, dtype=dtype).reshape(-1)
+            return torch.as_tensor(scores, device=device, dtype=dtype).reshape(-1)
+        return torch.tensor([float(scores)], device=device, dtype=dtype)
+
+    def _init_dreamsim_model(self) -> None:
+        try:
+            from dreamsim import dreamsim  # type: ignore
+
+            controller_device, _ = self.controller._input_device_dtype()
+            loaded = dreamsim(pretrained=True, device=str(controller_device))
+            if not isinstance(loaded, tuple) or len(loaded) < 2:
+                raise RuntimeError("unexpected dreamsim() return signature")
+            self.dreamsim_model, self.dreamsim_preprocess = loaded[0], loaded[1]
+            if hasattr(self.dreamsim_model, "eval"):
+                self.dreamsim_model.eval()
+        except Exception as exc:
+            raise RuntimeError(
+                "ControllerTrainer: dreamsim_weight > 0 requires the 'dreamsim' package."
+            ) from exc
+
+    def _init_hps_model(self) -> None:
+        try:
+            import hpsv2  # type: ignore
+
+            self.hps_backend = "hpsv2"
+            self.hps_module = hpsv2
+            return
+        except Exception:
+            pass
+        try:
+            import ImageReward as RM  # type: ignore
+
+            self.hps_backend = "imagereward"
+            self.hps_model = RM.load("ImageReward-v1.0")
+            return
+        except Exception as exc:
+            raise RuntimeError(
+                "ControllerTrainer: hps_weight > 0 requires either 'hpsv2' or 'image-reward'."
+            ) from exc
+
+    def _init_biqa_models(self) -> None:
+        try:
+            import pyiqa  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "ControllerTrainer: BIQA weights > 0 require the 'pyiqa' package."
+            ) from exc
+        controller_device, _ = self.controller._input_device_dtype()
+        try:
+            self.biqa_backend = "qalign"
+            self.biqa_quality_model = pyiqa.create_metric("qalign", device=controller_device)
+            self.biqa_aesthetic_model = self.biqa_quality_model
+            return
+        except Exception:
+            pass
+        try:
+            self.biqa_backend = "liqe"
+            self.biqa_quality_model = pyiqa.create_metric("liqe_mix", device=controller_device)
+            self.biqa_aesthetic_model = pyiqa.create_metric("nima", device=controller_device)
+        except Exception as exc:
+            raise RuntimeError(
+                "ControllerTrainer: BIQA weights > 0 require pyiqa metrics (qalign or liqe_mix+nima)."
+            ) from exc
+
+    def _dreamsim_batch_from_rgb(self, rgb: torch.Tensor, *, target_device: torch.device) -> torch.Tensor:
+        if self.dreamsim_preprocess is None:
+            return rgb.to(device=target_device)
+        processed: list[torch.Tensor] = []
+        for pil_img in self._pil_batch_from_rgb(rgb):
+            out = self.dreamsim_preprocess(pil_img)
+            if not torch.is_tensor(out):
+                out = torch.as_tensor(out)
+            if out.ndim == 3:
+                out = out.unsqueeze(0)
+            processed.append(out.float())
+        return torch.cat(processed, dim=0).to(device=target_device)
+
+    def _score_dreamsim(
+        self,
+        *,
+        teacher_rgb_01: torch.Tensor,
+        student_rgb_01: torch.Tensor,
+        loss: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.dreamsim_model is None:
+            raise RuntimeError("DreamSim requested but dreamsim model is not initialized.")
+        target_device = self._module_primary_device(self.dreamsim_model) or teacher_rgb_01.device
+        self._ensure_metric_model_device(self.dreamsim_model, target_device=target_device, component_name="DreamSim model")
+        teacher_batch = self._dreamsim_batch_from_rgb(teacher_rgb_01, target_device=target_device)
+        student_batch = self._dreamsim_batch_from_rgb(student_rgb_01, target_device=target_device)
+        score = self.dreamsim_model(student_batch, teacher_batch)
+        return self._to_scalar_tensor(score, device=loss.device, dtype=loss.dtype)
+
+    def _score_hps_batch(
+        self,
+        *,
+        rgb_01: torch.Tensor,
+        prompt: str,
+        loss: torch.Tensor,
+    ) -> torch.Tensor:
+        pil_images = self._pil_batch_from_rgb(rgb_01)
+        if self.hps_backend == "hpsv2":
+            if self.hps_module is None:
+                raise RuntimeError("HPS requested but hpsv2 is not initialized.")
+            try:
+                scores = self.hps_module.score(pil_images, prompt, hps_version=self.hps_version)
+            except Exception:
+                scores = [
+                    self.hps_module.score(pil_img, prompt, hps_version=self.hps_version)
+                    for pil_img in pil_images
+                ]
+            return self._scores_to_tensor(scores, device=loss.device, dtype=loss.dtype).mean()
+        if self.hps_backend != "imagereward" or self.hps_model is None:
+            raise RuntimeError("HPS requested but no HPS backend is initialized.")
+        scores = [self.hps_model.score(prompt, img) for img in pil_images]
+        return self._scores_to_tensor(scores, device=loss.device, dtype=loss.dtype).mean()
+
+    def _score_biqa_quality(self, *, rgb_01: torch.Tensor, loss: torch.Tensor) -> torch.Tensor:
+        if self.biqa_quality_model is None:
+            raise RuntimeError("BIQA quality requested but quality model is not initialized.")
+        target_device = self._module_primary_device(self.biqa_quality_model) or rgb_01.device
+        self._ensure_metric_model_device(self.biqa_quality_model, target_device=target_device, component_name="BIQA quality model")
+        inp = rgb_01.to(device=target_device)
+        out = self.biqa_quality_model(inp, task_="quality") if self.biqa_backend == "qalign" else self.biqa_quality_model(inp)
+        return self._to_scalar_tensor(out, device=loss.device, dtype=loss.dtype)
+
+    def _score_biqa_aesthetic(self, *, rgb_01: torch.Tensor, loss: torch.Tensor) -> torch.Tensor:
+        if self.biqa_aesthetic_model is None:
+            raise RuntimeError("BIQA aesthetic requested but aesthetic model is not initialized.")
+        target_device = self._module_primary_device(self.biqa_aesthetic_model) or rgb_01.device
+        self._ensure_metric_model_device(
+            self.biqa_aesthetic_model,
+            target_device=target_device,
+            component_name="BIQA aesthetic model",
+        )
+        inp = rgb_01.to(device=target_device)
+        out = self.biqa_aesthetic_model(inp, task_="aesthetic") if self.biqa_backend == "qalign" else self.biqa_aesthetic_model(inp)
+        return self._to_scalar_tensor(out, device=loss.device, dtype=loss.dtype)
+
     @staticmethod
     def _ratio_tensor(
         actual_full_attn_ratio: float | torch.Tensor,
@@ -689,11 +917,30 @@ class ControllerTrainer:
         loss = self.rmse_weight * rmse + self.cosine_weight * cosine
 
         lpips_term = torch.tensor(0.0, device=loss.device)
+        dreamsim_term = torch.tensor(0.0, device=loss.device)
+        hps_teacher = torch.tensor(0.0, device=loss.device)
+        hps_student = torch.tensor(0.0, device=loss.device)
+        hps_penalty = torch.tensor(0.0, device=loss.device)
+        biqa_quality_teacher = torch.tensor(0.0, device=loss.device)
+        biqa_quality_student = torch.tensor(0.0, device=loss.device)
+        biqa_quality_penalty = torch.tensor(0.0, device=loss.device)
+        biqa_aesthetic_teacher = torch.tensor(0.0, device=loss.device)
+        biqa_aesthetic_student = torch.tensor(0.0, device=loss.device)
+        biqa_aesthetic_penalty = torch.tensor(0.0, device=loss.device)
+
+        needs_rgb = (
+            self.lpips_weight > 0
+            or self.dreamsim_weight > 0
+            or self.hps_weight > 0
+            or self.biqa_quality_weight > 0
+            or self.biqa_aesthetic_weight > 0
+        )
+        if needs_rgb and (teacher_rgb is None or student_rgb is None):
+            raise ValueError("teacher_rgb and student_rgb are required when any RGB quality weights are enabled.")
+
         if self.lpips_weight > 0:
             if self.lpips_model is None:
                 raise RuntimeError("LPIPS requested but lpips_model is not initialized.")
-            if teacher_rgb is None or student_rgb is None:
-                raise ValueError("teacher_rgb and student_rgb are required when lpips_weight > 0.")
             teacher_rgb = self._prep_lpips_rgb(teacher_rgb)
             student_rgb = self._prep_lpips_rgb(student_rgb)
 
@@ -704,6 +951,34 @@ class ControllerTrainer:
 
             lpips_term = self.lpips_model(student_rgb, teacher_rgb).mean().to(device=loss.device)
             loss = loss + self.lpips_weight * lpips_term
+
+        if self.dreamsim_weight > 0 or self.hps_weight > 0 or self.biqa_quality_weight > 0 or self.biqa_aesthetic_weight > 0:
+            teacher_rgb_01 = self._prep_metric_rgb(teacher_rgb)
+            student_rgb_01 = self._prep_metric_rgb(student_rgb)
+            if self.dreamsim_weight > 0:
+                dreamsim_term = self._score_dreamsim(
+                    teacher_rgb_01=teacher_rgb_01,
+                    student_rgb_01=student_rgb_01,
+                    loss=loss,
+                )
+                loss = loss + self.dreamsim_weight * dreamsim_term
+            if self.hps_weight > 0:
+                if not self.hps_prompt:
+                    logger.warning("ControllerTrainer: hps_weight > 0 but hps_prompt is empty; HPS scores may be less meaningful.")
+                hps_teacher = self._score_hps_batch(rgb_01=teacher_rgb_01, prompt=self.hps_prompt, loss=loss)
+                hps_student = self._score_hps_batch(rgb_01=student_rgb_01, prompt=self.hps_prompt, loss=loss)
+                hps_penalty = torch.relu(hps_teacher - hps_student)
+                loss = loss + self.hps_weight * hps_penalty
+            if self.biqa_quality_weight > 0:
+                biqa_quality_teacher = self._score_biqa_quality(rgb_01=teacher_rgb_01, loss=loss)
+                biqa_quality_student = self._score_biqa_quality(rgb_01=student_rgb_01, loss=loss)
+                biqa_quality_penalty = torch.relu(biqa_quality_teacher - biqa_quality_student)
+                loss = loss + self.biqa_quality_weight * biqa_quality_penalty
+            if self.biqa_aesthetic_weight > 0:
+                biqa_aesthetic_teacher = self._score_biqa_aesthetic(rgb_01=teacher_rgb_01, loss=loss)
+                biqa_aesthetic_student = self._score_biqa_aesthetic(rgb_01=student_rgb_01, loss=loss)
+                biqa_aesthetic_penalty = torch.relu(biqa_aesthetic_teacher - biqa_aesthetic_student)
+                loss = loss + self.biqa_aesthetic_weight * biqa_aesthetic_penalty
 
         ratio = self._ratio_tensor(
             actual_full_attn_ratio,
@@ -722,6 +997,16 @@ class ControllerTrainer:
             "rmse": float(rmse.detach().item()),
             "cosine_distance": float(cosine.detach().item()),
             "lpips": float(lpips_term.detach().item()),
+            "dreamsim": float(dreamsim_term.detach().item()),
+            "hps_teacher": float(hps_teacher.detach().item()),
+            "hps_student": float(hps_student.detach().item()),
+            "hps_penalty": float(hps_penalty.detach().item()),
+            "biqa_quality_teacher": float(biqa_quality_teacher.detach().item()),
+            "biqa_quality_student": float(biqa_quality_student.detach().item()),
+            "biqa_quality_penalty": float(biqa_quality_penalty.detach().item()),
+            "biqa_aesthetic_teacher": float(biqa_aesthetic_teacher.detach().item()),
+            "biqa_aesthetic_student": float(biqa_aesthetic_student.detach().item()),
+            "biqa_aesthetic_penalty": float(biqa_aesthetic_penalty.detach().item()),
             "efficiency_penalty": float(efficiency_penalty.detach().item()),
             "actual_full_attn_ratio": actual_full_attn_ratio_value,
             "actual_ttr_ratio": float(1.0 - actual_full_attn_ratio_value),

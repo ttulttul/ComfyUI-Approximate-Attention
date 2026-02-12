@@ -69,7 +69,6 @@ class ControllerTrainingConfig:
     checkpoint_path: str
     sigma_aware_training: bool
     total_iterations: int
-    lpips_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -562,7 +561,6 @@ class ControllerTrainerNodeEngine:
             checkpoint_path=checkpoint_path,
             sigma_aware_training=bool(self.inputs.sigma_aware_training),
             total_iterations=max(1, int(self.inputs.training_iterations)),
-            lpips_enabled=self.deps.float_or(loss_cfg.get("lpips_weight"), 0.0) > 0,
         )
 
     def _load_controller(self, checkpoint_path: str, num_layers: int) -> flux2_ttr_controller.TTRController:
@@ -953,8 +951,8 @@ class ControllerTrainerNodeEngine:
             teacher_latent=teacher_latent["samples"],
             student_latent=student_latent["samples"],
             actual_full_attn_ratio=actual_full_attn_ratio_eligible,
-            teacher_rgb=teacher_rgb if self.config.lpips_enabled else None,
-            student_rgb=student_rgb if self.config.lpips_enabled else None,
+            teacher_rgb=teacher_rgb,
+            student_rgb=student_rgb,
             include_efficiency_penalty=False,
         )
         reward = -float(quality_loss.detach().item())
@@ -1317,7 +1315,17 @@ class ControllerTrainerNodeEngine:
             "loss": float(quality_loss.detach().item()),
             "rmse": float(quality_metrics["rmse"]),
             "cosine_distance": float(quality_metrics["cosine_distance"]),
-            "lpips": float(quality_metrics["lpips"]),
+            "lpips": float(quality_metrics.get("lpips", 0.0)),
+            "dreamsim": float(quality_metrics.get("dreamsim", 0.0)),
+            "hps_penalty": float(quality_metrics.get("hps_penalty", 0.0)),
+            "hps_teacher": float(quality_metrics.get("hps_teacher", 0.0)),
+            "hps_student": float(quality_metrics.get("hps_student", 0.0)),
+            "biqa_quality_penalty": float(quality_metrics.get("biqa_quality_penalty", 0.0)),
+            "biqa_quality_teacher": float(quality_metrics.get("biqa_quality_teacher", 0.0)),
+            "biqa_quality_student": float(quality_metrics.get("biqa_quality_student", 0.0)),
+            "biqa_aesthetic_penalty": float(quality_metrics.get("biqa_aesthetic_penalty", 0.0)),
+            "biqa_aesthetic_teacher": float(quality_metrics.get("biqa_aesthetic_teacher", 0.0)),
+            "biqa_aesthetic_student": float(quality_metrics.get("biqa_aesthetic_student", 0.0)),
             "efficiency_penalty": float(reinforce_metrics["efficiency_penalty"]),
             "mask_mean": full_attn_ratio_eligible,
             "probs_mean": expected_eligible,
