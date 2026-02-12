@@ -1036,7 +1036,7 @@ class ControllerTrainerNodeEngine:
         trainer = self.bundle.trainer
         target_ttr_ratio = float(trainer.target_ttr_ratio)
         target_full_attn_ratio = float(trainer._target_full_attn_ratio_from_ttr_ratio(target_ttr_ratio))
-        efficiency_penalty = max(0.0, float(actual_full_attn_ratio) - target_full_attn_ratio)
+        efficiency_penalty = abs(float(actual_full_attn_ratio) - target_full_attn_ratio)
         efficiency_penalty_weighted = float(trainer.lambda_eff * efficiency_penalty)
         entropy_bonus = float(trainer.lambda_entropy * float(entropy_value))
         reward_value = float(reward - efficiency_penalty_weighted + entropy_bonus)

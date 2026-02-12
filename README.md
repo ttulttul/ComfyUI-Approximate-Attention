@@ -70,7 +70,9 @@ Controller training uses policy gradients with quality-driven rewards. A teacher
 
 For HPS/BIQA terms, the trainer compares teacher and student scores and penalizes only when the student is lower (`relu(teacher_score - student_score)`), so improving over the teacher baseline is not penalized.
 
-**Reward shaping.** The reward signal is `reward = −quality_loss − λ_eff × efficiency_penalty + λ_entropy × entropy_bonus`, where the efficiency penalty is `relu(actual_full_attn_ratio − target_full_attn_ratio)` and `target_full_attn_ratio = 1 − target_ttr_ratio`.
+**Reward shaping.** The reward signal is `reward = −quality_loss − λ_eff × efficiency_penalty + λ_entropy × entropy_bonus`, where the efficiency penalty is `abs(actual_full_attn_ratio − target_full_attn_ratio)` and `target_full_attn_ratio = 1 − target_ttr_ratio`.
+
+**Stability guards.** Efficiency penalty uses symmetric deviation from target full-attention ratio (`abs(actual_full_attn_ratio - target_full_attn_ratio)`) so both over- and under-routing are penalized. Reward-baseline EMA updates are quality-floor clamped (`reward_baseline_quality_floor`, default `-0.3`) to prevent baseline drift from normalizing poor-quality rewards.
 
 **REINFORCE update.** The policy loss is `−(reward − baseline) × log_prob(actions)` computed over eligible (ready) layers only. An entropy bonus keeps policies from collapsing to saturated Bernoulli decisions. Routing ratios and penalties are computed over eligible layers, with forced-full layers tracked separately to avoid biased policy pressure. The reward baseline and AdamW optimizer state are checkpointed and restored for stable resume.
 

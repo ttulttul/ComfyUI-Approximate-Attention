@@ -1,3 +1,8 @@
+from types import SimpleNamespace
+
+import pytest
+
+import flux2_ttr_controller
 import flux2_ttr_controller_trainer_node as trainer_node
 
 
@@ -61,3 +66,30 @@ def test_build_ready_layer_indices_filters_by_runtime_refresh_state():
         {0: "single:0", 1: "single:1", 2: "single:2"},
     )
     assert ready_indices == [0, 2]
+
+
+def test_sigma_reward_terms_efficiency_penalty_is_symmetric():
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        target_ttr_ratio=0.5,  # target_full_attn_ratio=0.5
+        lambda_eff=1.0,
+        lambda_entropy=0.0,
+        lpips_weight=0.0,
+    )
+    engine = trainer_node.ControllerTrainerNodeEngine.__new__(trainer_node.ControllerTrainerNodeEngine)
+    engine.bundle = SimpleNamespace(trainer=trainer)
+    terms_low = engine._compute_sigma_reward_terms(
+        reward=0.0,
+        entropy_value=0.0,
+        actual_full_attn_ratio=0.3,
+    )
+    terms_high = engine._compute_sigma_reward_terms(
+        reward=0.0,
+        entropy_value=0.0,
+        actual_full_attn_ratio=0.7,
+    )
+    assert terms_low.target_full_attn_ratio == pytest.approx(0.5)
+    assert terms_high.target_full_attn_ratio == pytest.approx(0.5)
+    assert terms_low.efficiency_penalty == pytest.approx(0.2, abs=1e-6)
+    assert terms_high.efficiency_penalty == pytest.approx(0.2, abs=1e-6)

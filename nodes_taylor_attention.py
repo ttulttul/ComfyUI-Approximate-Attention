@@ -47,6 +47,7 @@ _TRAINING_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "hps_weight": 0.0,
         "biqa_quality_weight": 0.0,
         "biqa_aesthetic_weight": 0.0,
+        "reward_baseline_quality_floor": -0.3,
         "huber_beta": 0.05,
     },
     "optimizer_config": {
@@ -250,6 +251,7 @@ def _build_training_config_payload(
     hps_weight: float,
     biqa_quality_weight: float,
     biqa_aesthetic_weight: float,
+    reward_baseline_quality_floor: float,
     huber_beta: float,
     learning_rate: float,
     grad_clip_norm: float,
@@ -277,6 +279,7 @@ def _build_training_config_payload(
             "hps_weight": float(hps_weight),
             "biqa_quality_weight": float(biqa_quality_weight),
             "biqa_aesthetic_weight": float(biqa_aesthetic_weight),
+            "reward_baseline_quality_floor": float(reward_baseline_quality_floor),
             "huber_beta": float(huber_beta),
         },
         "optimizer_config": {
@@ -323,6 +326,14 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
                 io.Float.Input("hps_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
                 io.Float.Input("biqa_quality_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
                 io.Float.Input("biqa_aesthetic_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
+                io.Float.Input(
+                    "reward_baseline_quality_floor",
+                    default=-0.3,
+                    min=-10.0,
+                    max=1.0,
+                    step=1e-3,
+                    tooltip="Clamp floor for reward-baseline EMA updates in controller training.",
+                ),
                 io.Float.Input("huber_beta", default=0.05, min=1e-6, max=10.0, step=1e-4),
                 io.Float.Input("learning_rate", default=1e-4, min=1e-7, max=1.0, step=1e-7),
                 io.Float.Input("grad_clip_norm", default=1.0, min=0.0, max=100.0, step=1e-3),
@@ -360,6 +371,7 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
         hps_weight: float,
         biqa_quality_weight: float,
         biqa_aesthetic_weight: float,
+        reward_baseline_quality_floor: float,
         huber_beta: float,
         learning_rate: float,
         grad_clip_norm: float,
@@ -386,6 +398,7 @@ class Flux2TTRTrainingParameters(io.ComfyNode):
             hps_weight=hps_weight,
             biqa_quality_weight=biqa_quality_weight,
             biqa_aesthetic_weight=biqa_aesthetic_weight,
+            reward_baseline_quality_floor=reward_baseline_quality_floor,
             huber_beta=huber_beta,
             learning_rate=learning_rate,
             grad_clip_norm=grad_clip_norm,
@@ -723,6 +736,10 @@ class Flux2TTRTrainer(io.ComfyNode):
             loss_cfg.get("biqa_aesthetic_weight"),
             _TRAINING_CONFIG_DEFAULTS["loss_config"]["biqa_aesthetic_weight"],
         )
+        reward_baseline_quality_floor = _float_or(
+            loss_cfg.get("reward_baseline_quality_floor"),
+            _TRAINING_CONFIG_DEFAULTS["loss_config"]["reward_baseline_quality_floor"],
+        )
 
         resolved_training_config = _build_training_config_payload(
             rmse_weight=rmse_weight,
@@ -732,6 +749,7 @@ class Flux2TTRTrainer(io.ComfyNode):
             hps_weight=hps_weight,
             biqa_quality_weight=biqa_quality_weight,
             biqa_aesthetic_weight=biqa_aesthetic_weight,
+            reward_baseline_quality_floor=reward_baseline_quality_floor,
             huber_beta=huber_beta,
             learning_rate=learning_rate,
             grad_clip_norm=grad_clip_norm,

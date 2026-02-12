@@ -255,6 +255,7 @@ def test_controller_checkpoint_persists_and_restores_trainer_state(tmp_path):
 
     assert payload["reward_baseline"] is not None
     assert payload["reward_count"] is not None
+    assert payload["reward_baseline_quality_floor"] == pytest.approx(-0.3)
     assert payload["lambda_entropy"] == pytest.approx(0.35)
     assert payload["optimizer_state_dict"] is not None
 
@@ -270,6 +271,7 @@ def test_controller_checkpoint_persists_and_restores_trainer_state(tmp_path):
 
     assert restored_trainer.reward_baseline == pytest.approx(trainer.reward_baseline)
     assert restored_trainer.reward_count == trainer.reward_count
+    assert restored_trainer.reward_baseline_quality_floor == pytest.approx(trainer.reward_baseline_quality_floor)
     assert restored_trainer.lambda_entropy == pytest.approx(0.35)
     assert len(restored_trainer.optimizer.state) > 0
 
@@ -288,6 +290,7 @@ def test_controller_trainer_restore_training_state_is_backward_compatible():
     )
     assert trainer.reward_baseline == pytest.approx(0.0)
     assert trainer.reward_count == 0
+    assert trainer.reward_baseline_quality_floor == pytest.approx(-0.3)
     assert trainer.lambda_entropy == pytest.approx(0.42)
     assert len(trainer.optimizer.state) == 0
 
@@ -444,6 +447,7 @@ def test_controller_trainer_training_config_overrides_defaults(monkeypatch):
             "hps_weight": 0.3,
             "biqa_quality_weight": 0.4,
             "biqa_aesthetic_weight": 0.5,
+            "reward_baseline_quality_floor": -0.25,
         },
         "optimizer_config": {"learning_rate": 3e-4, "grad_clip_norm": 0.25},
         "schedule_config": {"target_ttr_ratio": 0.4, "lambda_eff": 2.25, "lambda_entropy": 0.35},
@@ -474,6 +478,7 @@ def test_controller_trainer_training_config_overrides_defaults(monkeypatch):
     assert trainer.hps_weight == pytest.approx(0.3)
     assert trainer.biqa_quality_weight == pytest.approx(0.4)
     assert trainer.biqa_aesthetic_weight == pytest.approx(0.5)
+    assert trainer.reward_baseline_quality_floor == pytest.approx(-0.25)
     assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
 
 
@@ -557,6 +562,54 @@ def test_controller_trainer_compute_loss_can_skip_efficiency_penalty():
 
     assert metrics_with_penalty["efficiency_penalty"] == pytest.approx(metrics_without_penalty["efficiency_penalty"])
     assert loss_with_penalty.item() > loss_without_penalty.item()
+
+
+def test_controller_trainer_reinforce_penalty_is_symmetric_about_target():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=10, embed_dim=16, hidden_dim=32)
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        learning_rate=1e-2,
+        target_ttr_ratio=0.5,  # target_full_attn_ratio=0.5
+        lambda_eff=1.0,
+        lambda_entropy=0.0,
+    )
+    mask_low = torch.tensor([1.0, 1.0, 1.0] + [0.0] * 7)
+    mask_high = torch.tensor([1.0] * 7 + [0.0] * 3)
+    metrics_low = trainer.reinforce_step(
+        sigma=0.8,
+        cfg_scale=3.0,
+        width=64,
+        height=64,
+        sampled_mask=mask_low,
+        reward=0.0,
+        actual_full_attn_ratio=0.3,
+    )
+    metrics_high = trainer.reinforce_step(
+        sigma=0.8,
+        cfg_scale=3.0,
+        width=64,
+        height=64,
+        sampled_mask=mask_high,
+        reward=0.0,
+        actual_full_attn_ratio=0.7,
+    )
+    assert metrics_low["target_full_attn_ratio"] == pytest.approx(0.5)
+    assert metrics_high["target_full_attn_ratio"] == pytest.approx(0.5)
+    assert metrics_low["efficiency_penalty"] == pytest.approx(0.2, abs=1e-6)
+    assert metrics_high["efficiency_penalty"] == pytest.approx(0.2, abs=1e-6)
+
+
+def test_controller_trainer_reward_baseline_quality_floor_clamps_update():
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        lpips_weight=0.0,
+        reward_baseline_quality_floor=-0.3,
+    )
+    for _ in range(200):
+        trainer._update_reward_baseline(-0.5)
+    assert trainer.reward_baseline == pytest.approx(-0.3, abs=1e-3)
 
 
 def test_controller_trainer_reinforce_step_updates_parameters():

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _CONTROLLER_CHECKPOINT_FORMAT = "flux2_ttr_controller_v1"
 _LPIPS_EPS = 1e-8
 DEFAULT_CONTROLLER_CHECKPOINT_EVERY = 10
+_REWARD_BASELINE_QUALITY_FLOOR_DEFAULT = -0.3
 
 
 def should_save_controller_checkpoint_step(step: int, checkpoint_every: int = DEFAULT_CONTROLLER_CHECKPOINT_EVERY) -> bool:
@@ -407,6 +408,11 @@ def controller_checkpoint_state(
         "state_dict": {k: v.detach().cpu() for k, v in controller.state_dict().items()},
         "reward_baseline": float(trainer.reward_baseline) if trainer is not None else None,
         "reward_count": int(trainer.reward_count) if trainer is not None else None,
+        "reward_baseline_quality_floor": (
+            float(trainer.reward_baseline_quality_floor)
+            if trainer is not None
+            else None
+        ),
         "lambda_entropy": float(trainer.lambda_entropy) if trainer is not None else None,
         "optimizer_state_dict": trainer.optimizer.state_dict() if trainer is not None else None,
     }
@@ -466,6 +472,7 @@ class ControllerTrainer:
         biqa_quality_weight: float = 0.0,
         biqa_aesthetic_weight: float = 0.0,
         hps_prompt: str = "",
+        reward_baseline_quality_floor: float = _REWARD_BASELINE_QUALITY_FLOOR_DEFAULT,
         target_ttr_ratio: float = 0.7,
         lambda_eff: float = 1.0,
         lambda_entropy: float = 0.1,
@@ -488,6 +495,12 @@ class ControllerTrainer:
             biqa_quality_weight = float(loss_cfg.get("biqa_quality_weight", biqa_quality_weight))
             biqa_aesthetic_weight = float(loss_cfg.get("biqa_aesthetic_weight", biqa_aesthetic_weight))
             hps_prompt = str(loss_cfg.get("hps_prompt", hps_prompt))
+            reward_baseline_quality_floor = float(
+                loss_cfg.get(
+                    "reward_baseline_quality_floor",
+                    reward_baseline_quality_floor,
+                )
+            )
             target_ttr_ratio = float(sched_cfg.get("target_ttr_ratio", target_ttr_ratio))
             lambda_eff = float(sched_cfg.get("lambda_eff", lambda_eff))
             lambda_entropy = float(sched_cfg.get("lambda_entropy", lambda_entropy))
@@ -514,6 +527,7 @@ class ControllerTrainer:
         self.biqa_quality_weight = max(0.0, float(biqa_quality_weight))
         self.biqa_aesthetic_weight = max(0.0, float(biqa_aesthetic_weight))
         self.hps_prompt = str(hps_prompt or "")
+        self.reward_baseline_quality_floor = float(reward_baseline_quality_floor)
         self.target_ttr_ratio = float(target_ttr_ratio)
         self.lambda_eff = max(0.0, float(lambda_eff))
         self.lambda_entropy = max(0.0, float(lambda_entropy))
@@ -555,7 +569,7 @@ class ControllerTrainer:
             (
                 "ControllerTrainer initialized: lr=%.6g rmse=%.4g cosine=%.4g lpips=%.4g dreamsim=%.4g hps=%.4g biqa_q=%.4g biqa_a=%.4g "
                 "target_ttr_ratio=%.4g target_full_attn_ratio=%.4g "
-                "lambda_eff=%.4g lambda_entropy=%.4g grad_clip=%.4g"
+                "lambda_eff=%.4g lambda_entropy=%.4g grad_clip=%.4g baseline_quality_floor=%.4g"
             ),
             float(learning_rate),
             self.rmse_weight,
@@ -570,6 +584,7 @@ class ControllerTrainer:
             self.lambda_eff,
             self.lambda_entropy,
             self.grad_clip_norm,
+            self.reward_baseline_quality_floor,
         )
 
     @property
@@ -588,6 +603,8 @@ class ControllerTrainer:
             self._reward_baseline = float(payload["reward_baseline"])
         if "reward_count" in payload and payload["reward_count"] is not None:
             self._reward_count = int(payload["reward_count"])
+        if "reward_baseline_quality_floor" in payload and payload["reward_baseline_quality_floor"] is not None:
+            self.reward_baseline_quality_floor = float(payload["reward_baseline_quality_floor"])
         if "lambda_entropy" in payload and payload["lambda_entropy"] is not None:
             self.lambda_entropy = max(0.0, float(payload["lambda_entropy"]))
         if "optimizer_state_dict" in payload and payload["optimizer_state_dict"] is not None:
@@ -1018,10 +1035,13 @@ class ControllerTrainer:
     def _update_reward_baseline(self, reward: float, decay: float = 0.95) -> None:
         self._reward_count += 1
         reward_f = float(reward)
+        # Keep baseline adaptation from accepting sustained low-quality rewards.
+        # reward is -quality_loss, so more negative values correspond to worse quality.
+        clamped_reward = max(reward_f, float(self.reward_baseline_quality_floor))
         if self._reward_count == 1:
-            self._reward_baseline = reward_f
+            self._reward_baseline = clamped_reward
         else:
-            self._reward_baseline = decay * self._reward_baseline + (1.0 - decay) * reward_f
+            self._reward_baseline = decay * self._reward_baseline + (1.0 - decay) * clamped_reward
 
     def reinforce_step(
         self,
@@ -1088,7 +1108,7 @@ class ControllerTrainer:
 
                 target_full_attn_ratio = self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio)
                 actual_full_attn_eligible = float(mask[eligible].mean().item())
-                efficiency_penalty_value = max(0.0, actual_full_attn_eligible - float(target_full_attn_ratio))
+                efficiency_penalty_value = abs(actual_full_attn_eligible - float(target_full_attn_ratio))
                 efficiency_penalty_weighted = float(self.lambda_eff * efficiency_penalty_value)
                 reward_value = reward_quality - efficiency_penalty_weighted + entropy_bonus
                 baselined_reward = reward_value - self._reward_baseline
